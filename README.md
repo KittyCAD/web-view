@@ -13,13 +13,13 @@ Various helpers to get a Zoo KittyCAD WebRTC stream onto a web page!
 
 ## Installation
 
-```
+```sh
 npm install @kittycad/web-view @kittycad/lib
 ```
 
 ## Example
 
-```
+```ts
 import * as zoo from '@kittycad/lib'
 import { ZooWebView } from '@kittycad/web-view'
 
