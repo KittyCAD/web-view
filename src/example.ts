@@ -1,46 +1,12 @@
-# @kittycad/web-view
-
-Various helpers to get a Zoo KittyCAD WebRTC stream onto a web page!
-
-## Features
-
-* Each instance runs on a Web Worker, preventing main worker blocking.
-* Take KCL as a string input, or a map of `path -> string`s.
-* Supports raw scene and modeling commands.
-* Managed multiplexing so that many can be used at once on a page.
-* Supports Zoo camera controls (middle to pan, right to rotate, wheel to zoom).
-* Written in vanilla JavaScript for easy porting to other frameworks.
-
-## Installation
-
-```sh
-npm install @kittycad/web-view @kittycad/lib
-```
-
-## Quick demo
-
-```sh
-npm run serve
-```
-
-## Building
-
-```sh
-npm run build
-```
-
-## Example
-
-```ts
 import * as zoo from '@kittycad/lib'
-import { ZooWebView } from '@kittycad/web-view'
+import { ZooWebView } from '.'
 
 document.addEventListener('DOMContentLoaded', () => {
   const token = 'api-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 
   const zooClient = new zoo.Client({
     token,
-    baseUrl: 'wss://api.dev.zoo.dev',
+    baseUrl: 'wss://api.zoo.dev',
   })
 
   const zooWebView = new ZooWebView({
@@ -82,4 +48,3 @@ document.addEventListener('DOMContentLoaded', () => {
     })
   })
 })
-```

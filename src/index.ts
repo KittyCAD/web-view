@@ -18,7 +18,7 @@ enum ZooWebViewState {
   Killed = 'killed',
 }
 
-class ZooWebView extends EventTarget {
+export class ZooWebView extends EventTarget {
   public el: HTMLDivElement
   public rtc: zoo.WebRTC | undefined = undefined
   public size: Size
