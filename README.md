@@ -9,7 +9,7 @@ Various helpers to get a Zoo KittyCAD WebRTC stream onto a web page!
 * Supports raw scene and modeling commands.
 * Managed multiplexing so that many can be used at once on a page.
 * Supports Zoo camera controls (middle to pan, right to rotate, wheel to zoom).
-* Written in vanilla JavaScript for easy porting to other frameworks.
+* Written in vanilla TypeScript for easy porting to other frameworks.
 
 ## Installation
 
