@@ -20,13 +20,13 @@ npm install @kittycad/web-view @kittycad/lib
 ## Quick demo
 
 ```sh
-npm run serve
+make serve
 ```
 
 ## Building
 
 ```sh
-npm run build
+make build
 ```
 
 ## Example
@@ -83,3 +83,6 @@ document.addEventListener('DOMContentLoaded', () => {
   })
 })
 ```
+
+## Pretty screenshot of making tons of these
+![nice screenshot](./screenshot.png)
