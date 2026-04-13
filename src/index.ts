@@ -1,6 +1,14 @@
 import * as zoo from '@kittycad/lib'
 import svgZoo from './svg-zoo'
 
+declare global {
+  interface Window {
+    zoo?: {
+      kittycadWebViews?: ZooWebView[]
+    }
+  }
+}
+
 window.zoo ??= {}
 window.zoo.kittycadWebViews ??= []
 
@@ -19,9 +27,10 @@ enum ZooWebViewState {
 }
 
 export class ZooWebView extends EventTarget {
-  public el: HTMLDivElement
+  public el: HTMLElement
   public rtc: zoo.WebRTC | undefined = undefined
   public size: Size
+  public state: ZooWebViewState = ZooWebViewState.Fresh
  
   constructor(args: {
     zooClient: zoo.Client,
@@ -36,20 +45,20 @@ export class ZooWebView extends EventTarget {
       height: args.size.height - args.size.height % 4,
     }
     
-    const elZooWebView = ZooWebView.createElements({ size: sizeAdjusted })
+    this.el = ZooWebView.createElements({ size: sizeAdjusted })
     
-    const elVideo = elZooWebView.querySelector('video')
+    const elVideo = this.el.querySelector<HTMLVideoElement>('video')
     if (elVideo === null) return
     elVideo.addEventListener('contextmenu', preventDefault)
    
-    const elStart = elZooWebView.querySelector('div.start')
+    const elStart = this.el.querySelector<HTMLElement>('div.start')
     if (elStart === null) return
     
     const startZooWebRTC = () => {
       // Make sure no other web view components are running. In the future we
       // may allow it.
-      window.zoo.kittycadWebViews
-        .filter(v => [ZooWebViewState.Running, ZooWebViewState.Starting].includes(v.state))
+      window.zoo?.kittycadWebViews
+        ?.filter(v => [ZooWebViewState.Running, ZooWebViewState.Starting].indexOf(v.state) >= 0)
         .forEach(v => v.deconstructor())
       
       this.state = ZooWebViewState.Starting
@@ -72,11 +81,12 @@ export class ZooWebView extends EventTarget {
       zooWebRTC.addEventListener('close', onClose, { once: true })
 
       const onTrack = (event: Event) => {
-        elVideo.srcObject = event.target.track?.streams[0]
+        if (!(event.target instanceof zoo.WebRTC)) return
+        elVideo.srcObject = event.target.track?.streams[0] ?? null
       }
       zooWebRTC.addEventListener('track', onTrack, { once: true })
       
-      const onConnected = (event: Event) => {
+      const onConnected = (_event: Event) => {
         void elVideo.play().catch(console.warn)
         
         zooWebRTC.send(JSON.stringify({
@@ -138,12 +148,11 @@ export class ZooWebView extends EventTarget {
     }
     
     this.state = ZooWebViewState.Fresh
-    this.el = elZooWebView
     
-    window.zoo.kittycadWebViews.push(this)
+    window.zoo?.kittycadWebViews?.push(this)
     
     const elStartClick = () => {
-      ZooWebView.decoOn(sizeAdjusted, elZooWebView, elStart)
+      ZooWebView.decoOn(sizeAdjusted, this.el, elStart)
       startZooWebRTC()
     }
     elStart.addEventListener('click', elStartClick)
@@ -155,11 +164,11 @@ export class ZooWebView extends EventTarget {
     // Never remove this event listener.
     // elStart.removeEventListener('click', elStartClick)
     
-    const elVideo = this.el.querySelector('video')
+    const elVideo = this.el.querySelector<HTMLVideoElement>('video')
     if (elVideo === null) return
     elVideo.pause()
     
-    const elStart = this.el.querySelector('div.start')
+    const elStart = this.el.querySelector<HTMLElement>('div.start')
     if (elStart === null) return
     ZooWebView.decoOff(this.size, this.el, elStart)
     
@@ -168,7 +177,7 @@ export class ZooWebView extends EventTarget {
     ])
   }
 
-  static decoOff(size: Size, elZooWebView: HTMLDivElement, elStart: HTMLDivElement) {
+  static decoOff(size: Size, elZooWebView: HTMLElement, elStart: HTMLElement) {
     elZooWebView.style.width = size.width.toString()
     elZooWebView.style.height = size.height.toString()
     
@@ -177,14 +186,14 @@ export class ZooWebView extends EventTarget {
     elZooWebView.style.cursor = 'pointer'
     elZooWebView.style.backgroundColor = '#1c1c1c'
     
-    elStart.style.paddingTop = undefined
-    elStart.style.paddingRight = undefined
+    elStart.style.paddingTop = ''
+    elStart.style.paddingRight = ''
     elStart.style.width = (size.width / 2).toString()
     elStart.style.position = 'absolute'
     elStart.style.color = 'hsl(154deg 100% 25%)'
   }
 
-  static decoOn(size: Size, elZooWebView: HTMLDivElement, elStart: HTMLDivElement) {
+  static decoOn(size: Size, elZooWebView: HTMLElement, elStart: HTMLElement) {
     elZooWebView.style.justifyContent = 'right'
     elZooWebView.style.alignItems = 'flex-start'
     elStart.style.width = (size.width / 4).toString()

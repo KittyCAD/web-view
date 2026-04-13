@@ -1,9 +1,10 @@
 {
   // Visit https://aka.ms/tsconfig to read more about this file
+  "exclude": ["src/example.ts", "pkg/"],
   "compilerOptions": {
     // File Layout
-    // "rootDir": "./src",
-    // "outDir": "./dist",
+    "rootDir": "./src",
+    "outDir": "./pkg",
 
     // Environment Settings
     // See also https://aka.ms/tsconfig/module
@@ -11,8 +12,8 @@
     "moduleResolution": "bundler",
     "target": "esnext",
     "types": [],
+    "lib": ["esnext","dom"],
     // For nodejs:
-    // "lib": ["esnext"],
     // "types": ["node"],
     // and npm install -D @types/node
 
@@ -26,12 +27,12 @@
     "exactOptionalPropertyTypes": true,
 
     // Style Options
-    // "noImplicitReturns": true,
-    // "noImplicitOverride": true,
-    // "noUnusedLocals": true,
-    // "noUnusedParameters": true,
-    // "noFallthroughCasesInSwitch": true,
-    // "noPropertyAccessFromIndexSignature": true,
+    "noImplicitReturns": true,
+    "noImplicitOverride": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "noPropertyAccessFromIndexSignature": true,
 
     // Recommended Options
     "strict": true,

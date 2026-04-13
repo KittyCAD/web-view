@@ -2,9 +2,10 @@
   "name": "@kittycad/web-view",
   "version": "1.0.0",
   "main": "index.js",
+  "types": "index.d.ts",
   "scripts": {
-    "build": "npx esbuild --bundle src/index.ts --outdir=pkg",
-    "serve": "npx esbuild --bundle src/example.ts --outdir=public --servedir=public --serve=localhost:3000",
+    "build": "make build'",
+    "serve": "make serve",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
