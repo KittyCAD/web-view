@@ -6,7 +6,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const zooClient = new zoo.Client({
     token,
-    baseUrl: 'wss://api.dev.zoo.dev',
+    baseUrl: 'wss://api.zoo.dev',
   })
 
   const zooWebView = new ZooWebView({
