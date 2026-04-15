@@ -12,7 +12,8 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@kittycad/lib": "^3.2.2",
+    "@kittycad/kcl-wasm-lib": "^0.1.141",
+    "@kittycad/lib": "^4.0.3",
     "bson": "^7.2.0",
     "typescript": "^5.9.3"
   },
