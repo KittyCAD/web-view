@@ -13,14 +13,10 @@ serve: node_modules/
 .PHONY: build
 build: node_modules/
 	-mkdir pkg/
-	@if [ -f node_modules/@kittycad/kcl-wasm-lib/kcl_wasm_lib_bg.wasm ]; then \
-		cp node_modules/@kittycad/kcl-wasm-lib/kcl_wasm_lib_bg.wasm pkg/; \
-	else \
-		echo "[sync-wasm-assets] Skipping copy; missing node_modules/@kittycad/kcl-wasm-lib/kcl_wasm_lib_bg.wasm"; \
-	fi
 	npx esbuild --bundle --global-name=kittycadWebWiew src/index.ts --outdir=pkg
 	npx tsc --build
 	cp package.json pkg/
+	cp README.md pkg/
 
 clean:
 	-rm -r pkg

@@ -17,6 +17,9 @@ Various helpers to get a Zoo KittyCAD WebRTC stream onto a web page!
 npm install @kittycad/web-view @kittycad/lib
 ```
 
+You will need to copy `node_modules/@kittycad/kcl-wasm-lib/kcl_wasm_lib_bg.wasm`
+to the root of a directory that will be served by your web server.
+
 ## Quick demo
 
 ```sh
