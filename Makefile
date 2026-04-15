@@ -12,6 +12,7 @@ serve: node_modules/
 
 .PHONY: build
 build: node_modules/
+	-mkdir pkg/
 	@if [ -f node_modules/@kittycad/kcl-wasm-lib/kcl_wasm_lib_bg.wasm ]; then \
 		cp node_modules/@kittycad/kcl-wasm-lib/kcl_wasm_lib_bg.wasm pkg/; \
 	else \
