@@ -17,7 +17,6 @@ build: node_modules/
 	npx tsc --build
 	cp package.json pkg/
 	cp README.md pkg/
-	cp screenshot.png pkg/
 
 clean:
 	-rm -r pkg
