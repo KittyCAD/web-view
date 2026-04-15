@@ -3,7 +3,7 @@
   "version": "1.0.4",
   "main": "index.js",
   "types": "index.d.ts",
-  "homepage": "https://github.com/@KittyCAD/web-view",
+  "homepage": "https://github.com/KittyCAD/web-view",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/KittyCAD/web-view.git"
