@@ -61,6 +61,7 @@ export class ZooWebView extends EventTarget {
       client: args.zooClient,
       video_res_width: sizeAdjusted.width,
       video_res_height: sizeAdjusted.height,
+      order_independent_transparency: true,
       show_grid: true,
       post_effect: 'ssao',
       fps: 30,
