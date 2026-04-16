@@ -2,11 +2,11 @@ import * as zoo from '@kittycad/lib'
 import { ZooWebView } from '.'
 
 document.addEventListener('DOMContentLoaded', () => {
-  const token = 'api-564d9062-9a7a-41ee-944e-db5a3dcedc2a'
+  const token = 'api-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 
   const zooClient = new zoo.Client({
     token,
-    baseUrl: 'wss://api.dev.zoo.dev',
+    baseUrl: 'wss://api.zoo.dev',
   })
   
   const parentElRect = document.body.getBoundingClientRect()
