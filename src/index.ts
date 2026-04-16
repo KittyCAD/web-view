@@ -54,6 +54,20 @@ export class ZooWebView extends EventTarget {
     const elStart = this.el.querySelector<HTMLElement>('div.start')
     if (elStart === null) return
     
+    // Owns setting up the WebSocket. Because the WebSocket is only good for a
+    // single WebRTC handshake, and it's to be used as the ICE information
+    // exchange, any other usage by an application is unexpected.
+    const zooWebRTC = new zoo.WebRTC({
+      client: args.zooClient,
+      video_res_width: sizeAdjusted.width,
+      video_res_height: sizeAdjusted.height,
+      show_grid: true,
+      post_effect: 'ssao',
+      fps: 30,
+    })
+  
+    zooWebRTC.addResizeObserver(this.el)
+   
     const startZooWebRTC = () => {
       // Make sure no other web view components are running. In the future we
       // may allow it.
@@ -63,18 +77,6 @@ export class ZooWebView extends EventTarget {
       
       this.state = ZooWebViewState.Starting
       
-      // Owns setting up the WebSocket. Because the WebSocket is only good for a
-      // single WebRTC handshake, and it's to be used as the ICE information
-      // exchange, any other usage by an application is unexpected.
-      const zooWebRTC = new zoo.WebRTC({
-        client: args.zooClient,
-        video_res_width: sizeAdjusted.width,
-        video_res_height: sizeAdjusted.height,
-        show_grid: true,
-        post_effect: 'ssao',
-        fps: 30,
-      })
-     
       const onClose = () => {
         this.deconstructor()
       }
@@ -88,53 +90,6 @@ export class ZooWebView extends EventTarget {
       
       const onConnected = (_event: Event) => {
         void elVideo.play().catch(console.warn)
-        
-        zooWebRTC.send(JSON.stringify({
-          "type": "modeling_cmd_batch_req",
-          "requests": [
-              {
-                  "cmd": {
-                      "type": "edge_lines_visible",
-                      "hidden": false
-                  },
-                  "cmd_id": "00000000-0000-0000-0000-000000000000"
-              },
-              {
-                  "cmd": {
-                      "type": "object_visible",
-                      "object_id": "cfa78409-653d-4c26-96f1-7c45fb784840",
-                      "hidden": false
-                  },
-                  "cmd_id": "00000000-0000-0000-0000-000000000000"
-              },
-              {
-                  "cmd": {
-                      "type": "set_grid_scale",
-                      "value": 10,
-                      "units": "mm"
-                  },
-                  "cmd_id": "00000000-0000-0000-0000-000000000000"
-              },
-              {
-                  "cmd": {
-                      "type": "object_visible",
-                      "object_id": "10782f33-f588-4668-8bcd-040502d26590",
-                      "hidden": false
-                  },
-                  "cmd_id": "00000000-0000-0000-0000-000000000000"
-              },
-              {
-                  "cmd": {
-                      "type": "zoom_to_fit",
-                      "object_ids": [],
-                      "padding": 0.0,
-                  },
-                  "cmd_id": "00000000-0000-0000-0000-000000000000"
-              }
-          ],
-          "batch_id": "00000000-0000-0000-0000-000000000000",
-          "responses": true
-        }))
         
         this.rtc = zooWebRTC
         this.state = ZooWebViewState.Running

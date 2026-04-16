@@ -2,22 +2,33 @@ import * as zoo from '@kittycad/lib'
 import { ZooWebView } from '.'
 
 document.addEventListener('DOMContentLoaded', () => {
-  const token = 'api-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+  const token = 'api-564d9062-9a7a-41ee-944e-db5a3dcedc2a'
 
   const zooClient = new zoo.Client({
     token,
-    baseUrl: 'wss://api.zoo.dev',
+    baseUrl: 'wss://api.dev.zoo.dev',
   })
-
+  
+  const parentElRect = document.body.getBoundingClientRect()
+  
   const zooWebView = new ZooWebView({
     zooClient,
     size: {
-      width: 256,
-      height: 256,
+      width: parentElRect.width,
+      height: parentElRect.height,
     },
   })
   
   document.body.appendChild(zooWebView.el)
+  
+  const observerResize = new ResizeObserver((entries) => {
+    entries.forEach((entry) => {
+      zooWebView.el.style.width = entry.contentRect.width
+      zooWebView.el.style.height = entry.contentRect.height
+    })
+  })
+  
+  observerResize.observe(document.body)
   
   zooWebView.addEventListener('ready', (ev: Event) => {
     const executor = ev.target.rtc.executor()
@@ -44,7 +55,28 @@ document.addEventListener('DOMContentLoaded', () => {
       |> appearance(color="#FF0000")
     `)
     void executor.submit(project).then(() => {
-      console.log('All done running!')
+      ev.target.rtc.send(JSON.stringify({
+        "type": "modeling_cmd_batch_req",
+        "requests": [
+            {
+                "cmd": {
+                    "type": "edge_lines_visible",
+                    "hidden": false
+                },
+                "cmd_id": "00000000-0000-0000-0000-000000000000"
+            },
+            {
+                "cmd": {
+                    "type": "zoom_to_fit",
+                    "object_ids": [],
+                    "padding": 0.0,
+                },
+                "cmd_id": "00000000-0000-0000-0000-000000000000"
+            }
+        ],
+        "batch_id": "00000000-0000-0000-0000-000000000000",
+        "responses": true
+      }))
     })
   })
 })
