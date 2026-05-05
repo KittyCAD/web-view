@@ -154,8 +154,8 @@ export class ZooWebView extends EventTarget {
     elZooWebView.style.alignItems = 'flex-start'
     elStart.style.width = (size.width / 4).toString()
     elStart.style.color = 'hsl(154deg 100% 58%)'
-    elStart.style.paddingTop = '2px'
-    elStart.style.paddingRight = '2px'
+    elStart.style.paddingTop = '0.5em'
+    elStart.style.paddingRight = '0.5em'
   }
 
   static createElements(args: { size: Size }) {
