@@ -2,11 +2,18 @@ import * as zoo from '@kittycad/lib'
 import { ZooWebView } from '.'
 
 document.addEventListener('DOMContentLoaded', () => {
-  const token = 'api-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-
   const zooClient = new zoo.Client({
-    token,
-    baseUrl: 'wss://api.zoo.dev',
+    baseUrl: 'https://api.zoo.dev',
+    clientId: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
+    redirectUrl: 'http://localhost:3000',
+    scopes: ['modeling'],
+  })
+  
+  void zooClient.isReturningFromAuthServer()
+  .then(async (hasAuthCode) => {
+    if (!hasAuthCode) return
+    const data = await zooClient.getAccessToken()
+    zooClient.token = data.token.value
   })
   
   const parentElRect = document.body.getBoundingClientRect()
