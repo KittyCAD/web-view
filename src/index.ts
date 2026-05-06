@@ -54,22 +54,22 @@ export class ZooWebView extends EventTarget {
     const elStart = this.el.querySelector<HTMLElement>('div.start')
     if (elStart === null) return
     
-    // Owns setting up the WebSocket. Because the WebSocket is only good for a
-    // single WebRTC handshake, and it's to be used as the ICE information
-    // exchange, any other usage by an application is unexpected.
-    const zooWebRTC = new zoo.WebRTC({
-      client: args.zooClient,
-      video_res_width: sizeAdjusted.width,
-      video_res_height: sizeAdjusted.height,
-      order_independent_transparency: true,
-      show_grid: true,
-      post_effect: 'ssao',
-      fps: 30,
-    })
-  
-    zooWebRTC.addResizeObserver(this.el)
-   
     const startZooWebRTC = () => {
+      // Owns setting up the WebSocket. Because the WebSocket is only good for a
+      // single WebRTC handshake, and it's to be used as the ICE information
+      // exchange, any other usage by an application is unexpected.
+      const zooWebRTC = new zoo.WebRTC({
+        client: args.zooClient,
+        video_res_width: sizeAdjusted.width,
+        video_res_height: sizeAdjusted.height,
+        order_independent_transparency: true,
+        show_grid: true,
+        post_effect: 'ssao',
+        fps: 30,
+      })
+    
+      zooWebRTC.addResizeObserver(this.el)
+     
       // Make sure no other web view components are running. In the future we
       // may allow it.
       window.zoo?.kittycadWebViews
