@@ -1,6 +1,6 @@
 {
   "name": "@kittycad/web-view",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "main": "index.js",
   "types": "index.d.ts",
   "homepage": "https://github.com/KittyCAD/web-view",
@@ -17,7 +17,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@kittycad/lib": "^4.1.2",
+    "@kittycad/lib": "^4.2.2",
     "typescript": "^5.9.3"
   },
   "devDependencies": {
