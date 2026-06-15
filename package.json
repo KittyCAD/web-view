@@ -9,7 +9,7 @@
     "url": "git+https://github.com/KittyCAD/web-view.git"
   },
   "scripts": {
-    "build": "make build'",
+    "build": "make build",
     "serve": "make serve",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -17,7 +17,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@kittycad/lib": "^4.2.2",
+    "@kittycad/lib": "^4.2.14",
     "typescript": "^5.9.3"
   },
   "devDependencies": {
