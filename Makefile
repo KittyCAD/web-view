@@ -13,8 +13,8 @@ serve: node_modules/
 .PHONY: build
 build: node_modules/
 	-mkdir pkg/
-	npx esbuild --bundle --global-name=kittycadWebWiew src/index.ts --outdir=pkg
 	npx tsc --build
+	npx esbuild --bundle --format=cjs --external:@kittycad/lib --sourcemap src/index.ts --outfile=pkg/index.js
 	cp package.json pkg/
 	cp README.md pkg/
 	cp screenshot.png pkg/
