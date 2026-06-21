@@ -26,6 +26,16 @@ to the root of a directory that will be served by your web server.
 make serve
 ```
 
+The demo page on this branch is a 3x3 Zookeeper orchestration wall. Span the
+browser window across the nine displays, refresh the page, then click **Start
+Zookeeper** to run the mock recursive assembly workflow with 50 live sub-agent
+viewer sessions.
+
+The 50 sample KCL assets live in `public/sample-kcl`. Their filenames match the
+mock agent IDs, so `Zookeeper Worker 0001` loads
+`/sample-kcl/worker-0001.kcl` and `Zookeeper Sub-Orchestrator 0001` loads
+`/sample-kcl/sub-orchestrator-0001.kcl`.
+
 ## Building
 
 ```sh
