@@ -4,14 +4,18 @@ import { ZooWebView } from '.'
 document.addEventListener('DOMContentLoaded', () => {
   const zooClient = new zoo.Client({
     baseUrl: 'https://api.zoo.dev',
-    clientId: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
-    redirectUrl: 'http://localhost:3000',
-    scopes: ['modeling'],
+    // Using OAuth:
+    // clientId: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
+    // redirectUrl: 'http://localhost:3000',                  . 
+    // scopes: ['modeling'],                                  . 
+    // Or with an API token:
+    // token: 'api-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
   })
   
   if (!zooClient.token) {
     void zooClient.isReturningFromAuthServer()
     .then(async (hasAuthCode) => {
+      if (zooClient.token) return
       if (!hasAuthCode) return
       const data = await zooClient.getAccessToken()
       zooClient.token = data.token.value
