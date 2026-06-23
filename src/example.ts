@@ -9,12 +9,14 @@ document.addEventListener('DOMContentLoaded', () => {
     scopes: ['modeling'],
   })
   
-  void zooClient.isReturningFromAuthServer()
-  .then(async (hasAuthCode) => {
-    if (!hasAuthCode) return
-    const data = await zooClient.getAccessToken()
-    zooClient.token = data.token.value
-  })
+  if (!zooClient.token) {
+    void zooClient.isReturningFromAuthServer()
+    .then(async (hasAuthCode) => {
+      if (!hasAuthCode) return
+      const data = await zooClient.getAccessToken()
+      zooClient.token = data.token.value
+    })
+  }
   
   const parentElRect = document.body.getBoundingClientRect()
   

@@ -87,5 +87,8 @@ document.addEventListener('DOMContentLoaded', () => {
 })
 ```
 
+By default, starting one web-view stops any other running web-views. Set
+`allowMultiple: true` when a project needs any number running at once.
+
 ## Pretty screenshot of making tons of these
 ![nice screenshot](./screenshot.png)

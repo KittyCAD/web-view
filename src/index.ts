@@ -17,6 +17,12 @@ type Size = {
   height: number,
 }
 
+type ZooWebViewArgs = {
+  zooClient: zoo.Client,
+  size: Size,
+  allowMultiple?: boolean,
+}
+
 const preventDefault = (e: Event) => e.preventDefault()
 
 enum ZooWebViewState {
@@ -32,10 +38,7 @@ export class ZooWebView extends EventTarget {
   public size: Size
   public state: ZooWebViewState = ZooWebViewState.Fresh
  
-  constructor(args: {
-    zooClient: zoo.Client,
-    size: Size,
-  }) {
+  constructor(args: ZooWebViewArgs) {
     super()
     
     this.size = args.size
@@ -70,11 +73,11 @@ export class ZooWebView extends EventTarget {
     
       zooWebRTC.addResizeObserver(this.el)
      
-      // Make sure no other web view components are running. In the future we
-      // may allow it.
-      window.zoo?.kittycadWebViews
-        ?.filter(v => [ZooWebViewState.Running, ZooWebViewState.Starting].indexOf(v.state) >= 0)
-        .forEach(v => v.deconstructor())
+      if (args.allowMultiple !== true) {
+        window.zoo?.kittycadWebViews
+          ?.filter(v => [ZooWebViewState.Running, ZooWebViewState.Starting].indexOf(v.state) >= 0)
+          .forEach(v => v.deconstructor())
+      }
       
       this.state = ZooWebViewState.Starting
       
@@ -180,4 +183,3 @@ export class ZooWebView extends EventTarget {
     return elZooWebView
   }
 }
-
