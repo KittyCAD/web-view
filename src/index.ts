@@ -37,11 +37,13 @@ export class ZooWebView extends EventTarget {
   public rtc: zoo.WebRTC | undefined = undefined
   public size: Size
   public state: ZooWebViewState = ZooWebViewState.Fresh
+  public allowMultiple: boolean = false
  
   constructor(args: ZooWebViewArgs) {
     super()
-    
+  
     this.size = args.size
+    this.allowMultiple = args.allowMultiple ?? false
     
     const sizeAdjusted: Size = {
       width: args.size.width - args.size.width % 4,
@@ -58,6 +60,8 @@ export class ZooWebView extends EventTarget {
     if (elStart === null) return
     
     const startZooWebRTC = () => {
+      this.state = ZooWebViewState.Starting
+      
       // Owns setting up the WebSocket. Because the WebSocket is only good for a
       // single WebRTC handshake, and it's to be used as the ICE information
       // exchange, any other usage by an application is unexpected.
@@ -70,16 +74,13 @@ export class ZooWebView extends EventTarget {
         post_effect: 'ssao',
         fps: 30,
       })
+      this.rtc = zooWebRTC
     
-      zooWebRTC.addResizeObserver(this.el)
-     
-      if (args.allowMultiple !== true) {
+      if (this.allowMultiple !== true) {
         window.zoo?.kittycadWebViews
           ?.filter(v => [ZooWebViewState.Running, ZooWebViewState.Starting].indexOf(v.state) >= 0)
           .forEach(v => v.deconstructor())
       }
-      
-      this.state = ZooWebViewState.Starting
       
       const onClose = () => {
         this.deconstructor()
@@ -95,9 +96,9 @@ export class ZooWebView extends EventTarget {
       const onConnected = (_event: Event) => {
         void elVideo.play().catch(console.warn)
         
-        this.rtc = zooWebRTC
         this.state = ZooWebViewState.Running
         this.dispatchEvent(new Event('ready'))
+        this.rtc?.addResizeObserver(this.el)
       }
       
       zooWebRTC.addMouseEvents(elVideo)
@@ -107,10 +108,11 @@ export class ZooWebView extends EventTarget {
     }
     
     this.state = ZooWebViewState.Fresh
-    
+   
     window.zoo?.kittycadWebViews?.push(this)
     
     const elStartClick = () => {
+      if (this.state !== ZooWebViewState.Fresh) { return }
       ZooWebView.decoOn(sizeAdjusted, this.el, elStart)
       startZooWebRTC()
     }
@@ -118,7 +120,16 @@ export class ZooWebView extends EventTarget {
   }
   
   deconstructor() {
+    if (this.state === ZooWebViewState.Killed) { return }
+    
     this.state = ZooWebViewState.Killed
+    
+    if (this.allowMultiple) {
+      const index = window.zoo?.kittycadWebViews?.indexOf(this) ?? -1
+      if (index >= 0) {
+        window.zoo?.kittycadWebViews?.splice(index, 1)
+      }
+    }
     
     // Never remove this event listener.
     // elStart.removeEventListener('click', elStartClick)
