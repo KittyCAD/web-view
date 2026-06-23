@@ -170,6 +170,22 @@ def render_files_for_zookeeper(files):
     }
 
 
+def format_interface_context(raw_interfaces, max_items=80):
+    if not isinstance(raw_interfaces, dict) or not raw_interfaces:
+        return ""
+    lines = []
+    for file_path, manifest in sorted(raw_interfaces.items(), key=lambda item: str(item[0]))[:max_items]:
+        text = str(manifest or "").strip()
+        if not text:
+            continue
+        lines.append(f"- {render_path_for_file_path(file_path)} ({file_path})")
+        for line in text.splitlines()[:18]:
+            clean = re.sub(r"\s+", " ", line).strip()
+            if clean:
+                lines.append(f"  {clean[:260]}")
+    return "\n".join(lines)[:12000]
+
+
 def extract_import_lines(kcl):
     return "\n".join(
         line for line in str(kcl or "").splitlines()
@@ -777,6 +793,7 @@ def build_zookeeper_agent_prompt(body, agent, current_kcl, imports, render_error
     name = sanitize_text(agent.get("name"), "Zookeeper Agent")
     root_instruction = sanitize_text(body.get("rootInstruction"), "Coordinate the assembly.")
     assembly_prompt = sanitize_text(body.get("prompt"), "assembly")
+    interface_context = format_interface_context(body.get("interfaces"))
     repair_text = (
         f"\nRenderer error from the wall viewer that must be repaired:\n{render_error}\n"
         if render_error else ""
@@ -797,12 +814,16 @@ def build_zookeeper_agent_prompt(body, agent, current_kcl, imports, render_error
             "You may import child components with aliases, clone imported components, hide raw imports, and use translate(), rotate(), scale(), and appearance() to place components.",
             "Do not create part geometry. Do not use startSketchOn, startProfile, line, circle, close, extrude, revolve, subtract, boolean tools, or new primitive solids.",
             "Keep each child part as a separate imported component and arrange those components into the assembly.",
+            "Read the child KCL files and interface manifests before selecting transforms. Place by aligning named mate points, local axes, bounding boxes, and dimensions; do not guess directions or distances from the render alone.",
+            "Maintain a // ZOOKEEPER_INTERFACE block for this assembled file with units, local_origin, local_axes, bbox_mm, mate_points, child_placements, and placement_warnings.",
             "The wall server preserves import lines from the current file, so write the placement body that references those aliases.",
             f"Placement/review attempt: {attempt}",
             repair_text,
             review_text,
             "Existing import lines and aliases available to place:",
             imports or "(none)",
+            "Current interface manifests from child/sub-assembly files:",
+            interface_context or "(none yet; inspect child KCL files directly and write placement_warnings for missing manifests)",
             "Current placement body:",
             strip_import_lines(current_kcl)[:6000] or "(empty)",
         ])
@@ -818,9 +839,13 @@ def build_zookeeper_agent_prompt(body, agent, current_kcl, imports, render_error
         "Import lines are managed by the wall server; keep your output self-contained and do not rely on editing sibling files.",
         "Use Zoo's CAD/KCL tools to write, inspect, execute, and repair the KCL instead of guessing.",
         "Return a complete renderable KCL model for this one part or sub-assembly.",
+        "Include a // ZOOKEEPER_INTERFACE block near the top of the KCL body. It must state units, local_origin, local_axes, bbox_mm, mate_points, exported_aggregate, key_dimensions, and parent_interface.",
+        "Use concrete dimensions and named mate points/axes that an orchestrator can align later. Do not use vague placeholders such as TBD, approximate, or visually align.",
         f"Repair attempt: {attempt}",
         repair_text,
         review_text,
+        "Known sibling/parent interface manifests that may constrain this repair:",
+        interface_context or "(none yet)",
         "Existing import lines that the wall server will preserve outside your editable body:",
         imports or "(none)",
         "Current KCL body:",
@@ -909,6 +934,7 @@ def zookeeper_review(body):
     child_role = sanitize_text(child.get("role"), "child update")
     child_file = sanitize_text(child.get("filePath"), "")
     agent_file = sanitize_text(agent.get("filePath"), ROOT_FILE_PATH)
+    interface_context = format_interface_context(body.get("interfaces"))
     child_list = body.get("children") or []
     child_lines = []
     if isinstance(child_list, list):
@@ -922,6 +948,7 @@ def zookeeper_review(body):
         f"You are {name}, running as a hosted Zoo Zookeeper in auto mode.",
         "You are reviewing a CAD assembly after a child agent returned KCL.",
         "Use Zoo's CAD/KCL tools to inspect or execute the provided project visually.",
+        "Also inspect the underlying KCL files and the interface manifests; do not rely on the render alone for axis direction, distance, or ownership.",
         "Do not edit files in this review turn.",
         f"Assembly prompt: {sanitize_text(body.get('prompt'), 'assembly')}",
         f"Orchestrator role: {role}",
@@ -929,9 +956,12 @@ def zookeeper_review(body):
         f"Recent child update: {child_name} / {child_role} / {child_file}",
         "Available child agents that can receive rework:",
         "\n".join(child_lines) or "(none)",
-        "Decide whether any child needs rework based on the visual/model result and interface fit.",
+        "Available interface manifests:",
+        interface_context or "(none)",
+        "Decide whether any child or orchestrator needs rework based on visual/model result, KCL evidence, and interface fit.",
+        "Target an orchestrator when the problem is placement, transform, imports, mate alignment, axis convention, or assembly integration. Target a worker only when that worker's own part geometry is wrong.",
         "Return JSON only with this exact shape:",
-        '{"summary":"one sentence visual review","rework":[{"target":"exact child role/name/file when possible","reason":"why","instruction":"specific rework request for that child"}]}',
+        '{"summary":"one sentence visual review","rework":[{"target":"exact orchestrator or worker role/name/file when possible","reason":"why, including KCL/interface evidence","instruction":"specific rework request"}]}',
         "If no rework is needed, return an empty rework array.",
     ])
     result = zookeeper_turn(
@@ -1018,6 +1048,7 @@ def orchestrate(body):
                 "Choose the number of agents that fits the requested assembly instead of filling the maximum.",
                 "For moderately complex mechanical assemblies, prefer roughly 15 to 25 agents unless the prompt clearly needs fewer or more.",
                 "Workers should own concrete CAD parts. Orchestrators should own sub-assemblies.",
+                "Each instruction should include concrete dimensional/interface context: local axes, expected mate points, neighboring parts, and what the parent orchestrator expects back.",
                 "Keep roles short, physical, and suitable as graph labels.",
             ]),
             f"Prompt: {prompt}\nMaximum agents: {max_agents}",

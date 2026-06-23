@@ -3228,6 +3228,8 @@
   var zooFallbackRetryBackoffMs = 2200;
   var defaultPrompt = "Design a small rocket engine assembly";
   var rootFilePath = "main.kcl";
+  var interfaceBlockStart = "ZOOKEEPER_INTERFACE";
+  var interfaceBlockEnd = "/ZOOKEEPER_INTERFACE";
   var agentColors = [
     "#00A3FF",
     "#FF4F8B",
@@ -3449,6 +3451,20 @@
 `;
   var objectFromMap = (files) => Object.fromEntries(files.entries());
   var stripImportLines = (source) => source.split("\n").filter((line) => !line.trim().startsWith("import ")).join("\n");
+  var cleanInterfaceLine = (line) => line.replace(/^\s*\/\/\s?/, "").replace(/^\s*#\s?/, "").trim();
+  var extractInterfaceManifest = (source) => {
+    const lines = source.split("\n");
+    const startIndex = lines.findIndex((line) => line.includes(interfaceBlockStart) && !line.includes(interfaceBlockEnd));
+    if (startIndex === -1) return "";
+    const endIndex = lines.findIndex((line, index) => index > startIndex && line.includes(interfaceBlockEnd));
+    const rawLines = lines.slice(startIndex + 1, endIndex === -1 ? Math.min(lines.length, startIndex + 18) : endIndex).map(cleanInterfaceLine).filter(Boolean);
+    return rawLines.join("\n").slice(0, 1800);
+  };
+  var fallbackInterfaceManifest = (agent) => [
+    "interface: missing",
+    `role: ${agent.role}`,
+    "placement_warning: inspect the child KCL before choosing axes, distances, or mate points."
+  ].join("\n");
   var createZooClient = () => {
     const zooApiToken = window.ZOO_API_TOKEN ?? window.localStorage.getItem("ZOO_API_TOKEN") ?? void 0;
     const zooClient = zooApiToken === void 0 ? new n({
@@ -3491,6 +3507,7 @@
     let rootReviewRounds = 0;
     let rootInstruction = "Coordinate the complete assembly and merge child KCL into the root view.";
     let kclFiles = /* @__PURE__ */ new Map();
+    let interfaceManifests = /* @__PURE__ */ new Map();
     const centerTile = document.createElement("section");
     centerTile.classList.add("wall-tile", "orchestrator-tile");
     const centerView = new ZooWebView({
@@ -3793,10 +3810,60 @@
       }
       appendAgentLog(agent, line, direction);
     };
+    const agentStillActive = (agent, currentRun) => currentRun === runId && (agent.id === rootAgentId || agents.has(agent.id));
+    const setWorkAgentStatus = (agent, status) => {
+      if (agent.id === rootAgentId) {
+        renderAllGraphs();
+        return;
+      }
+      setAgentStatus(agent, status);
+    };
+    const appendWorkAgentLog = (agent, line, direction = "sys") => {
+      if (agent.id === rootAgentId) {
+        rootLogLine(line, direction);
+        return;
+      }
+      appendAgentLog(agent, line, direction);
+    };
+    const submitWorkAgentProject = async (agent, onSuccess) => {
+      if (agent.id !== rootAgentId) return submitAgentProject(agent, onSuccess);
+      if (kclFiles.size === 0) return { ok: false, message: "root view not ready" };
+      try {
+        await submitProject(centerView, renderProjectFor(rootFilePath), (message) => {
+          centerStatus.textContent = `Center KCL failed: ${message}`;
+          rootLogLine(`root kcl failed: ${message}`);
+        }, () => {
+          sendRootCameraCommand(centerView);
+          onSuccess?.();
+        });
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, message: errorToMessage(error) };
+      }
+    };
+    const updateInterfaceManifest = (agent, kcl) => {
+      const manifest = extractInterfaceManifest(kcl);
+      if (manifest.trim().length === 0) return;
+      interfaceManifests.set(agent.filePath, manifest);
+      appendWorkAgentLog(agent, `< interface manifest captured for ${agent.filePath}`, "in");
+    };
+    const interfaceManifestFor = (agent) => interfaceManifests.get(agent.filePath) ?? fallbackInterfaceManifest(agent);
     const reviewChildren = (agent) => graphChildren(agent.id);
+    const childInterfaceContext = (agent) => {
+      const children = reviewChildren(agent);
+      if (children.length === 0) return "";
+      return children.map((child) => [
+        `- ${aliasForFilePath(child.filePath)} from ${child.filePath}: ${child.role}`,
+        interfaceManifestFor(child).split("\n").map((line) => `  ${line}`).join("\n")
+      ].join("\n")).join("\n");
+    };
     const reviewWorkerTargets = (agent) => {
       const collect = (id) => graphChildren(id).flatMap((child) => child.kind === "worker" ? [child] : reviewWorkerTargets(child));
       return collect(agent.id);
+    };
+    const reviewOrchestratorTargets = (agent) => {
+      const collect = (id) => graphChildren(id).flatMap((child) => child.kind === "orchestrator" ? [child, ...reviewOrchestratorTargets(child)] : []);
+      return agent.id === rootAgentId ? [agent, ...collect(agent.id)] : [agent, ...collect(agent.id)];
     };
     const reviewFilesFor = (agent) => {
       const entryFilePath = agent.id === rootAgentId ? rootFilePath : agent.filePath;
@@ -3806,8 +3873,9 @@
       return files;
     };
     const workerBodyReady = (agent) => stripImportLines(kclFiles.get(agent.filePath) ?? "").trim().length > 0;
-    const rankReworkTarget = (parent, request) => {
-      const candidates = reviewWorkerTargets(parent);
+    const pendingWorkerTargets = (agent) => reviewWorkerTargets(agent).filter((child) => !workerBodyReady(child));
+    const placementReady = (agent) => pendingWorkerTargets(agent).length === 0;
+    const rankAgentTarget = (candidates, request) => {
       if (candidates.length === 0) return void 0;
       const targetText = request.target.toLowerCase();
       const fullText = `${request.target} ${request.instruction} ${request.reason}`.toLowerCase();
@@ -3833,25 +3901,45 @@
       const ranked = candidates.map((candidate) => ({ candidate, score: score(candidate) })).sort((a, b) => b.score - a.score);
       return ranked[0];
     };
+    const rankWorkerReworkTarget = (parent, request) => rankAgentTarget(reviewWorkerTargets(parent), request);
+    const rankOrchestratorReworkTarget = (parent, request) => rankAgentTarget(reviewOrchestratorTargets(parent), request);
     const findReworkTarget = (parent, request, fallbackChild) => {
-      const ranked = rankReworkTarget(parent, request);
+      const ranked = rankWorkerReworkTarget(parent, request);
       return ranked?.score ? ranked.candidate : fallbackChild;
     };
-    const isPlacementRework = (request) => /\b(assembly|assemble|place|placement|position|translate|rotate|align|layout|duplicate|stray|unassembled|integrat|root)\b/i.test(`${request.target} ${request.reason} ${request.instruction}`);
-    const isGeometryRework = (request) => /\b(solver|constraint|sketch|profile|hole|through-hole|cut|subtract|extrude|geometry|body|part|generate|create|empty|zero bytes|file|kcl|plate|bracket|support)\b/i.test(`${request.target} ${request.reason} ${request.instruction}`);
+    const isPlacementRework = (request) => /\b(assembly|assemble|place|placement|position|translate|rotate|align|axis convention|datum|origin|mate|layout|duplicate|stray|unassembled|integrat|import|clone|hidden|unplaced|root|transform|coaxial)\b/i.test(`${request.target} ${request.reason} ${request.instruction}`);
+    const isGeometryRework = (request) => /\b(solver|constraint|sketch|profile|hole|through-hole|cut|subtract|extrude|geometry|body|part|generate|create|empty|zero bytes|file|kcl|plate|bracket|support|fails execution|engine error|under-constrained)\b/i.test(`${request.target} ${request.reason} ${request.instruction}`);
+    const isOrchestratorOwnedRework = (request) => {
+      const text = `${request.target} ${request.reason} ${request.instruction}`;
+      return isPlacementRework(request) || /\b(parent applies|parent assembly|assembly file|placement layer|local axis|local datum|interface fit|not integrated|not placed|imported but not)\b/i.test(text) || /\b(clone|translate|rotate|scale)\(/i.test(text);
+    };
+    const owningOrchestratorFor = (parent, request, fallbackChild) => {
+      const rankedOrchestrator = rankOrchestratorReworkTarget(parent, request);
+      if (rankedOrchestrator !== void 0 && rankedOrchestrator.score > 0) return rankedOrchestrator.candidate;
+      const rankedWorker = rankWorkerReworkTarget(parent, request);
+      if (rankedWorker !== void 0 && rankedWorker.score > 0) {
+        return graphNode(rankedWorker.candidate.parentId) ?? parent;
+      }
+      if (fallbackChild.kind === "worker") return graphNode(fallbackChild.parentId) ?? parent;
+      return fallbackChild;
+    };
     const placementTargetFor = (parent) => {
-      if (parent.id !== rootAgentId) return parent;
-      return graphChildren(rootAgentId).find((child) => child.kind === "orchestrator");
+      return parent;
     };
     const placementInstructionFor = (parent, changedChild, extra = "") => {
       const childImports = reviewChildren(parent).map((child) => `- ${aliasForFilePath(child.filePath)} from ${child.filePath}: ${child.role}`).join("\n");
+      const interfaces = childInterfaceContext(parent);
       return [
         `Update ${parent.name}'s assembly placement layer after ${changedChild.role} changed.`,
         "Use imported child aliases, clone(), hide(), translate(), rotate(), scale(), and appearance() only.",
         "Do not create or modify part geometry. Do not use sketches, profiles, lines, circles, extrude, subtract, or boolean modeling tools.",
+        "Before choosing transforms, inspect the child KCL and the interface manifests below for local origins, axes, bounding boxes, mate points, and dimensions.",
+        "Place children by aligning named mate points and axes. If a child is missing an interface manifest, infer only from its KCL and leave a concise interface warning in the assembly manifest.",
         "Keep each child part as a separate imported component and place the components into one coherent assembly.",
         childImports ? `Child imports:
 ${childImports}` : "",
+        interfaces ? `Child interface manifests:
+${interfaces}` : "",
         extra
       ].filter(Boolean).join("\n");
     };
@@ -3862,8 +3950,8 @@ ${childImports}` : "",
       if (existing !== void 0) window.clearTimeout(existing);
       const timer = window.setTimeout(() => {
         placementTimers.delete(parent.id);
-        if (currentRun !== runId || !agents.has(parent.id)) return;
-        appendAgentLog(parent, `-> placement update after ${changedChild.role}`, "out");
+        if (!agentStillActive(parent, currentRun)) return;
+        appendWorkAgentLog(parent, `-> placement update after ${changedChild.role}`, "out");
         void requestAgentWork(parent, currentRun, "", 0, placementInstructionFor(parent, changedChild, extraInstruction));
       }, 1400);
       placementTimers.set(parent.id, timer);
@@ -3872,7 +3960,7 @@ ${childImports}` : "",
       if (currentRun !== runId || !active) return;
       const children = reviewWorkerTargets(parent);
       if (children.length === 0) return;
-      const pendingChildren = children.filter((child) => !workerBodyReady(child));
+      const pendingChildren = pendingWorkerTargets(parent);
       if (pendingChildren.length > 0) {
         reviewLogLine(parent, `< visual review deferred: waiting on ${pendingChildren.map((child) => child.role).join(", ")}`, "in");
         return;
@@ -3909,7 +3997,8 @@ ${childImports}` : "",
               role: child.role,
               filePath: child.filePath
             })),
-            files: reviewFilesFor(parent)
+            files: reviewFilesFor(parent),
+            interfaces: objectFromMap(interfaceManifests)
           })
         });
         if (!response.ok) throw new Error(`review ${response.status}`);
@@ -3923,10 +4012,10 @@ ${childImports}` : "",
         }
         review.rework.forEach((item) => {
           const instruction = `${item.reason ? `${item.reason}: ` : ""}${item.instruction}`;
-          const rankedTarget = rankReworkTarget(parent, item);
+          const rankedTarget = rankWorkerReworkTarget(parent, item);
           const hasWorkerTarget = rankedTarget !== void 0 && rankedTarget.score > 0;
-          if (isPlacementRework(item) && (!hasWorkerTarget || !isGeometryRework(item))) {
-            const placementTarget = placementTargetFor(parent);
+          if (isOrchestratorOwnedRework(item) && (!isGeometryRework(item) || isPlacementRework(item))) {
+            const placementTarget = placementTargetFor(owningOrchestratorFor(parent, item, changedChild));
             if (placementTarget === void 0) {
               reviewLogLine(parent, "< placement rework skipped; no orchestrator target");
               return;
@@ -3967,14 +4056,25 @@ ${childImports}` : "",
           submitRootProject();
           rootLogLine(`< merged ${agent.role} into root assembly`, "in");
           const rootAgent = graphNode(rootAgentId);
-          if (rootAgent !== void 0) scheduleOrchestratorReview(rootAgent, agent);
+          if (rootAgent !== void 0) {
+            if (placementReady(rootAgent)) scheduleOrchestratorPlacement(rootAgent, agent);
+            else {
+              const pending = pendingWorkerTargets(rootAgent).map((child) => child.role).join(", ");
+              rootLogLine(`< root placement deferred: waiting on ${pending}`, "in");
+            }
+            scheduleOrchestratorReview(rootAgent, agent);
+          }
           break;
         }
         const parent = agents.get(parentId);
         if (parent === void 0) break;
         appendAgentLog(parent, `< merged child update: ${agent.role}`, "in");
         void submitAgentProject(parent);
-        scheduleOrchestratorPlacement(parent, agent);
+        if (placementReady(parent)) scheduleOrchestratorPlacement(parent, agent);
+        else {
+          const pending = pendingWorkerTargets(parent).map((child) => child.role).join(", ");
+          appendAgentLog(parent, `< placement deferred: waiting on ${pending}`, "in");
+        }
         scheduleOrchestratorReview(parent, agent);
         parentId = parent.parentId;
       }
@@ -4282,16 +4382,16 @@ ${childImports}` : "",
       }
     };
     const requestAgentWork = async (agent, currentRun, renderError = "", repairAttempt = 0, reviewInstruction = "", zooRetryAttempt = 0) => {
-      if (currentRun !== runId || !agents.has(agent.id)) return;
-      setAgentStatus(agent, "running");
+      if (!agentStillActive(agent, currentRun)) return;
+      setWorkAgentStatus(agent, "running");
       if (zooRetryAttempt > 0) {
-        appendAgentLog(agent, `-> hosted Zookeeper retry ${zooRetryAttempt}/${maxZooFallbackRetries}`, "out");
+        appendWorkAgentLog(agent, `-> hosted Zookeeper retry ${zooRetryAttempt}/${maxZooFallbackRetries}`, "out");
       } else if (reviewInstruction.trim().length > 0) {
-        appendAgentLog(agent, `-> rework iteration ${repairAttempt}: ${reviewInstruction.slice(0, 180)}`, "out");
+        appendWorkAgentLog(agent, `-> rework iteration ${repairAttempt}: ${reviewInstruction.slice(0, 180)}`, "out");
       } else if (renderError.trim().length === 0) {
-        appendAgentLog(agent, `-> ${agent.instruction}`, "out");
+        appendWorkAgentLog(agent, `-> ${agent.instruction}`, "out");
       } else {
-        appendAgentLog(agent, `-> repair iteration ${repairAttempt}: ${renderError.slice(0, 180)}`, "out");
+        appendWorkAgentLog(agent, `-> repair iteration ${repairAttempt}: ${renderError.slice(0, 180)}`, "out");
       }
       try {
         const response = await fetch("/api/zookeeper/work", {
@@ -4311,6 +4411,7 @@ ${childImports}` : "",
             },
             rootInstruction,
             files: objectFromMap(kclFiles),
+            interfaces: objectFromMap(interfaceManifests),
             currentKcl: kclFiles.get(agent.filePath) ?? "",
             renderError,
             reviewInstruction,
@@ -4319,57 +4420,58 @@ ${childImports}` : "",
         });
         if (!response.ok) throw new Error(`agent work ${response.status}`);
         const update = await response.json();
-        if (currentRun !== runId || !agents.has(agent.id)) return;
+        if (!agentStillActive(agent, currentRun)) return;
         if (isRetryableZooFallback(update)) {
-          update.dialog?.slice(-3).forEach((line) => appendAgentLog(agent, `< ws: ${line}`, "in"));
-          appendAgentLog(agent, `< hosted Zookeeper failed: ${update.summary}`, "in");
+          update.dialog?.slice(-3).forEach((line) => appendWorkAgentLog(agent, `< ws: ${line}`, "in"));
+          appendWorkAgentLog(agent, `< hosted Zookeeper failed: ${update.summary}`, "in");
           if (zooRetryAttempt < maxZooFallbackRetries) {
             const nextRetry = zooRetryAttempt + 1;
-            appendAgentLog(agent, `-> retrying hosted Zookeeper after websocket fallback (${nextRetry}/${maxZooFallbackRetries})`, "out");
+            appendWorkAgentLog(agent, `-> retrying hosted Zookeeper after websocket fallback (${nextRetry}/${maxZooFallbackRetries})`, "out");
             await wait(zooFallbackRetryBackoffMs * nextRetry);
-            if (currentRun !== runId || !agents.has(agent.id)) return;
+            if (!agentStillActive(agent, currentRun)) return;
             await requestAgentWork(agent, currentRun, renderError, repairAttempt, reviewInstruction, nextRetry);
             return;
           }
-          appendAgentLog(agent, `< fallback refused after ${maxZooFallbackRetries} retries; no KCL accepted`);
-          setAgentStatus(agent, "error");
+          appendWorkAgentLog(agent, `< fallback refused after ${maxZooFallbackRetries} retries; no KCL accepted`);
+          setWorkAgentStatus(agent, "error");
           return;
         }
         kclFiles.set(agent.filePath, update.kcl);
+        updateInterfaceManifest(agent, update.kcl);
         if (update.dialog !== void 0 && update.dialog.length > 0) {
-          update.dialog.slice(-3).forEach((line) => appendAgentLog(agent, `< ws: ${line}`, "in"));
+          update.dialog.slice(-3).forEach((line) => appendWorkAgentLog(agent, `< ws: ${line}`, "in"));
         }
-        appendAgentLog(agent, `< ${update.source === "zookeeper" ? "Zookeeper auto KCL" : "fallback KCL"}: ${update.summary}`, "in");
-        appendAgentLog(agent, `< wrote ${agent.filePath}${repairAttempt === 0 ? "" : ` (repair ${repairAttempt})`}`, "in");
-        setAgentStatus(agent, agent.kind === "orchestrator" ? "reviewing" : "complete");
-        const renderResult = await submitAgentProject(agent);
-        if (currentRun !== runId || !agents.has(agent.id)) return;
+        appendWorkAgentLog(agent, `< ${update.source === "zookeeper" ? "Zookeeper auto KCL" : "fallback KCL"}: ${update.summary}`, "in");
+        appendWorkAgentLog(agent, `< wrote ${agent.filePath}${repairAttempt === 0 ? "" : ` (repair ${repairAttempt})`}`, "in");
+        setWorkAgentStatus(agent, agent.kind === "orchestrator" ? "reviewing" : "complete");
+        const renderResult = await submitWorkAgentProject(agent);
+        if (!agentStillActive(agent, currentRun)) return;
         if (!renderResult.ok) {
           const message = renderResult.message ?? "renderer rejected KCL";
           if (message.includes("view not ready") || message.includes("view not connected")) {
-            appendAgentLog(agent, `< render queued until engine connects: ${message}`);
+            appendWorkAgentLog(agent, `< render queued until engine connects: ${message}`);
             return;
           }
           if (repairAttempt < maxAgentRepairAttempts) {
-            appendAgentLog(agent, `-> renderer rejected KCL; requesting repair ${repairAttempt + 1}`, "out");
+            appendWorkAgentLog(agent, `-> renderer rejected KCL; requesting repair ${repairAttempt + 1}`, "out");
             await requestAgentWork(agent, currentRun, message, repairAttempt + 1, reviewInstruction);
           } else {
-            appendAgentLog(agent, `< renderer rejected KCL after ${maxAgentRepairAttempts} repair attempts: ${message}`);
-            setAgentStatus(agent, "error");
+            appendWorkAgentLog(agent, `< renderer rejected KCL after ${maxAgentRepairAttempts} repair attempts: ${message}`);
+            setWorkAgentStatus(agent, "error");
           }
           return;
         }
         refreshAncestorProjects(agent);
         if (agent.kind === "orchestrator") {
           after(900, () => {
-            if (currentRun !== runId || !agents.has(agent.id) || agent.status === "error") return;
-            setAgentStatus(agent, "complete");
+            if (!agentStillActive(agent, currentRun) || agent.status === "error") return;
+            setWorkAgentStatus(agent, "complete");
           });
         }
       } catch (error) {
-        if (currentRun !== runId || !agents.has(agent.id)) return;
-        appendAgentLog(agent, `< agent update failed: ${errorToMessage(error)}`);
-        setAgentStatus(agent, "error");
+        if (!agentStillActive(agent, currentRun)) return;
+        appendWorkAgentLog(agent, `< agent update failed: ${errorToMessage(error)}`);
+        setWorkAgentStatus(agent, "error");
       }
     };
     const runZookeeper = async () => {
@@ -4395,6 +4497,7 @@ ${childImports}` : "",
       activeSource = plan.source;
       rootInstruction = plan.root.instruction;
       kclFiles = new Map(Object.entries(plan.files));
+      interfaceManifests = /* @__PURE__ */ new Map();
       rootLogLine(`< ${plan.source} plan accepted: ${plan.agents.length} sub-agents`, "in");
       plan.notes?.forEach((note) => rootLogLine(`system: ${note}`));
       renderAllGraphs();
@@ -4458,6 +4561,7 @@ ${childImports}` : "",
       rootReviewRounds = 0;
       activeSessionId = "";
       kclFiles = /* @__PURE__ */ new Map();
+      interfaceManifests = /* @__PURE__ */ new Map();
       void centerView.deconstructor();
       rootLogLine("system: zookeeper stopped");
       startButton.disabled = false;
