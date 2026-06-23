@@ -21,6 +21,7 @@ type ZooWebViewArgs = {
   zooClient: zoo.Client,
   size: Size,
   allowMultiple?: boolean,
+  autoStart?: boolean,
 }
 
 const preventDefault = (e: Event) => e.preventDefault()
@@ -38,19 +39,21 @@ export class ZooWebView extends EventTarget {
   public size: Size
   public state: ZooWebViewState = ZooWebViewState.Fresh
   public allowMultiple: boolean = false
+  public autoStart: boolean = false
  
   constructor(args: ZooWebViewArgs) {
     super()
   
     this.size = args.size
     this.allowMultiple = args.allowMultiple ?? false
+    this.autoStart = args.autoStart ?? false
     
     const sizeAdjusted: Size = {
       width: args.size.width - args.size.width % 4,
       height: args.size.height - args.size.height % 4,
     }
     
-    this.el = ZooWebView.createElements({ size: sizeAdjusted })
+    this.el = ZooWebView.createElements({ size: sizeAdjusted, autoStart: this.autoStart })
     
     const elVideo = this.el.querySelector<HTMLVideoElement>('video')
     if (elVideo === null) return
@@ -88,6 +91,7 @@ export class ZooWebView extends EventTarget {
 
       const onTrack = (event: Event) => {
         if (!(event.target instanceof zoo.WebRTC)) return
+        elVideo.muted = true
         elVideo.srcObject = event.target.track?.streams[0] ?? null
       }
       zooWebRTC.addEventListener('track', onTrack, { once: true })
@@ -116,6 +120,11 @@ export class ZooWebView extends EventTarget {
       startZooWebRTC()
     }
     elStart.addEventListener('click', elStartClick)
+    
+    if (this.autoStart) {
+      // Start on the next frame, after DOM has elements attached.
+      requestAnimationFrame(elStartClick)
+    }
   }
   
   deconstructor() {
@@ -171,7 +180,7 @@ export class ZooWebView extends EventTarget {
     elStart.style.paddingRight = '0.5em'
   }
 
-  static createElements(args: { size: Size }) {
+  static createElements(args: { size: Size, autoStart: boolean }) {
     const elZooWebView = document.createElement('div')
     const elVideo = document.createElement('video')
     const elStart = document.createElement('div')
@@ -190,6 +199,11 @@ export class ZooWebView extends EventTarget {
       
     elZooWebView.appendChild(elVideo)
     elZooWebView.appendChild(elStart)
+
+    if (args.autoStart) {
+      elStart.style.display = 'none'
+    }
+    
     return elZooWebView
   }
 }
