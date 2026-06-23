@@ -60,8 +60,6 @@ export class ZooWebView extends EventTarget {
     if (elStart === null) return
     
     const startZooWebRTC = () => {
-      this.state = ZooWebViewState.Starting
-      
       // Owns setting up the WebSocket. Because the WebSocket is only good for a
       // single WebRTC handshake, and it's to be used as the ICE information
       // exchange, any other usage by an application is unexpected.
@@ -81,6 +79,7 @@ export class ZooWebView extends EventTarget {
           ?.filter(v => [ZooWebViewState.Running, ZooWebViewState.Starting].indexOf(v.state) >= 0)
           .forEach(v => v.deconstructor())
       }
+      this.state = ZooWebViewState.Starting
       
       const onClose = () => {
         this.deconstructor()
@@ -112,7 +111,7 @@ export class ZooWebView extends EventTarget {
     window.zoo?.kittycadWebViews?.push(this)
     
     const elStartClick = () => {
-      if (this.state !== ZooWebViewState.Fresh) { return }
+      if (![ZooWebViewState.Fresh, ZooWebViewState.Killed].includes(this.state)) { return }
       ZooWebView.decoOn(sizeAdjusted, this.el, elStart)
       startZooWebRTC()
     }
