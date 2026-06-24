@@ -23,6 +23,34 @@ type WallView = {
   isOrchestrator?: boolean,
 }
 
+type PlannedPart = {
+  name: string,
+  role: string,
+  description: string,
+  color: string,
+  width: number,
+  height: number,
+  depth: number,
+  position: { x: number, y: number, z: number },
+}
+
+type PromptPlan = {
+  title: string,
+  summary: string,
+  parts: PlannedPart[],
+}
+
+type RuntimeView = {
+  wallView: WallView,
+  webView: ZooWebView,
+  log: HTMLElement,
+  state: HTMLElement | null,
+  name: HTMLElement | null,
+  role: HTMLElement | null,
+  ready: boolean,
+  pendingProject?: Map<string, string>,
+}
+
 const rows = 3
 const cols = 3
 const centerIndex = 4
@@ -53,6 +81,10 @@ const partRoles = [
 const pathForRole = (role: string) => `parts/${role.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase()}.kcl`
 
 const format = (value: number) => Number(value.toFixed(3))
+
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
+
+const slugify = (value: string) => value.replace(/[^a-z0-9]+/gi, '-').replace(/^-|-$/g, '').toLowerCase() || 'part'
 
 const randomId = () => `00000000-0000-4000-8000-${Math.random().toString(16).slice(2, 14).padEnd(12, '0')}`
 
@@ -220,6 +252,127 @@ ${id('profile002')} = startProfile(${id('sketch002')}, at = [${format(center.x -
 ${id('extrude002')} = extrude(${id('profile002')}, length = ${format(depth + 0.34)})
   |> appearance(color="#F8FAFC")
 `.trimStart()
+}
+
+const sanitizeColor = (color: string | undefined, index: number) => {
+  if (color !== undefined && /^#[0-9a-f]{6}$/i.test(color)) return color
+  return colors[index % colors.length] ?? '#2DD4BF'
+}
+
+const sanitizePart = (value: unknown, index: number, count: number): PlannedPart => {
+  const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
+  const name = typeof record.name === 'string' && record.name.trim().length > 0
+    ? record.name.trim()
+    : `Generated Part ${String(index + 1).padStart(2, '0')}`
+  const role = typeof record.role === 'string' && record.role.trim().length > 0
+    ? record.role.trim()
+    : name
+  const description = typeof record.description === 'string' ? record.description.trim() : ''
+  const angle = (Math.PI * 2 * index) / Math.max(1, count) - Math.PI / 2
+  const positionRecord = typeof record.position === 'object' && record.position !== null
+    ? record.position as Record<string, unknown>
+    : {}
+  const numberOr = (input: unknown, fallback: number) => typeof input === 'number' && Number.isFinite(input) ? input : fallback
+
+  return {
+    name,
+    role,
+    description,
+    color: sanitizeColor(typeof record.color === 'string' ? record.color : undefined, index),
+    width: format(clamp(numberOr(record.width, 1.15 + (index % 4) * 0.26), 0.35, 3.5)),
+    height: format(clamp(numberOr(record.height, 0.82 + (index % 3) * 0.18), 0.35, 2.8)),
+    depth: format(clamp(numberOr(record.depth, 0.85 + index * 0.1), 0.25, 3.2)),
+    position: {
+      x: format(clamp(numberOr(positionRecord.x, Math.cos(angle) * 3.15), -4.2, 4.2)),
+      y: format(clamp(numberOr(positionRecord.y, Math.sin(angle) * 1.75), -2.35, 2.35)),
+      z: format(clamp(numberOr(positionRecord.z, 0.58), 0.15, 1.4)),
+    },
+  }
+}
+
+const sanitizePlan = (value: unknown): PromptPlan => {
+  const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {}
+  const rawParts = Array.isArray(record.parts) ? record.parts.slice(0, perimeterOrder.length) : []
+  const parts = rawParts.map((part, index) => sanitizePart(part, index, rawParts.length))
+  return {
+    title: typeof record.title === 'string' && record.title.trim().length > 0 ? record.title.trim() : 'Prompted Assembly',
+    summary: typeof record.summary === 'string' ? record.summary.trim() : '',
+    parts,
+  }
+}
+
+const plannedPartKcl = (
+  part: PlannedPart,
+  index: number,
+  center: WallView['center'],
+  prefix = '',
+) => {
+  const id = (name: string) => `${prefix}${name}`
+  const width = part.width
+  const height = part.height
+  const depth = part.depth
+  const x = format(center.x - width / 2)
+  const y = format(center.y - height / 2)
+  const ribWidth = format(width * 0.68)
+  const ribHeight = format(Math.max(0.18, height * 0.2))
+  const postWidth = format(Math.max(0.2, Math.min(width, height) * 0.28))
+
+  return `// ${part.name}: ${part.description || part.role}
+${id('sketch001')} = startSketchOn(XY)
+${id('profile001')} = startProfile(${id('sketch001')}, at = [${x}, ${y}])
+  |> line(end = [${width}, 0])
+  |> line(end = [0, ${height}])
+  |> line(end = [${format(-width)}, 0])
+  |> close()
+${id('body001')} = extrude(${id('profile001')}, length = ${depth})
+  |> appearance(color="${part.color}")
+
+${id('sketch002')} = startSketchOn(XY)
+${id('profile002')} = startProfile(${id('sketch002')}, at = [${format(center.x - ribWidth / 2)}, ${format(center.y - ribHeight / 2)}])
+  |> line(end = [${ribWidth}, 0])
+  |> line(end = [0, ${ribHeight}])
+  |> line(end = [${format(-ribWidth)}, 0])
+  |> close()
+${id('rib001')} = extrude(${id('profile002')}, length = ${format(depth + 0.28 + index * 0.03)})
+  |> appearance(color="#F8FAFC")
+
+${id('sketch003')} = startSketchOn(XY)
+${id('profile003')} = startProfile(${id('sketch003')}, at = [${format(center.x + width * 0.18 - postWidth / 2)}, ${format(center.y + height * 0.18 - postWidth / 2)}])
+  |> line(end = [${postWidth}, 0])
+  |> line(end = [0, ${postWidth}])
+  |> line(end = [${format(-postWidth)}, 0])
+  |> close()
+${id('post001')} = extrude(${id('profile003')}, length = ${format(depth + 0.54)})
+  |> appearance(color="#CBD5E1")
+`.trimStart()
+}
+
+const assemblyDatumKcl = (title: string) => `// Zookeeper Orchestrator assembly: ${title}
+sketch001 = startSketchOn(XY)
+profile001 = startProfile(sketch001, at = [-4.8, -2.75])
+  |> line(end = [9.6, 0])
+  |> line(end = [0, 5.5])
+  |> line(end = [-9.6, 0])
+  |> close()
+extrude001 = extrude(profile001, length = 0.14)
+  |> appearance(color="#111827")
+`.trimStart()
+
+const projectForPart = (part: PlannedPart, index: number) => {
+  const project = new Map<string, string>()
+  project.set('main.kcl', plannedPartKcl(part, index, { x: 0, y: 0, z: part.position.z }))
+  return project
+}
+
+const projectForAssembly = (plan: PromptPlan) => {
+  const project = new Map<string, string>()
+  project.set(
+    'main.kcl',
+    `${assemblyDatumKcl(plan.title)}\n\n${plan.parts.map((part, index) => (
+      plannedPartKcl(part, index, part.position, `p${String(index + 1).padStart(2, '0')}_`)
+    )).join('\n\n')}`,
+  )
+  return project
 }
 
 const orchestratorKcl = () => `
@@ -405,6 +558,137 @@ const attachWorkerDebugLog = (webView: ZooWebView, log: HTMLElement) => {
   attach()
 }
 
+const fetchPromptPlan = async (prompt: string) => {
+  const response = await fetch('/plan', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt }),
+  })
+  const payload = await response.json() as { plan?: unknown, error?: string }
+  if (!response.ok || payload.plan === undefined) {
+    throw new Error(payload.error ?? `planner failed with HTTP ${response.status}`)
+  }
+  const plan = sanitizePlan(payload.plan)
+  if (plan.parts.length === 0) throw new Error('planner returned no parts')
+  return plan
+}
+
+const submitRuntimeProject = async (
+  runtime: RuntimeView,
+  project: Map<string, string>,
+  label: string,
+) => {
+  runtime.pendingProject = project
+  runtime.wallView.project = project
+  runtime.wallView.filePath = label
+  writeLog(runtime.log, `loading ${label}`)
+
+  if (!runtime.ready) {
+    writeLog(runtime.log, 'queued until engine is ready')
+    return
+  }
+
+  const executor = runtime.webView.rtc?.executor()
+  if (executor === undefined) {
+    writeLog(runtime.log, 'engine executor unavailable')
+    return
+  }
+
+  if (runtime.state !== null) runtime.state.textContent = 'rendering'
+  try {
+    await executor.submit(project)
+    runtime.pendingProject = undefined
+    if (runtime.state !== null) runtime.state.textContent = 'live'
+    writeLog(runtime.log, `submitted ${project.size} KCL file${project.size === 1 ? '' : 's'}`, 'in')
+    sendInitialCamera(runtime.webView)
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (runtime.state !== null) runtime.state.textContent = 'error'
+    writeLog(runtime.log, `render failed: ${message}`)
+  }
+}
+
+const applyPromptPlan = async (plan: PromptPlan, runtimes: Map<number, RuntimeView>) => {
+  const centerRuntime = runtimes.get(centerIndex)
+  if (centerRuntime !== undefined) {
+    if (centerRuntime.role !== null) centerRuntime.role.textContent = plan.title
+    writeLog(centerRuntime.log, `planner: ${plan.summary || `generated ${plan.parts.length} parts`}`)
+    await submitRuntimeProject(centerRuntime, projectForAssembly(plan), 'prompted-assembly.kcl')
+  }
+
+  await Promise.all(plan.parts.map(async (part, partIndex) => {
+    const tileIndex = perimeterOrder[partIndex]
+    if (tileIndex === undefined) return
+    const runtime = runtimes.get(tileIndex)
+    if (runtime === undefined) return
+    runtime.wallView.role = part.name
+    runtime.wallView.filePath = `parts/${slugify(part.name)}.kcl`
+    runtime.wallView.color = part.color
+    runtime.wallView.center = { x: 0, y: 0, z: part.position.z }
+    runtime.webView.el.parentElement?.parentElement?.style.setProperty('--accent', part.color)
+    if (runtime.role !== null) runtime.role.textContent = part.name.toUpperCase()
+    writeLog(runtime.log, `assignment: ${part.role}`)
+    if (part.description.length > 0) writeLog(runtime.log, `prompt context: ${part.description}`)
+    await submitRuntimeProject(runtime, projectForPart(part, partIndex), runtime.wallView.filePath)
+  }))
+}
+
+const createPromptPanel = (
+  tile: HTMLElement,
+  runtimes: Map<number, RuntimeView>,
+) => {
+  const panel = document.createElement('form')
+  panel.classList.add('prompt-panel')
+  panel.innerHTML = `
+    <label class="prompt-label" for="zookeeper-prompt">Orchestrator Prompt</label>
+    <textarea id="zookeeper-prompt" class="prompt-input" rows="4" spellcheck="false"></textarea>
+    <div class="prompt-actions">
+      <button class="prompt-button" type="submit">Run Prompt</button>
+      <div class="prompt-status">ready</div>
+    </div>
+  `
+
+  const input = panel.querySelector<HTMLTextAreaElement>('.prompt-input')
+  const button = panel.querySelector<HTMLButtonElement>('.prompt-button')
+  const status = panel.querySelector<HTMLElement>('.prompt-status')
+  const url = new URL(window.location.href)
+  input!.value = url.searchParams.get('prompt') ?? 'Design a compact lunar sample processing station as an eight-part assembly. Use distinct modules for intake, crushing, sorting, heating, spectrometry, sample storage, power electronics, and a frame. Keep the parts spatially separated but visibly related as one machine.'
+
+  const run = async () => {
+    const prompt = input?.value.trim() ?? ''
+    if (prompt.length === 0) return
+    if (button !== null) button.disabled = true
+    if (status !== null) status.textContent = 'prompting'
+    const centerRuntime = runtimes.get(centerIndex)
+    if (centerRuntime !== undefined) writeLog(centerRuntime.log, `prompt: ${prompt}`)
+    try {
+      const plan = await fetchPromptPlan(prompt)
+      if (status !== null) status.textContent = `${plan.parts.length} assignments`
+      await applyPromptPlan(plan, runtimes)
+      if (status !== null) status.textContent = 'rendered'
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (status !== null) status.textContent = 'error'
+      if (centerRuntime !== undefined) writeLog(centerRuntime.log, `planner failed: ${message}`)
+    } finally {
+      if (button !== null) button.disabled = false
+    }
+  }
+
+  panel.addEventListener('submit', (event) => {
+    event.preventDefault()
+    void run()
+  })
+
+  tile.appendChild(panel)
+
+  if (url.searchParams.get('autoPrompt') === '1') {
+    url.searchParams.delete('autoPrompt')
+    window.history.replaceState({}, '', url)
+    window.setTimeout(() => void run(), 3500)
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   installWorkerWebSocketSendQueuePatch()
   installWebRTCNoIceServerOfferPatch()
@@ -416,6 +700,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const wallViews = createWallViews()
   const tiles = new Map<number, HTMLElement>()
+  const runtimes = new Map<number, RuntimeView>()
 
   for (let index = 0; index < rows * cols; index += 1) {
     const tile = document.createElement('section')
@@ -460,29 +745,34 @@ document.addEventListener('DOMContentLoaded', () => {
       attachWorkerDebugLog(webView, log)
 
       const state = overlay.querySelector<HTMLElement>('.tile-state')
+      const name = overlay.querySelector<HTMLElement>('.tile-name')
+      const role = overlay.querySelector<HTMLElement>('.tile-role')
+      const runtime: RuntimeView = {
+        wallView,
+        webView,
+        log,
+        state,
+        name,
+        role,
+        ready: false,
+      }
+      runtimes.set(wallView.index, runtime)
 
       webView.addEventListener('ready', (event: Event) => {
         const currentView = event.currentTarget
         if (!(currentView instanceof ZooWebView)) return
         if (state !== null) state.textContent = 'rendering'
         writeLog(log, 'engine websocket connected', 'in')
+        runtime.ready = true
 
-        const executor = currentView.rtc?.executor()
-        if (executor === undefined) return
-        void executor.submit(wallView.project).then(() => {
-          if (state !== null) state.textContent = 'live'
-          writeLog(log, `submitted ${wallView.project.size} KCL file${wallView.project.size === 1 ? '' : 's'}`, 'in')
-          sendInitialCamera(currentView)
+        void submitRuntimeProject(runtime, runtime.pendingProject ?? wallView.project, wallView.filePath).then(() => {
           startInspectionCamera(currentView, wallView)
-        }).catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error)
-          if (state !== null) state.textContent = 'error'
-          writeLog(log, `render failed: ${message}`)
         })
       })
 
       viewerSlot.appendChild(webView.el)
       tile.append(viewerSlot, overlay, log)
+      if (wallView.isOrchestrator === true) createPromptPanel(tile, runtimes)
     })
   })
 
