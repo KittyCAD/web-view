@@ -11,6 +11,9 @@
   "scripts": {
     "build": "make build",
     "serve": "make serve",
+    "build:wall": "cp node_modules/@kittycad/kcl-wasm-lib/kcl_wasm_lib_bg.wasm public/ && npx esbuild --bundle src/example.ts --outdir=public",
+    "serve:wall": "npm run build:wall && node scripts/wall-server.mjs",
+    "serve:wall:python": "npm run build:wall && python3 scripts/wall_server.py",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",

@@ -1,4 +1,5 @@
 node_modules/
 pkg/
 public/*.wasm
+public/example.js
 tsconfig.tsbuildinfo
