@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import type { ServerResponse } from 'node:http'
 import path from 'node:path'
-import type { Plugin, PluginOption } from 'vite'
+import type { Plugin, PluginOption, Rollup } from 'vite'
 
 export const webViewKclWasmFileName =
   'kittycad-web-view-kcl_wasm_lib_bg.wasm'
@@ -34,6 +34,7 @@ const rewriteKittyCadLibWorkerWasmUrl = (
   { strict = true } = {}
 ) => {
   let replacements = 0
+  kittyCadLibWorkerPayloadRegex.lastIndex = 0
   const updatedCode = code.replaceAll(
     kittyCadLibWorkerPayloadRegex,
     (call, factoryName: string, encodedWorker: string) => {
@@ -63,7 +64,7 @@ const rewriteKittyCadLibWorkerWasmUrl = (
   return updatedCode
 }
 
-const rewriteGeneratedBundleWorkerPayloads = (bundle: Record<string, any>) => {
+const rewriteGeneratedBundleWorkerPayloads = (bundle: Rollup.OutputBundle) => {
   for (const asset of Object.values(bundle)) {
     if (asset.type !== 'chunk') continue
     if (!hasKittyCadLibWorkerPayload(asset.code)) continue
@@ -112,10 +113,10 @@ export function kittyCadWebViewWasmPlugin(): Plugin {
     enforce: 'pre',
     config(config) {
       const existingWorkerPlugins = config.worker?.plugins
-      const workerPlugins = () => [
+      const workerPlugins = (): PluginOption[] => [
         ...(existingWorkerPlugins?.() ?? []),
         kittyCadWebViewWorkerWasmPlugin(),
-      ] as PluginOption[]
+      ]
 
       return {
         optimizeDeps: {
