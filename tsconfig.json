@@ -1,6 +1,6 @@
 {
   // Visit https://aka.ms/tsconfig to read more about this file
-  "exclude": ["src/example.ts", "pkg/"],
+  "exclude": ["src/example.ts", "src/vite.ts", "src/vite.d.ts", "pkg/"],
   "compilerOptions": {
     // File Layout
     "rootDir": "./src",

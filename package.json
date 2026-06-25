@@ -3,6 +3,18 @@
   "version": "1.2.5",
   "main": "index.js",
   "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "require": "./index.js",
+      "default": "./index.js"
+    },
+    "./vite": {
+      "types": "./vite.d.ts",
+      "require": "./vite.js",
+      "default": "./vite.js"
+    }
+  },
   "homepage": "https://github.com/KittyCAD/web-view",
   "repository": {
     "type": "git",

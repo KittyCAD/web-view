@@ -15,6 +15,8 @@ build: node_modules/
 	-mkdir pkg/
 	npx tsc --build
 	npx esbuild --bundle --format=cjs --external:@kittycad/lib --sourcemap src/index.ts --outfile=pkg/index.js
+	npx esbuild --bundle --platform=node --format=cjs --external:vite --sourcemap src/vite.ts --outfile=pkg/vite.js
+	cp src/vite.d.ts pkg/vite.d.ts
 	cp package.json pkg/
 	cp README.md pkg/
 	cp screenshot.png pkg/
