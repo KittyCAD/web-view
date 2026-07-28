@@ -92,6 +92,17 @@ export class ZooWebView extends EventTarget {
     if (elVideo === null) throw new Error('ZooWebView video element is missing')
     this.elVideo = elVideo
     elVideo.addEventListener('contextmenu', preventDefault)
+    elVideo.addEventListener('error', () => {
+      this.dispatchEvent(new CustomEvent('status', { detail: 'video error' }))
+      this.dispatchEvent(new CustomEvent('error', { detail: elVideo.error?.message || 'video error' }))
+    })
+    elVideo.addEventListener('stalled', () => {
+      this.dispatchEvent(new CustomEvent('status', { detail: 'video stalled' }))
+    })
+    elVideo.addEventListener('ended', () => {
+      this.dispatchEvent(new CustomEvent('status', { detail: 'video ended' }))
+      this.dispatchEvent(new CustomEvent('error', { detail: 'video ended' }))
+    })
    
     const elStart = this.el.querySelector<HTMLElement>('div.start')
     if (elStart === null) throw new Error('ZooWebView start element is missing')
@@ -155,6 +166,8 @@ export class ZooWebView extends EventTarget {
     this.state = ZooWebViewState.Starting
 
     const onClose = () => {
+      this.dispatchEvent(new CustomEvent('status', { detail: 'webrtc closed' }))
+      this.dispatchEvent(new CustomEvent('error', { detail: 'webrtc closed' }))
       this.deconstructor()
     }
     zooWebRTC.addEventListener('close', onClose, { once: true })

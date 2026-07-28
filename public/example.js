@@ -3087,6 +3087,17 @@
       if (elVideo === null) throw new Error("ZooWebView video element is missing");
       this.elVideo = elVideo;
       elVideo.addEventListener("contextmenu", preventDefault);
+      elVideo.addEventListener("error", () => {
+        this.dispatchEvent(new CustomEvent("status", { detail: "video error" }));
+        this.dispatchEvent(new CustomEvent("error", { detail: elVideo.error?.message || "video error" }));
+      });
+      elVideo.addEventListener("stalled", () => {
+        this.dispatchEvent(new CustomEvent("status", { detail: "video stalled" }));
+      });
+      elVideo.addEventListener("ended", () => {
+        this.dispatchEvent(new CustomEvent("status", { detail: "video ended" }));
+        this.dispatchEvent(new CustomEvent("error", { detail: "video ended" }));
+      });
       const elStart = this.el.querySelector("div.start");
       if (elStart === null) throw new Error("ZooWebView start element is missing");
       this.elStart = elStart;
@@ -3133,6 +3144,8 @@
       }
       this.state = "starting" /* Starting */;
       const onClose = () => {
+        this.dispatchEvent(new CustomEvent("status", { detail: "webrtc closed" }));
+        this.dispatchEvent(new CustomEvent("error", { detail: "webrtc closed" }));
         this.deconstructor();
       };
       zooWebRTC.addEventListener("close", onClose, { once: true });
@@ -3222,14 +3235,38 @@
   var centerIndex = 4;
   var rootAgentId = "zookeeper-orchestrator-root";
   var perimeterOrder = [0, 1, 2, 5, 8, 7, 6, 3];
-  var mockAgentCount = 50;
+  var maxWallAgents = 48;
+  var maxLiveAgentViews = 24;
   var maxAgentRepairAttempts = 2;
   var maxZooFallbackRetries = 3;
   var zooFallbackRetryBackoffMs = 2200;
-  var defaultPrompt = "Design a small rocket engine assembly";
+  var maxViewerReloadAttempts = 5;
+  var supervisorSweepIntervalMs = 15e3;
+  var supervisorSummaryIntervalMs = 6e4;
+  var supervisorQueuedWakeMs = 45e3;
+  var supervisorRecoveryCooldownMs = 2e4;
+  var maxSupervisorRecoveryAttempts = 3;
+  var viewerHealthPollMs = 1e4;
+  var viewerStalledReloadMs = 45e3;
+  var useAgentCadSnapshots = true;
+  var snapshotViewerSize = { width: 2560, height: 1440 };
+  var snapshotFrameWaitMs = 900;
+  var snapshotSubmitTimeoutMs = 35e3;
+  var snapshotCaptureTimeoutMs = 12e3;
+  var snapshotPersistTimeoutMs = 2e4;
+  var snapshotDisposeTimeoutMs = 5e3;
+  var snapshotRendererRecycleIntervalMs = 12e4;
+  var defaultPrompt = "A terminator robot endoskeleton display assembly. Build a metallic humanoid inspection robot with roughly 28-40 concrete parts organized through nested sub-orchestrators: skull/head, neck/spine, ribcage/torso, pelvis/hips, left arm, right arm, left leg, right leg, hands/feet, exposed actuator links, and cable routing. Workers should each own one physical part file, not a set: individual skull plate, eye lens, jaw link, vertebra, rib hoop, shoulder yoke, upper-arm bone, forearm piston, finger segment, hip bracket, thigh strut, shin strut, foot plate, etc. Use shared reusable components for repeated hardware such as bolts, pins, bushings, bearings, washers, spacers, cable clips, and small actuator clevises; model each reusable component once and have orchestrators clone/place the required counts. For mirrored limbs, paired brackets, repeated ribs, bolt circles, and other arrays, create one canonical part when possible and have orchestrators apply the mirrored, radial, or linear placement transforms with BOM comments. Every sub-orchestrator should place only direct child/subassembly imports and explicit shared reusable imports, add BOM comments for reused parts, align by named mate points/local axes/dimensions, and return one renderable aggregate so parent assemblies can place it. Avoid weapons; focus on the mechanical robot body, exposed structure, and assembled presentation.";
   var rootFilePath = "main.kcl";
   var interfaceBlockStart = "ZOOKEEPER_INTERFACE";
   var interfaceBlockEnd = "/ZOOKEEPER_INTERFACE";
+  var wallParams = new URLSearchParams(window.location.search);
+  var requestedWallTile = Number(wallParams.get("wallTile"));
+  var wallTileIndex = Number.isInteger(requestedWallTile) && requestedWallTile >= 0 && requestedWallTile < rows * cols ? requestedWallTile : void 0;
+  var isWallTileMode = wallTileIndex !== void 0;
+  var isControllerWindow = !isWallTileMode || wallTileIndex === centerIndex;
+  var shouldRenderAgentViews = !isWallTileMode || !isControllerWindow;
+  var wallBroadcastChannelName = "zookeeper-wall-v1";
   var agentColors = [
     "#00A3FF",
     "#FF4F8B",
@@ -3287,17 +3324,17 @@
     };
   };
   var tileSize = () => ({
-    width: window.innerWidth / cols,
-    height: window.innerHeight / rows
+    width: isWallTileMode ? window.innerWidth : window.innerWidth / cols,
+    height: isWallTileMode ? window.innerHeight : window.innerHeight / rows
   });
-  var paneViewerSize = (agentCount = mockAgentCount) => {
+  var paneViewerSize = (agentCount = 1) => {
     const size = tileSize();
     const maxAgentsPerMonitor = Math.max(1, Math.ceil(agentCount / perimeterOrder.length));
     const columns = maxAgentsPerMonitor <= 1 ? 1 : Math.ceil(Math.sqrt(maxAgentsPerMonitor));
     const rows2 = Math.ceil(maxAgentsPerMonitor / columns);
     return {
-      width: Math.max(480, Math.floor(size.width / columns)),
-      height: Math.max(270, Math.floor(size.height / rows2))
+      width: Math.min(1280, Math.max(480, Math.floor(size.width / columns))),
+      height: Math.min(720, Math.max(270, Math.floor(size.height / rows2)))
     };
   };
   var rootViewerSize = () => {
@@ -3311,10 +3348,45 @@
     if (error instanceof Error) return error.message;
     return String(error);
   };
+  var withTimeout = (promise, timeoutMs, label) => new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => reject(new Error(`${label} timed out after ${Math.ceil(timeoutMs / 1e3)}s`)), timeoutMs);
+    void promise.then(
+      (value) => {
+        window.clearTimeout(timeout);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timeout);
+        reject(error);
+      }
+    );
+  });
+  var httpErrorFromResponse = async (response, label) => {
+    let bodyText = "";
+    try {
+      bodyText = await response.text();
+    } catch {
+      bodyText = "";
+    }
+    let detail = bodyText.trim();
+    let errorId = "";
+    try {
+      const payload = JSON.parse(bodyText);
+      if (typeof payload.error === "string" && payload.error.trim().length > 0) {
+        detail = payload.error.trim();
+      }
+      if (typeof payload.errorId === "string" && payload.errorId.trim().length > 0) {
+        errorId = ` id=${payload.errorId.trim()}`;
+      }
+    } catch {
+    }
+    return new Error(`${label} ${response.status}${errorId}${detail ? `: ${detail.slice(0, 700)}` : ""}`);
+  };
   var wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   var isRetryableZooFallback = (update) => update.source === "fallback" && /\b(websocket closed|closed while reading frame|timed out|timeout|without an EditKclCode output|socket|connection reset|connection closed)\b/i.test(update.summary);
   var escapeHtml = (value) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
   var titleCase = (value) => value.replace(/\w\S*/g, (word) => word[0].toUpperCase() + word.slice(1));
+  var slugLabel = (value) => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "component";
   var sequenceFromId = (id) => id.match(/(\d{4})$/)?.[1];
   var graphPrimaryLabel = (agent) => {
     if (agent.id === rootAgentId) return "Zookeeper Orchestrator";
@@ -3360,6 +3432,18 @@
           cmd_id: "00000000-0000-0000-0000-000000000000"
         },
         {
+          // Keep persisted agent snapshots consistently isometric. The fit command
+          // that follows preserves this orientation while framing each KCL result.
+          cmd: {
+            type: "default_camera_look_at",
+            center: { x: 0, y: 0, z: 0 },
+            sequence: 1,
+            up: { x: 0, y: 0, z: 1 },
+            vantage: { x: 9, y: -9, z: 9 }
+          },
+          cmd_id: randomId()
+        },
+        {
           cmd: {
             type: "zoom_to_fit",
             object_ids: [],
@@ -3371,43 +3455,6 @@
       batch_id: "00000000-0000-0000-0000-000000000000",
       responses: true
     }));
-  };
-  var sendInspectionCameraCommand = (webView, agentIndex, step) => {
-    if (webView.rtc === void 0) return;
-    const angle = step * 0.82 + agentIndex * 0.47;
-    const radius = 6.2 + agentIndex % 5 * 0.35;
-    const z2 = 2.6 + step % 4 * 0.24 + agentIndex % 3 * 0.18;
-    const request = webView.rtc.send(JSON.stringify({
-      type: "modeling_cmd_batch_req",
-      requests: [
-        {
-          cmd: {
-            type: "default_camera_look_at",
-            center: { x: 0, y: 0, z: 0.85 },
-            sequence: step,
-            up: { x: 0, y: 0, z: 1 },
-            vantage: {
-              x: Number((Math.cos(angle) * radius).toFixed(4)),
-              y: Number((Math.sin(angle) * radius).toFixed(4)),
-              z: Number(z2.toFixed(4))
-            }
-          },
-          cmd_id: randomId()
-        },
-        {
-          cmd: {
-            type: "zoom_to_fit",
-            object_ids: [],
-            padding: 0
-          },
-          cmd_id: randomId()
-        }
-      ],
-      batch_id: randomId(),
-      responses: true
-    }));
-    void request.catch(() => {
-    });
   };
   var sendRootCameraCommand = (webView) => {
     if (webView.rtc === void 0) return;
@@ -3451,6 +3498,15 @@
 `;
   var objectFromMap = (files) => Object.fromEntries(files.entries());
   var stripImportLines = (source) => source.split("\n").filter((line) => !line.trim().startsWith("import ")).join("\n");
+  var directAssemblyBlockStart = "// ZOOKEEPER_WALL_DIRECT_CHILDREN_START";
+  var directAssemblyBlockEnd = "// ZOOKEEPER_WALL_DIRECT_CHILDREN_END";
+  var stripDirectAssemblyBlock = (source) => {
+    const start = source.indexOf(directAssemblyBlockStart);
+    if (start < 0) return source;
+    const end = source.indexOf(directAssemblyBlockEnd, start);
+    if (end < 0) return source.slice(0, start);
+    return `${source.slice(0, start)}${source.slice(end + directAssemblyBlockEnd.length)}`;
+  };
   var cleanInterfaceLine = (line) => line.replace(/^\s*\/\/\s?/, "").replace(/^\s*#\s?/, "").trim();
   var extractInterfaceManifest = (source) => {
     const lines = source.split("\n");
@@ -3489,37 +3545,88 @@
   document.addEventListener("DOMContentLoaded", () => {
     installWorkerWebSocketSendQueuePatch();
     const zooClient = createZooClient();
+    const wallChannel = typeof BroadcastChannel === "undefined" ? void 0 : new BroadcastChannel(wallBroadcastChannelName);
     const root = document.createElement("main");
     root.classList.add("wall-root");
+    if (isWallTileMode) {
+      document.title = `Zoo Web View Wall ${wallTileIndex}`;
+      document.body.classList.add("wall-tile-mode");
+      root.classList.add("wall-root-tile-mode");
+      root.dataset.wallTile = String(wallTileIndex);
+    }
+    if (!isControllerWindow) {
+      document.body.classList.add("wall-display-only");
+    }
     document.body.append(root);
+    const snapshotCaptureHost = document.createElement("div");
+    snapshotCaptureHost.classList.add("snapshot-capture-host");
+    if (isControllerWindow && useAgentCadSnapshots) document.body.append(snapshotCaptureHost);
     const monitorElements = /* @__PURE__ */ new Map();
     const agents = /* @__PURE__ */ new Map();
     const timers = /* @__PURE__ */ new Set();
     const cameraTimers = /* @__PURE__ */ new Set();
     const reviewTimers = /* @__PURE__ */ new Map();
     const placementTimers = /* @__PURE__ */ new Map();
+    const draftRenderChains = /* @__PURE__ */ new Map();
+    const snapshotJobs = /* @__PURE__ */ new Map();
+    const workWaiters = /* @__PURE__ */ new Map();
+    const bomPlanningAgentIds = /* @__PURE__ */ new Set();
+    const supervisorReviewAtMs = /* @__PURE__ */ new Map();
+    let workEventAbort;
+    let rootRenderTimer;
+    let graphRenderTimer;
+    let layoutTimer;
+    let aggregateTimeTimer;
+    let supervisorTimer;
+    let supervisorLastSummaryAtMs = 0;
+    let workEventSessionId = "";
     let runId = 0;
     let startInProgress = false;
     let active = false;
     let plannedAgentCount = 0;
     let activeSessionId = "";
+    let rootActiveStartedAtMs;
+    let rootElapsedMs = 0;
     let activeSource = "fallback";
     let rootReviewRounds = 0;
     let rootInstruction = "Coordinate the complete assembly and merge child KCL into the root view.";
     let kclFiles = /* @__PURE__ */ new Map();
     let interfaceManifests = /* @__PURE__ */ new Map();
+    let rootImports = /* @__PURE__ */ new Set();
+    let snapshotView;
+    let snapshotViewStarting;
+    let snapshotViewDisposing;
+    let snapshotDrainPromise;
+    let snapshotRecycleTimer;
+    let snapshotRecycleRequested = false;
+    let snapshotRecycleReason = "";
+    let capacityWarningRun = -1;
+    const broadcastWall = (message) => {
+      if (!isControllerWindow) return;
+      wallChannel?.postMessage(message);
+    };
     const centerTile = document.createElement("section");
     centerTile.classList.add("wall-tile", "orchestrator-tile");
-    const centerView = new ZooWebView({
-      zooClient,
-      size: rootViewerSize(),
-      allowConcurrentViews: true,
-      showStartLogo: true
-    });
-    centerView.el.classList.add("wall-view", "orchestrator-view");
+    const createCenterView = () => {
+      const view = new ZooWebView({
+        zooClient,
+        size: rootViewerSize(),
+        allowConcurrentViews: true,
+        showStartLogo: true
+      });
+      view.el.classList.add("wall-view", "orchestrator-view");
+      return view;
+    };
+    let centerView = createCenterView();
+    let centerViewerReloadTimer;
+    let centerViewerReloadAttempts = 0;
+    let centerViewerHealthTimer;
     const centerStatus = document.createElement("div");
     centerStatus.classList.add("center-status");
-    centerStatus.textContent = "Mock websocket ready";
+    centerStatus.textContent = "Zookeeper ready";
+    const aggregateTime = document.createElement("div");
+    aggregateTime.classList.add("aggregate-time");
+    aggregateTime.textContent = "Aggregate Agent Time: 0s";
     const promptInput = document.createElement("textarea");
     promptInput.classList.add("orchestrator-prompt");
     promptInput.value = defaultPrompt;
@@ -3543,10 +3650,13 @@
       <div>
         <h1>Zookeeper Orchestrator</h1>
       </div>
-      <div class="mode-pill">mock</div>
+      <div class="orchestrator-badges">
+        <div class="mode-pill">live</div>
+      </div>
     </div>
     <label class="prompt-label">Prompt</label>
   `;
+    orchestratorConsole.querySelector(".orchestrator-badges")?.prepend(aggregateTime);
     const controls = document.createElement("div");
     controls.classList.add("orchestrator-controls");
     controls.append(startButton, stopButton);
@@ -3580,16 +3690,44 @@
     centerOverlay.classList.add("orchestrator-overlay");
     centerOverlay.append(orchestratorConsole, graphPanel);
     centerTile.append(centerOverlay);
-    const writeLog = (target, line, direction = "sys") => {
+    const writeLog = (target, line, direction = "sys", maxRows = 56) => {
       const row = document.createElement("div");
       row.classList.add("log-row", `log-${direction}`);
       row.textContent = line;
       target.appendChild(row);
-      while (target.childElementCount > 80) target.firstElementChild?.remove();
+      while (target.childElementCount > maxRows) target.firstElementChild?.remove();
       target.scrollTop = target.scrollHeight;
     };
     const rootLogLine = (line, direction = "sys") => {
-      writeLog(rootLog, line, direction);
+      writeLog(rootLog, line, direction, 160);
+      broadcastWall({ type: "root:log", line, direction });
+    };
+    const formatAggregateAgentTime = (elapsedMs) => {
+      const totalSeconds = Math.floor(elapsedMs / 1e3);
+      if (totalSeconds < 60) return `${totalSeconds}s`;
+      const totalMinutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      if (totalMinutes < 60) return `${totalMinutes}m ${String(seconds).padStart(2, "0")}s`;
+      const hours = Math.floor(totalMinutes / 60);
+      const minutes = totalMinutes % 60;
+      return `${hours}h ${String(minutes).padStart(2, "0")}m`;
+    };
+    const aggregateAgentTimeMs = () => {
+      const now = Date.now();
+      const rootActiveElapsed = rootActiveStartedAtMs === void 0 ? 0 : now - rootActiveStartedAtMs;
+      return Array.from(agents.values()).reduce((total, agent) => {
+        const elapsed = agent.elapsedMs ?? 0;
+        const activeElapsed = agent.activeStartedAtMs === void 0 ? 0 : now - agent.activeStartedAtMs;
+        return total + elapsed + activeElapsed;
+      }, rootElapsedMs + rootActiveElapsed);
+    };
+    const updateAggregateTime = () => {
+      aggregateTime.textContent = `Aggregate Agent Time: ${formatAggregateAgentTime(aggregateAgentTimeMs())}`;
+    };
+    const startAggregateTimeTicker = () => {
+      if (aggregateTimeTimer !== void 0) return;
+      updateAggregateTime();
+      aggregateTimeTimer = window.setInterval(updateAggregateTime, 1e3);
     };
     const graphNode = (id) => {
       if (id === rootAgentId) {
@@ -3603,24 +3741,45 @@
           color: "#FFFFFF",
           status: active ? "running" : "queued",
           filePath: rootFilePath,
+          imports: Array.from(rootImports),
           source: activeSource
         };
       }
       return agents.get(id);
     };
     const graphChildren = (id) => Array.from(agents.values()).filter((agent) => agent.parentId === id).sort((a, b) => a.id.localeCompare(b.id));
+    const isReusableLibraryAgent = (agent) => agent.kind === "orchestrator" && /\b(reusable|shared|library|catalog|standard)\b/i.test(agent.role);
+    const agentTileIndex = (agent) => {
+      const agentIndex = Array.from(agents.keys()).indexOf(agent.id);
+      if (agentIndex < 0) return void 0;
+      return perimeterOrder[agentIndex % perimeterOrder.length];
+    };
+    const shouldRenderAgentLocally = (agent) => {
+      if (isReusableLibraryAgent(agent)) return false;
+      if (!shouldRenderAgentViews) return false;
+      if (!isWallTileMode) return true;
+      return agentTileIndex(agent) === wallTileIndex;
+    };
     const renderGraphFor = (container, startId, compact) => {
       const edges = [];
       const points = /* @__PURE__ */ new Map();
       const visited = /* @__PURE__ */ new Set();
-      const nodeWidth = compact ? 220 : 300;
-      const nodeHeight = compact ? 58 : 64;
-      const columnGap = compact ? 52 : 66;
+      const nodeMetricsAtDepth = (depth) => {
+        const baseWidth = compact ? 250 : 340;
+        const baseHeight = compact ? 76 : 86;
+        const floor = compact ? 0.58 : 0.46;
+        const scale = Math.max(floor, Math.pow(compact ? 0.82 : 0.83, depth));
+        return {
+          width: Math.round(baseWidth * scale),
+          height: Math.round(baseHeight * Math.max(0.62, scale)),
+          scale
+        };
+      };
+      const columnGap = compact ? 38 : 50;
       const rowGap = compact ? 18 : 24;
       const paddingX = compact ? 20 : 28;
       const paddingY = compact ? 24 : 34;
-      const columnWidth = nodeWidth + columnGap;
-      const rowHeight = nodeHeight + rowGap;
+      const rowHeight = nodeMetricsAtDepth(0).height + rowGap;
       let row = 0;
       let maxDepth = 0;
       const layoutTree = (id, depth) => {
@@ -3636,53 +3795,105 @@
           row += 1;
         } else {
           const childYs = children.map((child) => {
-            edges.push([id, child.id]);
+            edges.push({ from: id, to: child.id, kind: "child" });
             return layoutTree(child.id, depth + 1);
           });
           y2 = (childYs[0] + childYs[childYs.length - 1]) / 2;
         }
         points.set(id, {
-          x: paddingX + depth * columnWidth,
+          x: 0,
           y: y2,
           depth
         });
         return y2;
       };
       layoutTree(startId, 0);
-      const contentWidth = paddingX * 2 + (maxDepth + 1) * nodeWidth + maxDepth * columnGap;
-      const contentHeight = paddingY * 2 + Math.max(1, row) * rowHeight;
+      const resolveDepthCollisions = () => {
+        const pointsByDepth = /* @__PURE__ */ new Map();
+        points.forEach((point) => {
+          const level = pointsByDepth.get(point.depth) ?? [];
+          level.push(point);
+          pointsByDepth.set(point.depth, level);
+        });
+        pointsByDepth.forEach((level) => {
+          let nextY = paddingY;
+          level.sort((left, right) => left.y - right.y).forEach((point) => {
+            point.y = Math.max(point.y, nextY);
+            nextY = point.y + rowHeight;
+          });
+        });
+      };
+      const centerParentsOnChildren = (id) => {
+        const point = points.get(id);
+        if (point === void 0) return paddingY;
+        const children = graphChildren(id).filter((child) => points.has(child.id));
+        if (children.length === 0) return point.y;
+        const childYs = children.map((child) => centerParentsOnChildren(child.id));
+        point.y = (childYs[0] + childYs[childYs.length - 1]) / 2;
+        return point.y;
+      };
+      resolveDepthCollisions();
+      centerParentsOnChildren(startId);
+      resolveDepthCollisions();
+      points.forEach((_point, id) => {
+        const agent = graphNode(id);
+        if (agent === void 0) return;
+        const childIds = new Set(graphChildren(id).map((child) => child.id));
+        importedAgentsFor(agent).filter((imported) => points.has(imported.id) && !childIds.has(imported.id)).forEach((imported) => edges.push({ from: id, to: imported.id, kind: "import" }));
+      });
+      const columnXs = [];
+      let nextColumnX = paddingX;
+      for (let depth = 0; depth <= maxDepth; depth += 1) {
+        columnXs[depth] = nextColumnX;
+        nextColumnX += nodeMetricsAtDepth(depth).width + columnGap;
+      }
+      const contentWidth = nextColumnX - columnGap + paddingX;
+      const contentHeight = Math.max(
+        paddingY * 2 + nodeMetricsAtDepth(0).height,
+        Math.max(...Array.from(points.values(), (point) => point.y + nodeMetricsAtDepth(point.depth).height)) + paddingY
+      );
       const width = Math.max(compact ? 760 : 1400, contentWidth);
       const height = Math.max(compact ? 460 : 900, contentHeight);
       const shiftX = (width - contentWidth) / 2;
       const shiftY = (height - contentHeight) / 2;
       points.forEach((point) => {
-        point.x += shiftX;
+        point.x = (columnXs[point.depth] ?? paddingX) + shiftX;
         point.y += shiftY;
       });
-      const edgeSvg = edges.map(([from, to]) => {
-        const start = points.get(from);
-        const end = points.get(to);
+      const edgeSvg = edges.map((edge) => {
+        const start = points.get(edge.from);
+        const end = points.get(edge.to);
         if (start === void 0 || end === void 0) return "";
-        const startX = start.x + nodeWidth;
-        const startY = start.y + nodeHeight / 2;
+        const startMetrics = nodeMetricsAtDepth(start.depth);
+        const endMetrics = nodeMetricsAtDepth(end.depth);
+        const startX = start.x + startMetrics.width;
+        const startY = start.y + startMetrics.height / 2;
         const endX = end.x;
-        const endY = end.y + nodeHeight / 2;
+        const endY = end.y + endMetrics.height / 2;
         const midX = startX + (endX - startX) / 2;
-        return `<path class="graph-edge" d="M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}" />`;
+        return `<path class="graph-edge graph-edge-${edge.kind}" d="M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}" />`;
       }).join("");
       const nodeSvg = Array.from(points.entries()).map(([id, point]) => {
         const agent = graphNode(id);
         if (agent === void 0 || point === void 0) return "";
-        const maxTitleLength = compact ? 25 : 34;
+        const metrics = nodeMetricsAtDepth(point.depth);
+        const showDetails = point.depth <= (compact ? 0 : 1);
+        const maxTitleLength = Math.max(12, Math.floor(metrics.width / (compact ? 8.8 : 9.4)));
         const primaryLabel = truncateLabel(graphPrimaryLabel(agent), maxTitleLength);
-        const secondaryLabel = truncateLabel(graphSecondaryLabel(agent), compact ? 32 : 40);
-        const primaryY = secondaryLabel === "" ? nodeHeight / 2 + 5 : compact ? 24 : 26;
-        const secondarySvg = secondaryLabel === "" ? "" : `<text class="graph-role" x="14" y="${compact ? 43 : 46}">${escapeHtml(secondaryLabel)}</text>`;
+        const secondaryLabel = showDetails ? truncateLabel(graphSecondaryLabel(agent), compact ? 32 : 40) : "";
+        const bomLabel = showDetails ? bomSummaryForGraphNode(agent, compact) : "";
+        const primaryY = secondaryLabel === "" && bomLabel === "" ? Math.round(metrics.height / 2 + Math.max(4, metrics.scale * 5)) : Math.round(metrics.height * 0.31);
+        const nameSize = Math.max(compact ? 11 : 12, Math.round((compact ? 17 : 20) * metrics.scale));
+        const detailSize = Math.max(compact ? 9 : 10, Math.round((compact ? 12 : 14) * metrics.scale));
+        const secondarySvg = secondaryLabel === "" ? "" : `<text class="graph-role" x="14" y="${Math.round(metrics.height * 0.57)}" style="font-size: ${detailSize}px">${escapeHtml(secondaryLabel)}</text>`;
+        const bomSvg = bomLabel === "" ? "" : `<text class="graph-bom" x="14" y="${Math.round(metrics.height * 0.8)}" style="font-size: ${detailSize}px">${escapeHtml(bomLabel)}</text>`;
         return `
-        <g class="graph-node graph-${agent.kind}" transform="translate(${point.x} ${point.y})">
-          <rect width="${nodeWidth}" height="${nodeHeight}" rx="6" style="--node-color: ${agent.color}" />
-          <text class="graph-name" x="14" y="${primaryY}">${escapeHtml(primaryLabel)}</text>
+        <g class="graph-node graph-${agent.kind} graph-status-${agent.status}" data-depth="${point.depth}" transform="translate(${point.x} ${point.y})">
+          <rect width="${metrics.width}" height="${metrics.height}" rx="6" style="--node-color: ${agent.color}" />
+          <circle class="graph-state-dot" cx="${metrics.width - 16}" cy="16" r="${Math.max(3, Math.round((compact ? 5 : 6) * metrics.scale))}" />
+          <text class="graph-name" x="14" y="${primaryY}" style="font-size: ${nameSize}px">${escapeHtml(primaryLabel)}</text>
           ${secondarySvg}
+          ${bomSvg}
         </g>
       `;
       }).join("");
@@ -3693,7 +3904,7 @@
       </svg>
     `;
     };
-    const renderAllGraphs = () => {
+    const renderAllGraphsNow = () => {
       renderGraphFor(rootGraph, rootAgentId, false);
       graphPanel.querySelector(".graph-count").textContent = `${agents.size} agents`;
       for (const agent of agents.values()) {
@@ -3701,7 +3912,14 @@
         renderGraphFor(agent.graphElement, agent.id, true);
       }
     };
-    const layoutAgents = () => {
+    const renderAllGraphs = () => {
+      if (graphRenderTimer !== void 0) return;
+      graphRenderTimer = window.setTimeout(() => {
+        graphRenderTimer = void 0;
+        renderAllGraphsNow();
+      }, 120);
+    };
+    const layoutAgentsNow = () => {
       const buckets = perimeterOrder.map(() => []);
       Array.from(agents.values()).forEach((agent, index) => {
         buckets[index % perimeterOrder.length].push(agent);
@@ -3739,6 +3957,13 @@
         }
       });
     };
+    const layoutAgents = () => {
+      if (layoutTimer !== void 0) return;
+      layoutTimer = window.setTimeout(() => {
+        layoutTimer = void 0;
+        layoutAgentsNow();
+      }, 80);
+    };
     const submitProject = (view, project, onFailure, onSuccess) => {
       if (view.rtc === void 0) return Promise.resolve();
       const executor = view.rtc.executor();
@@ -3750,21 +3975,222 @@
         throw error;
       });
     };
+    const waitForSnapshotView = async () => {
+      if (!isControllerWindow) throw new Error("only the controller can render CAD snapshots");
+      if (snapshotViewDisposing !== void 0) await snapshotViewDisposing;
+      if (snapshotView?.rtc !== void 0) return snapshotView;
+      if (snapshotViewStarting !== void 0) return snapshotViewStarting;
+      snapshotViewStarting = (async () => {
+        if (snapshotView !== void 0) {
+          await snapshotView.deconstructor();
+          snapshotView = void 0;
+        }
+        const view = new ZooWebView({
+          zooClient,
+          size: snapshotViewerSize,
+          allowConcurrentViews: true,
+          showStartLogo: false
+        });
+        view.el.classList.add("snapshot-capture-view");
+        snapshotCaptureHost.replaceChildren(view.el);
+        snapshotView = view;
+        let transportReady = false;
+        view.addEventListener("ready", () => {
+          transportReady = true;
+        }, { once: true });
+        view.start();
+        const deadline = Date.now() + 3e4;
+        const video = view.el.querySelector("video");
+        while ((!transportReady || view.rtc === void 0 || video?.srcObject === null || (video?.readyState ?? 0) < HTMLMediaElement.HAVE_CURRENT_DATA) && Date.now() < deadline) await wait(80);
+        if (!transportReady || view.rtc === void 0 || video?.srcObject === null || (video?.readyState ?? 0) < HTMLMediaElement.HAVE_CURRENT_DATA) {
+          throw new Error("snapshot renderer transport did not become ready within 30 seconds");
+        }
+        return view;
+      })();
+      try {
+        return await snapshotViewStarting;
+      } finally {
+        snapshotViewStarting = void 0;
+      }
+    };
+    const captureSnapshotDataUrl = async (view) => {
+      const video = view.el.querySelector("video");
+      if (video === null) throw new Error("snapshot renderer video is missing");
+      await wait(snapshotFrameWaitMs);
+      if (video.videoWidth === 0 || video.videoHeight === 0) {
+        throw new Error("snapshot renderer has no video frame");
+      }
+      const scale = Math.min(1, snapshotViewerSize.width / video.videoWidth, snapshotViewerSize.height / video.videoHeight);
+      const width = Math.max(1, Math.round(video.videoWidth * scale));
+      const height = Math.max(1, Math.round(video.videoHeight * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (context === null) throw new Error("snapshot canvas is unavailable");
+      context.fillStyle = "#05070b";
+      context.fillRect(0, 0, width, height);
+      context.drawImage(video, 0, 0, width, height);
+      const image = await withTimeout(new Promise((resolve, reject) => {
+        canvas.toBlob((blob) => {
+          if (blob === null) reject(new Error("snapshot canvas returned no image"));
+          else resolve(blob);
+        }, "image/webp", 0.86);
+      }), snapshotCaptureTimeoutMs, "snapshot canvas encoding");
+      return await withTimeout(new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.addEventListener("load", () => {
+          if (typeof reader.result === "string") resolve(reader.result);
+          else reject(new Error("snapshot image reader returned no data URL"));
+        }, { once: true });
+        reader.addEventListener("error", () => reject(reader.error ?? new Error("snapshot image reader failed")), { once: true });
+        reader.readAsDataURL(image);
+      }), snapshotCaptureTimeoutMs, "snapshot data URL conversion");
+    };
+    const persistAgentSnapshot = async (agent, dataUrl) => {
+      const response = await withTimeout(fetch("/api/snapshot", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ agentId: agent.id, dataUrl })
+      }), snapshotPersistTimeoutMs, "snapshot upload");
+      if (!response.ok) throw await httpErrorFromResponse(response, "snapshot");
+      const payload = await response.json();
+      if (typeof payload.url !== "string" || payload.url.length === 0) {
+        throw new Error("snapshot endpoint returned no URL");
+      }
+      return payload.url;
+    };
+    const disposeSnapshotView = async () => {
+      if (snapshotViewDisposing !== void 0) {
+        await snapshotViewDisposing;
+        return;
+      }
+      const previous = snapshotView;
+      snapshotView = void 0;
+      snapshotViewStarting = void 0;
+      snapshotCaptureHost.replaceChildren();
+      const disposing = (async () => {
+        if (previous !== void 0) {
+          await withTimeout(Promise.resolve(previous.deconstructor()), snapshotDisposeTimeoutMs, "snapshot renderer shutdown").catch(() => {
+          });
+        }
+      })();
+      snapshotViewDisposing = disposing;
+      try {
+        await disposing;
+      } finally {
+        if (snapshotViewDisposing === disposing) snapshotViewDisposing = void 0;
+      }
+    };
+    const recycleSnapshotViewAfterCurrentJob = async (agent) => {
+      if (!snapshotRecycleRequested) return;
+      const reason = snapshotRecycleReason || "scheduled renderer recycle";
+      snapshotRecycleRequested = false;
+      snapshotRecycleReason = "";
+      if (agent !== void 0) appendAgentLog(agent, `< recycling CAD snapshot renderer: ${reason}`, "in");
+      await disposeSnapshotView();
+    };
+    const requestSnapshotViewRecycle = (reason) => {
+      if (!isControllerWindow || !useAgentCadSnapshots) return;
+      snapshotRecycleRequested = true;
+      snapshotRecycleReason = reason;
+      if (snapshotDrainPromise !== void 0) return;
+      void recycleSnapshotViewAfterCurrentJob();
+    };
+    const drainAgentSnapshots = async () => {
+      while (snapshotJobs.size > 0) {
+        const next = snapshotJobs.entries().next().value;
+        if (next === void 0) break;
+        const [agentId, job] = next;
+        snapshotJobs.delete(agentId);
+        const agent = agents.get(agentId);
+        if (agent === void 0 || !agentStillActive(agent, job.currentRun)) continue;
+        try {
+          appendAgentLog(agent, `< rendering CAD snapshot: ${job.label}`, "in");
+          const view = await waitForSnapshotView();
+          await withTimeout(submitProject(view, job.project, (message) => {
+            throw new Error(message);
+          }), snapshotSubmitTimeoutMs, "snapshot renderer submit");
+          const snapshotUrl = await persistAgentSnapshot(agent, await captureSnapshotDataUrl(view));
+          if (!agentStillActive(agent, job.currentRun)) continue;
+          setAgentSnapshot(agent, snapshotUrl);
+          broadcastWall({ type: "agent:snapshot", agentId: agent.id, snapshotUrl });
+          appendAgentLog(agent, `< CAD snapshot updated: ${job.label}`, "in");
+          await recycleSnapshotViewAfterCurrentJob(agent);
+        } catch (error) {
+          const message = errorToMessage(error);
+          appendAgentLog(agent, `< CAD snapshot failed: ${message}`);
+          await disposeSnapshotView();
+          snapshotRecycleRequested = false;
+          snapshotRecycleReason = "";
+          if (job.attempt < 1 && agentStillActive(agent, job.currentRun)) {
+            snapshotJobs.set(agent.id, { ...job, attempt: job.attempt + 1 });
+            appendAgentLog(agent, `< CAD snapshot retrying after renderer recovery`, "in");
+          }
+        }
+      }
+    };
+    const ensureSnapshotDrain = () => {
+      if (snapshotDrainPromise !== void 0) return;
+      snapshotDrainPromise = drainAgentSnapshots().finally(() => {
+        snapshotDrainPromise = void 0;
+        if (snapshotJobs.size > 0) ensureSnapshotDrain();
+      });
+    };
+    const queueAgentSnapshot = (agent, currentRun, project, label) => {
+      if (!useAgentCadSnapshots || !isControllerWindow) return;
+      snapshotJobs.set(agent.id, { agentId: agent.id, currentRun, project, label, attempt: 0 });
+      if (agent.snapshotUrl === void 0) setAgentViewerPlaceholder(agent, "Rendering CAD snapshot");
+      ensureSnapshotDrain();
+    };
+    if (isControllerWindow && useAgentCadSnapshots) {
+      snapshotRecycleTimer = window.setInterval(() => {
+        requestSnapshotViewRecycle("scheduled two-minute recycle");
+      }, snapshotRendererRecycleIntervalMs);
+      window.addEventListener("beforeunload", () => {
+        if (snapshotRecycleTimer !== void 0) window.clearInterval(snapshotRecycleTimer);
+      }, { once: true });
+    }
     const agentForFilePath = (filePath) => Array.from(agents.values()).find((agent) => agent.filePath === filePath);
     const descendantFilePaths = (agent) => [
       agent.filePath,
       ...graphChildren(agent.id).flatMap((child) => descendantFilePaths(child))
     ];
+    const resolveImportFilePath = (specifier) => {
+      if (kclFiles.has(specifier)) return specifier;
+      return Array.from(kclFiles.keys()).find((filePath) => renderPathForFilePath(filePath) === specifier || filePath.endsWith(`/${specifier}`));
+    };
+    const importFilePathsFromSource = (source) => {
+      const paths = [];
+      const regex = /^\s*import\s+"([^"]+)"/gm;
+      for (; ; ) {
+        const match = regex.exec(source);
+        if (match === null) break;
+        const filePath = resolveImportFilePath(match[1]);
+        if (filePath !== void 0) paths.push(filePath);
+      }
+      return paths;
+    };
+    const collectFilePathsWithImports = (entryPaths) => {
+      const seen = /* @__PURE__ */ new Set();
+      const ordered = [];
+      const visit = (filePath) => {
+        if (seen.has(filePath)) return;
+        seen.add(filePath);
+        ordered.push(filePath);
+        importFilePathsFromSource(kclFiles.get(filePath) ?? "").forEach(visit);
+      };
+      entryPaths.forEach(visit);
+      return ordered;
+    };
     const renderFilePathsFor = (entryFilePath) => {
       if (entryFilePath === rootFilePath) {
-        return [
-          rootFilePath,
-          ...Array.from(agents.values()).map((agent2) => agent2.filePath)
-        ];
+        return collectFilePathsWithImports([rootFilePath]);
       }
       const agent = agentForFilePath(entryFilePath);
       if (agent === void 0) return [entryFilePath];
-      return descendantFilePaths(agent);
+      if (isReusableLibraryAgent(agent)) return [entryFilePath];
+      return collectFilePathsWithImports([entryFilePath]);
     };
     const renderContentForFile = (filePath) => {
       let source = kclFiles.get(filePath) ?? "";
@@ -3779,27 +4205,273 @@
         renderFilePathsFor(entryFilePath).map((filePath) => [renderPathForFilePath(filePath), renderContentForFile(filePath)])
       )
     });
+    const viewerReloadDelay = (attempt) => Math.min(15e3, 1e3 * 2 ** Math.min(attempt, 4));
+    const isViewerFailureMessage = (message) => {
+      const text = message.toLowerCase();
+      if (/\bws-(created|open|message)\b/.test(text)) return false;
+      return [
+        /\b(start failed|view error|video error|video ended|webrtc closed|engine connection failed)\b/,
+        /\b(video frame stream stalled)\b/,
+        /\b(ws|websocket)[ -]?(error|close|closed|failed|disconnect|disconnected)\b/,
+        /\b(gpu process|gpucontrol|createcommandbuffer|command buffer|context lost|webgl context|transientfailure)\b/,
+        /\b(peerconnection|ice|dtls|srtp).*\b(closed|failed|disconnect|error)\b/
+      ].some((pattern) => pattern.test(text));
+    };
+    const installViewHealthWatchdog = (view, onFailure) => {
+      const video = view.el.querySelector("video");
+      let lastFrameCount = -1;
+      let lastProgressAt = Date.now();
+      return window.setInterval(() => {
+        if (!document.body.contains(view.el)) return;
+        if (video?.error !== null && video?.error !== void 0) {
+          onFailure(`video error: ${video.error.message || video.error.code}`);
+          return;
+        }
+        if (view.rtc === void 0 || video === null || video.srcObject === null) {
+          lastProgressAt = Date.now();
+          return;
+        }
+        const quality = video.getVideoPlaybackQuality?.();
+        const frameCount = quality?.totalVideoFrames ?? 0;
+        if (frameCount > lastFrameCount) {
+          lastFrameCount = frameCount;
+          lastProgressAt = Date.now();
+        }
+        if (lastFrameCount >= 0 && !video.paused && Date.now() - lastProgressAt > viewerStalledReloadMs) {
+          onFailure(`video frame stream stalled for ${Math.round((Date.now() - lastProgressAt) / 1e3)}s`);
+        }
+      }, viewerHealthPollMs);
+    };
+    function attachCenterViewHandlers(view) {
+      if (centerViewerHealthTimer !== void 0) window.clearInterval(centerViewerHealthTimer);
+      centerViewerHealthTimer = installViewHealthWatchdog(view, scheduleCenterViewerReload);
+      view.addEventListener("status", (ev) => {
+        if (!(ev instanceof CustomEvent)) return;
+        const message = String(ev.detail);
+        centerStatus.textContent = `Center view: ${message}`;
+        if (isViewerFailureMessage(message)) scheduleCenterViewerReload(message);
+      });
+      view.addEventListener("error", (ev) => {
+        const message = ev instanceof CustomEvent ? errorToMessage(ev.detail) : "center view error";
+        scheduleCenterViewerReload(message);
+      });
+      view.addEventListener("ready", (ev) => {
+        const webView = ev.currentTarget;
+        if (!(webView instanceof ZooWebView)) return;
+        centerViewerReloadAttempts = 0;
+        centerStatus.textContent = "Center assembly connected";
+        submitRootProject();
+      });
+    }
+    async function rebuildCenterViewer(reason) {
+      const previousView = centerView;
+      centerView = createCenterView();
+      attachCenterViewHandlers(centerView);
+      assemblyRenderer.replaceChildren(centerView.el);
+      await previousView.deconstructor();
+      centerStatus.textContent = "Center renderer restarting";
+      centerView.start();
+      if (kclFiles.size > 0) scheduleRootProjectSubmit();
+      rootLogLine(`< center renderer recreated: ${reason}`, "in");
+    }
+    function scheduleCenterViewerReload(reason) {
+      if (centerViewerReloadTimer !== void 0) return;
+      if (centerViewerReloadAttempts >= maxViewerReloadAttempts) {
+        rootLogLine(`< center renderer reload limit reached: ${reason}`);
+        centerStatus.textContent = `Center renderer offline: ${reason.slice(0, 120)}`;
+        return;
+      }
+      const attempt = centerViewerReloadAttempts + 1;
+      const delay = viewerReloadDelay(centerViewerReloadAttempts);
+      centerViewerReloadAttempts = attempt;
+      rootLogLine(`< center renderer error; reload ${attempt}/${maxViewerReloadAttempts} in ${Math.round(delay / 1e3)}s: ${reason}`, "in");
+      centerStatus.textContent = `Center renderer restarting: ${reason.slice(0, 120)}`;
+      centerViewerReloadTimer = window.setTimeout(() => {
+        centerViewerReloadTimer = void 0;
+        void rebuildCenterViewer(reason);
+      }, delay);
+    }
     const submitRootProject = () => {
       if (kclFiles.size === 0) return;
       void submitProject(centerView, renderProjectFor(rootFilePath), (message) => {
         centerStatus.textContent = `Center KCL failed: ${message}`;
+        if (isViewerFailureMessage(message)) scheduleCenterViewerReload(message);
       }, () => {
         sendRootCameraCommand(centerView);
       }).catch(() => {
       });
     };
+    const scheduleRootProjectSubmit = () => {
+      if (rootRenderTimer !== void 0) window.clearTimeout(rootRenderTimer);
+      rootRenderTimer = window.setTimeout(() => {
+        rootRenderTimer = void 0;
+        submitRootProject();
+      }, 450);
+    };
+    const liveAgentViewLimit = () => Math.min(maxLiveAgentViews, Math.max(1, plannedAgentCount || agents.size || 1));
+    const liveAgentViewCount = () => Array.from(agents.values()).filter((agent) => agent.view !== void 0).length;
+    const markViewerQueued = (agent, reason) => {
+      agent.viewerSlot?.classList.add("agent-viewer-queued");
+      if (agent.viewPlaceholder !== void 0) {
+        agent.viewPlaceholder.textContent = `Renderer queued (${liveAgentViewCount()}/${liveAgentViewLimit()})`;
+      }
+      if (!agent.viewerQueuedLogged) {
+        appendAgentLog(agent, `< renderer queued: ${reason}; AI work continues`, "in");
+        agent.viewerQueuedLogged = true;
+      }
+    };
+    const setAgentViewerPlaceholder = (agent, message) => {
+      const viewerSlot = agent.viewerSlot;
+      if (viewerSlot === void 0) return;
+      const placeholder = document.createElement("div");
+      placeholder.classList.add("agent-viewer-placeholder");
+      placeholder.textContent = message;
+      agent.viewPlaceholder = placeholder;
+      viewerSlot.replaceChildren(placeholder);
+    };
+    const setAgentSnapshot = (agent, snapshotUrl) => {
+      const viewerSlot = agent.viewerSlot;
+      if (viewerSlot === void 0) return;
+      const image = document.createElement("img");
+      image.classList.add("agent-cad-snapshot");
+      image.alt = `CAD snapshot for ${agent.name}`;
+      image.src = snapshotUrl;
+      agent.snapshotUrl = snapshotUrl;
+      agent.viewPlaceholder = void 0;
+      viewerSlot.classList.remove("agent-viewer-queued");
+      viewerSlot.replaceChildren(image);
+    };
+    const clearAgentViewerTimers = (agent) => {
+      if (agent.viewerReloadTimer !== void 0) {
+        window.clearTimeout(agent.viewerReloadTimer);
+        agent.viewerReloadTimer = void 0;
+      }
+      if (agent.viewerHealthTimer !== void 0) {
+        window.clearInterval(agent.viewerHealthTimer);
+        agent.viewerHealthTimer = void 0;
+      }
+    };
+    const disposeAgentView = async (agent) => {
+      const previousView = agent.view;
+      agent.view = void 0;
+      agent.viewStarted = false;
+      if (agent.viewerHealthTimer !== void 0) {
+        window.clearInterval(agent.viewerHealthTimer);
+        agent.viewerHealthTimer = void 0;
+      }
+      await previousView?.deconstructor();
+    };
+    function scheduleAgentViewerReload(agent, reason) {
+      if (!shouldRenderAgentLocally(agent) || isReusableLibraryAgent(agent)) return;
+      if (agent.viewerReloadTimer !== void 0) return;
+      if (agent.viewerReloadAttempts !== void 0 && agent.viewerReloadAttempts >= maxViewerReloadAttempts) {
+        appendAgentLog(agent, `< renderer reload limit reached: ${reason}`);
+        setAgentViewerPlaceholder(agent, `Renderer offline: ${reason.slice(0, 120)}`);
+        return;
+      }
+      const attempt = (agent.viewerReloadAttempts ?? 0) + 1;
+      const delay = viewerReloadDelay(agent.viewerReloadAttempts ?? 0);
+      agent.viewerReloadAttempts = attempt;
+      appendAgentLog(agent, `< renderer error; reload ${attempt}/${maxViewerReloadAttempts} in ${Math.round(delay / 1e3)}s: ${reason}`, "in");
+      setAgentViewerPlaceholder(agent, `Renderer restarting: ${reason.slice(0, 120)}`);
+      agent.viewerReloadTimer = window.setTimeout(() => {
+        agent.viewerReloadTimer = void 0;
+        void (async () => {
+          await disposeAgentView(agent);
+          if (!agents.has(agent.id)) return;
+          if (ensureAgentView(agent, "renderer recovery")) {
+            appendAgentLog(agent, "< renderer recreated after error", "in");
+          }
+        })();
+      }, delay);
+    }
+    function attachAgentViewHandlers(agent, view) {
+      if (agent.viewerHealthTimer !== void 0) window.clearInterval(agent.viewerHealthTimer);
+      agent.viewerHealthTimer = installViewHealthWatchdog(view, (message) => {
+        scheduleAgentViewerReload(agent, message);
+      });
+      view.addEventListener("status", (ev) => {
+        if (!(ev instanceof CustomEvent)) return;
+        const message = String(ev.detail);
+        if (agent.logElement !== void 0) writeLog(agent.logElement, `rtc: ${message}`);
+        if (isViewerFailureMessage(message)) scheduleAgentViewerReload(agent, message);
+      });
+      view.addEventListener("error", (ev) => {
+        const message = ev instanceof CustomEvent ? errorToMessage(ev.detail) : "view error";
+        if (agent.logElement !== void 0) writeLog(agent.logElement, `rtc error: ${message}`);
+        scheduleAgentViewerReload(agent, message);
+      });
+      view.addEventListener("ready", (ev) => {
+        const webView = ev.currentTarget;
+        if (!(webView instanceof ZooWebView)) return;
+        agent.viewerReloadAttempts = 0;
+        if (agent.logElement !== void 0) writeLog(agent.logElement, "modeling websocket: connected", "in");
+        if (agent.logElement !== void 0) writeLog(agent.logElement, `loaded ${agent.filePath}`, "in");
+        void submitAgentProject(agent);
+      });
+    }
+    const ensureAgentView = (agent, reason) => {
+      if (agent.view !== void 0) {
+        startAgentView(agent);
+        return true;
+      }
+      if (liveAgentViewCount() >= liveAgentViewLimit()) {
+        markViewerQueued(agent, reason);
+        return false;
+      }
+      const viewerSlot = agent.viewerSlot;
+      if (viewerSlot === void 0) return false;
+      const view = new ZooWebView({
+        zooClient,
+        size: paneViewerSize(plannedAgentCount || agents.size || 1),
+        allowConcurrentViews: true,
+        showStartLogo: false
+      });
+      view.el.classList.add("wall-view", "agent-view");
+      agent.view = view;
+      agent.viewPlaceholder = void 0;
+      viewerSlot.classList.remove("agent-viewer-queued");
+      viewerSlot.replaceChildren(view.el);
+      attachAgentViewHandlers(agent, view);
+      appendAgentLog(agent, `< renderer allocated: ${reason}`, "in");
+      startAgentView(agent);
+      return true;
+    };
     const submitAgentProject = async (agent, onSuccess) => {
-      if (kclFiles.size === 0 || agent.view === void 0) return { ok: false, message: "agent view not ready" };
+      if (kclFiles.size === 0) return { ok: false, message: "agent view not ready" };
+      if (isReusableLibraryAgent(agent)) return { ok: true, message: "BOM library is metadata only" };
+      if (useAgentCadSnapshots) {
+        if (!isControllerWindow) return { ok: true, message: "snapshot rendered by controller" };
+        queueAgentSnapshot(agent, runId, renderProjectFor(agent.filePath), "latest KCL");
+        onSuccess?.();
+        return { ok: true, message: "CAD snapshot queued" };
+      }
+      if (!shouldRenderAgentLocally(agent)) return { ok: true, message: "render delegated to tile window" };
+      if (agent.view === void 0 && !ensureAgentView(agent, "final KCL ready")) {
+        return { ok: true, message: "viewer budget queued" };
+      }
+      if (agent.view?.rtc === void 0) return { ok: false, message: "agent view not connected yet" };
       const project = renderProjectFor(agent.filePath);
       let failureMessage = "";
+      let viewerFailure = false;
       try {
         await submitProject(agent.view, project, (message) => {
           failureMessage = message;
+          if (isViewerFailureMessage(message)) {
+            viewerFailure = true;
+            appendAgentLog(agent, `renderer transport failed: ${message}`);
+            scheduleAgentViewerReload(agent, message);
+            return;
+          }
           setAgentStatus(agent, "error");
           appendAgentLog(agent, `kcl failed: ${message}`);
         }, onSuccess);
         return { ok: true };
       } catch (error) {
+        if (viewerFailure || isViewerFailureMessage(failureMessage || errorToMessage(error))) {
+          scheduleAgentViewerReload(agent, failureMessage || errorToMessage(error));
+          return { ok: true, message: "renderer restarting after transport error" };
+        }
         return { ok: false, message: failureMessage || errorToMessage(error) };
       }
     };
@@ -3828,8 +4500,17 @@
     const submitWorkAgentProject = async (agent, onSuccess) => {
       if (agent.id !== rootAgentId) return submitAgentProject(agent, onSuccess);
       if (kclFiles.size === 0) return { ok: false, message: "root view not ready" };
+      let viewerFailure = false;
+      let failureMessage = "";
       try {
         await submitProject(centerView, renderProjectFor(rootFilePath), (message) => {
+          failureMessage = message;
+          if (isViewerFailureMessage(message)) {
+            viewerFailure = true;
+            scheduleCenterViewerReload(message);
+            rootLogLine(`root renderer transport failed: ${message}`);
+            return;
+          }
           centerStatus.textContent = `Center KCL failed: ${message}`;
           rootLogLine(`root kcl failed: ${message}`);
         }, () => {
@@ -3838,8 +4519,78 @@
         });
         return { ok: true };
       } catch (error) {
+        if (viewerFailure || isViewerFailureMessage(failureMessage || errorToMessage(error))) {
+          scheduleCenterViewerReload(failureMessage || errorToMessage(error));
+          return { ok: true, message: "center renderer restarting after transport error" };
+        }
         return { ok: false, message: errorToMessage(error) };
       }
+    };
+    const renderProjectForDraft = (entryFilePath, draftKcl) => {
+      const hadPrevious = kclFiles.has(entryFilePath);
+      const previous = kclFiles.get(entryFilePath);
+      kclFiles.set(entryFilePath, draftKcl);
+      const project = renderProjectFor(entryFilePath);
+      if (hadPrevious) kclFiles.set(entryFilePath, previous);
+      else kclFiles.delete(entryFilePath);
+      return project;
+    };
+    const submitDraftWorkAgentProject = async (agent, currentRun, draftKcl, draftIndex) => {
+      const entryFilePath = agent.id === rootAgentId ? rootFilePath : agent.filePath;
+      if (agent.id !== rootAgentId && useAgentCadSnapshots) {
+        if (!isControllerWindow) return { ok: true, message: "snapshot rendered by controller" };
+        queueAgentSnapshot(agent, currentRun, renderProjectForDraft(entryFilePath, draftKcl), `draft KCL ${draftIndex}`);
+        return { ok: true, message: "CAD snapshot queued" };
+      }
+      if (agent.id !== rootAgentId && !shouldRenderAgentLocally(agent)) {
+        return { ok: true, message: "draft render delegated to tile window" };
+      }
+      if (agent.id !== rootAgentId && agent.view === void 0 && !ensureAgentView(agent, "draft KCL stream")) {
+        return { ok: true, message: "viewer budget queued" };
+      }
+      const view = agent.id === rootAgentId ? centerView : agent.view;
+      if (kclFiles.size === 0 || view === void 0) return { ok: false, message: "draft view not ready" };
+      if (view.rtc === void 0) return { ok: true, message: "draft renderer starting" };
+      let failureMessage = "";
+      let viewerFailure = false;
+      try {
+        await submitProject(view, renderProjectForDraft(entryFilePath, draftKcl), (message) => {
+          failureMessage = message;
+          if (!isViewerFailureMessage(message)) return;
+          viewerFailure = true;
+          if (agent.id === rootAgentId) scheduleCenterViewerReload(message);
+          else scheduleAgentViewerReload(agent, message);
+        }, () => {
+          if (agent.id === rootAgentId) sendRootCameraCommand(centerView);
+        });
+        return { ok: true };
+      } catch (error) {
+        if (viewerFailure || isViewerFailureMessage(failureMessage || errorToMessage(error))) {
+          const message = failureMessage || errorToMessage(error);
+          if (agent.id === rootAgentId) scheduleCenterViewerReload(message);
+          else scheduleAgentViewerReload(agent, message);
+          return { ok: true, message: "draft renderer restarting after transport error" };
+        }
+        return { ok: false, message: failureMessage || errorToMessage(error) };
+      }
+    };
+    const queueDraftRender = (agent, currentRun, draftKcl, draftIndex) => {
+      broadcastWall({ type: "agent:draft", agentId: agent.id, kcl: draftKcl, draftIndex });
+      const chain = draftRenderChains.get(agent.id) ?? Promise.resolve();
+      const next = chain.catch(() => {
+      }).then(async () => {
+        if (!active || !agentStillActive(agent, currentRun)) return;
+        appendWorkAgentLog(agent, `< draft KCL ${draftIndex}; rendering intermediary`, "in");
+        const result = await submitDraftWorkAgentProject(agent, currentRun, draftKcl, draftIndex);
+        if (!active || !agentStillActive(agent, currentRun)) return;
+        if (!result.ok) {
+          appendWorkAgentLog(agent, `< draft KCL ${draftIndex} render rejected: ${result.message ?? "unknown renderer error"}`);
+        }
+      });
+      draftRenderChains.set(agent.id, next);
+      void next.finally(() => {
+        if (draftRenderChains.get(agent.id) === next) draftRenderChains.delete(agent.id);
+      });
     };
     const updateInterfaceManifest = (agent, kcl) => {
       const manifest = extractInterfaceManifest(kcl);
@@ -3849,8 +4600,85 @@
     };
     const interfaceManifestFor = (agent) => interfaceManifests.get(agent.filePath) ?? fallbackInterfaceManifest(agent);
     const reviewChildren = (agent) => graphChildren(agent.id);
+    const importedAgentsFor = (agent) => (agent.imports ?? []).map((filePath) => agentForFilePath(filePath)).filter((candidate) => candidate !== void 0 && candidate.id !== agent.id);
+    const importConsumersFor = (agent) => Array.from(agents.values()).filter((candidate) => candidate.kind === "orchestrator" && candidate.id !== agent.parentId && (candidate.imports ?? []).includes(agent.filePath));
+    const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const kclForGraphAgent = (agent) => kclFiles.get(agent.id === rootAgentId ? rootFilePath : agent.filePath) ?? "";
+    const cleanBomBody = (source) => stripImportLines(source).split("\n").map((line) => line.replace(/\/\/.*$/, "").trim()).filter(Boolean).join("\n");
+    const sharedReusableImportsFor = (agent) => importedAgentsFor(agent).filter((imported) => imported.kind === "worker" && imported.scope === "shared_part");
+    const explicitBomQuantityForReusable = (source, reusable) => {
+      const alias = aliasForFilePath(reusable.filePath).toLowerCase();
+      const role = reusable.role.toLowerCase();
+      const file = renderPathForFilePath(reusable.filePath).toLowerCase();
+      for (const line of source.split("\n")) {
+        const lower = line.toLowerCase();
+        if (!lower.includes("bom")) continue;
+        if (!lower.includes(alias) && !lower.includes(role) && !lower.includes(file)) continue;
+        const quantity = lower.match(/\b(\d+)\s*x\b/)?.[1] ?? lower.match(/\bx\s*(\d+)\b/)?.[1] ?? lower.match(/\bquantity\s*[:=]\s*(\d+)\b/)?.[1];
+        if (quantity !== void 0) return Number(quantity);
+      }
+      return void 0;
+    };
+    const quantityForReusableImport = (consumer, reusable) => {
+      const source = kclForGraphAgent(consumer);
+      const explicitQuantity = explicitBomQuantityForReusable(source, reusable);
+      if (explicitQuantity !== void 0) return explicitQuantity;
+      const body = cleanBomBody(source);
+      if (body.trim().length === 0) return 0;
+      const alias = aliasForFilePath(reusable.filePath);
+      const aliasPattern = escapeRegExp(alias);
+      const lines = body.split("\n").filter((line) => !new RegExp(`\\bhide\\s*\\(\\s*${aliasPattern}\\b`, "i").test(line));
+      const searchable = lines.join("\n");
+      const cloneCount = searchable.match(new RegExp(`\\bclone\\s*\\(\\s*${aliasPattern}\\b`, "g"))?.length ?? 0;
+      if (cloneCount > 0) return cloneCount;
+      return new RegExp(`\\b${aliasPattern}\\b`).test(searchable) ? 1 : 0;
+    };
+    const mergeBomUsage = (usage, item) => {
+      const existing = usage.get(item.agent.id);
+      if (existing === void 0) {
+        usage.set(item.agent.id, { ...item });
+        return;
+      }
+      existing.quantity += item.quantity;
+    };
+    const directBomUsageFor = (agent) => sharedReusableImportsFor(agent).map((reusable) => ({
+      agent: reusable,
+      quantity: quantityForReusableImport(agent, reusable)
+    }));
+    const rolledUpBomUsageFor = (agent, visited = /* @__PURE__ */ new Set()) => {
+      if (visited.has(agent.id) || agent.scope === "shared_part") return [];
+      visited.add(agent.id);
+      const usage = /* @__PURE__ */ new Map();
+      directBomUsageFor(agent).forEach((item) => mergeBomUsage(usage, item));
+      graphChildren(agent.id).filter((child) => !isReusableLibraryAgent(child)).forEach((child) => {
+        rolledUpBomUsageFor(child, visited).forEach((item) => mergeBomUsage(usage, item));
+      });
+      return Array.from(usage.values()).sort((a, b) => b.quantity - a.quantity || a.agent.role.localeCompare(b.agent.role));
+    };
+    const bomSummaryForGraphNode = (agent, compact) => {
+      if (agent.scope === "shared_part") return "BOM: reusable component";
+      const usage = rolledUpBomUsageFor(agent);
+      if (usage.length === 0) return "";
+      const maxItems = compact ? 2 : 3;
+      const labels = usage.slice(0, maxItems).map((item) => `${item.quantity > 0 ? item.quantity : "?"}x ${titleCase(item.agent.role)}`);
+      const remainder = usage.length - labels.length;
+      return `BOM: ${labels.join(", ")}${remainder > 0 ? ` +${remainder}` : ""}`;
+    };
+    const placementComponentsFor = (agent) => {
+      const seen = /* @__PURE__ */ new Set();
+      const directChildIds = new Set(reviewChildren(agent).map((child) => child.id));
+      return [...reviewChildren(agent), ...importedAgentsFor(agent)].filter((component) => {
+        if (isReusableLibraryAgent(component)) return false;
+        if (component.status === "error") return false;
+        if (!placementComponentReady(component)) return false;
+        if (seen.has(component.id)) return false;
+        if (!directChildIds.has(component.id) && component.kind === "worker" && component.scope !== "shared_part") return false;
+        seen.add(component.id);
+        return true;
+      });
+    };
     const childInterfaceContext = (agent) => {
-      const children = reviewChildren(agent);
+      const children = placementComponentsFor(agent);
       if (children.length === 0) return "";
       return children.map((child) => [
         `- ${aliasForFilePath(child.filePath)} from ${child.filePath}: ${child.role}`,
@@ -3859,7 +4687,12 @@
     };
     const reviewWorkerTargets = (agent) => {
       const collect = (id) => graphChildren(id).flatMap((child) => child.kind === "worker" ? [child] : reviewWorkerTargets(child));
-      return collect(agent.id);
+      const seen = /* @__PURE__ */ new Set();
+      return [...collect(agent.id), ...importedAgentsFor(agent).filter((child) => child.kind === "worker")].filter((child) => {
+        if (seen.has(child.id)) return false;
+        seen.add(child.id);
+        return true;
+      });
     };
     const reviewOrchestratorTargets = (agent) => {
       const collect = (id) => graphChildren(id).flatMap((child) => child.kind === "orchestrator" ? [child, ...reviewOrchestratorTargets(child)] : []);
@@ -3872,9 +4705,12 @@
       if (entryFilePath !== rootFilePath) files[rootFilePath] = files[project.mainFilePath] ?? "";
       return files;
     };
-    const workerBodyReady = (agent) => stripImportLines(kclFiles.get(agent.filePath) ?? "").trim().length > 0;
+    const agentKclReady = (agent) => stripImportLines(kclFiles.get(agent.filePath) ?? "").split("\n").map((line) => line.replace(/\/\/.*$/, "").trim()).some(Boolean);
+    const placementComponentReady = (agent) => agent.status !== "error" && agentKclReady(agent);
+    const workerBodyReady = (agent) => agent.status === "error" || agentKclReady(agent);
     const pendingWorkerTargets = (agent) => reviewWorkerTargets(agent).filter((child) => !workerBodyReady(child));
-    const placementReady = (agent) => pendingWorkerTargets(agent).length === 0;
+    const failedWorkerTargets = (agent) => reviewWorkerTargets(agent).filter((child) => child.status === "error");
+    const placementReady = (agent) => placementComponentsFor(agent).length > 0;
     const rankAgentTarget = (candidates, request) => {
       if (candidates.length === 0) return void 0;
       const targetText = request.target.toLowerCase();
@@ -3907,7 +4743,7 @@
       const ranked = rankWorkerReworkTarget(parent, request);
       return ranked?.score ? ranked.candidate : fallbackChild;
     };
-    const isPlacementRework = (request) => /\b(assembly|assemble|place|placement|position|translate|rotate|align|axis convention|datum|origin|mate|layout|duplicate|stray|unassembled|integrat|import|clone|hidden|unplaced|root|transform|coaxial)\b/i.test(`${request.target} ${request.reason} ${request.instruction}`);
+    const isPlacementRework = (request) => /\b(assembly|assemble|place|placement|position|translate|rotate|align|axis convention|datum|origin|mate|layout|duplicate|stray|unassembled|integrat|import|clone|mirror|mirrored|symmetry|symmetric|pattern|array|radial|linear|spacing|pitch|bolt circle|hidden|unplaced|root|transform|coaxial)\b/i.test(`${request.target} ${request.reason} ${request.instruction}`);
     const isGeometryRework = (request) => /\b(solver|constraint|sketch|profile|hole|through-hole|cut|subtract|extrude|geometry|body|part|generate|create|empty|zero bytes|file|kcl|plate|bracket|support|fails execution|engine error|under-constrained)\b/i.test(`${request.target} ${request.reason} ${request.instruction}`);
     const isOrchestratorOwnedRework = (request) => {
       const text = `${request.target} ${request.reason} ${request.instruction}`;
@@ -3927,17 +4763,29 @@
       return parent;
     };
     const placementInstructionFor = (parent, changedChild, extra = "") => {
-      const childImports = reviewChildren(parent).map((child) => `- ${aliasForFilePath(child.filePath)} from ${child.filePath}: ${child.role}`).join("\n");
+      const childImports = placementComponentsFor(parent).map((child) => `- ${aliasForFilePath(child.filePath)} from ${child.filePath}: ${child.role}`).join("\n");
       const interfaces = childInterfaceContext(parent);
+      const failedChildren = failedWorkerTargets(parent).map((child) => `- ${child.role} (${child.filePath})`).join("\n");
       return [
         `Update ${parent.name}'s assembly placement layer after ${changedChild.role} changed.`,
+        "This is an incremental assembly update. Place every currently available import now; do not wait for pending children and do not invent stand-ins for them.",
         "Use imported child aliases, clone(), hide(), translate(), rotate(), scale(), and appearance() only.",
+        "You own mirrored, symmetric, radial-pattern, and linear-pattern placement. Express those by cloning imported aliases and applying explicit translate/rotate/scale transforms in this assembly file.",
+        "Do not push repeated placement down into worker part files. Workers model one canonical part; this orchestrator creates left/right instances, bolt circles, rib arrays, repeated rollers/pins/washers, and other patterns.",
+        "For mirrored/patterned placements, include auditable comments with source alias, count, spacing/angle, mirror plane or symmetry axis, and target mate points.",
         "Do not create or modify part geometry. Do not use sketches, profiles, lines, circles, extrude, subtract, or boolean modeling tools.",
+        "Place only direct child/sub-assembly imports and explicit shared reusable imports listed below. Do not place non-direct worker descendants or grandchild part files in this parent assembly.",
+        "If a direct child/sub-assembly import has no usable return value, leave this parent partial and record that child in placement_warnings instead of reaching through to import/place its children.",
+        "Return one renderable aggregate as the final expression so this assembly can itself be imported and placed by its parent.",
         "Before choosing transforms, inspect the child KCL and the interface manifests below for local origins, axes, bounding boxes, mate points, and dimensions.",
         "Place children by aligning named mate points and axes. If a child is missing an interface manifest, infer only from its KCL and leave a concise interface warning in the assembly manifest.",
-        "Keep each child part as a separate imported component and place the components into one coherent assembly.",
+        "For every shared/reusable component import you place, add a concise comment near the placement in the form `// BOM: <quantity>x <alias> (<role>)` so the graph can display the bill of materials.",
+        "If a child is listed as failed, do not import or place it. Continue the partial assembly and record the omission in placement_warnings.",
+        "Keep each direct child/sub-assembly as a separate imported component and place the components into one coherent assembly.",
         childImports ? `Child imports:
 ${childImports}` : "",
+        failedChildren ? `Failed children to omit from this placement update:
+${failedChildren}` : "",
         interfaces ? `Child interface manifests:
 ${interfaces}` : "",
         extra
@@ -3945,6 +4793,10 @@ ${interfaces}` : "",
     };
     const scheduleOrchestratorPlacement = (parent, changedChild, extraInstruction = "") => {
       if (!active || parent.kind !== "orchestrator") return;
+      if (!placementReady(parent)) {
+        appendWorkAgentLog(parent, `< placement waiting for first renderable direct child`, "in");
+        return;
+      }
       const currentRun = runId;
       const existing = placementTimers.get(parent.id);
       if (existing !== void 0) window.clearTimeout(existing);
@@ -3959,11 +4811,14 @@ ${interfaces}` : "",
     const requestOrchestratorReview = async (parent, changedChild, currentRun) => {
       if (currentRun !== runId || !active) return;
       const children = reviewWorkerTargets(parent);
-      if (children.length === 0) return;
+      const readyChildren = children.filter(workerBodyReady);
+      if (readyChildren.length === 0) {
+        reviewLogLine(parent, "< visual review waiting for the first child KCL result", "in");
+        return;
+      }
       const pendingChildren = pendingWorkerTargets(parent);
       if (pendingChildren.length > 0) {
-        reviewLogLine(parent, `< visual review deferred: waiting on ${pendingChildren.map((child) => child.role).join(", ")}`, "in");
-        return;
+        reviewLogLine(parent, `< partial visual review: ${readyChildren.length}/${children.length} child KCL results ready`, "in");
       }
       const reviewCount = parent.id === rootAgentId ? rootReviewRounds : parent.reviewRounds ?? 0;
       if (parent.id === rootAgentId) rootReviewRounds += 1;
@@ -3980,32 +4835,51 @@ ${interfaces}` : "",
               id: parent.id,
               parentId: parent.parentId,
               kind: parent.kind,
+              scope: parent.scope,
               name: parent.name,
               role: parent.role,
               instruction: parent.instruction,
-              filePath: parent.id === rootAgentId ? rootFilePath : parent.filePath
+              filePath: parent.id === rootAgentId ? rootFilePath : parent.filePath,
+              imports: parent.imports ?? []
             },
             child: {
               id: changedChild.id,
               name: changedChild.name,
               role: changedChild.role,
-              filePath: changedChild.filePath
+              filePath: changedChild.filePath,
+              scope: changedChild.scope
             },
-            children: children.map((child) => ({
+            children: readyChildren.map((child) => ({
               id: child.id,
               name: child.name,
               role: child.role,
-              filePath: child.filePath
+              filePath: child.filePath,
+              scope: child.scope,
+              imports: child.imports ?? []
+            })),
+            allAgents: Array.from(agents.values()).map((agent) => ({
+              id: agent.id,
+              parentId: agent.parentId,
+              kind: agent.kind,
+              scope: agent.scope,
+              name: agent.name,
+              role: agent.role,
+              filePath: agent.filePath,
+              imports: agent.imports ?? []
             })),
             files: reviewFilesFor(parent),
             interfaces: objectFromMap(interfaceManifests)
           })
         });
-        if (!response.ok) throw new Error(`review ${response.status}`);
+        if (!response.ok) throw await httpErrorFromResponse(response, "review");
         const review = await response.json();
         if (currentRun !== runId || !active) return;
         review.dialog?.slice(-2).forEach((line) => reviewLogLine(parent, `< review ws: ${line}`, "in"));
         reviewLogLine(parent, `< visual review: ${review.summary}`, "in");
+        const bomUpdates = applyBomReview(parent, review.bom, currentRun);
+        if (bomUpdates > 0) {
+          reviewLogLine(parent, `< BOM review applied ${bomUpdates} graph update${bomUpdates === 1 ? "" : "s"}`, "in");
+        }
         if (review.rework.length === 0) {
           reviewLogLine(parent, "< visual review: no child rework requested", "in");
           return;
@@ -4053,36 +4927,107 @@ ${interfaces}` : "",
       let parentId = agent.parentId;
       while (parentId !== "") {
         if (parentId === rootAgentId) {
-          submitRootProject();
+          syncRootFileImports();
+          scheduleRootProjectSubmit();
           rootLogLine(`< merged ${agent.role} into root assembly`, "in");
           const rootAgent = graphNode(rootAgentId);
           if (rootAgent !== void 0) {
-            if (placementReady(rootAgent)) scheduleOrchestratorPlacement(rootAgent, agent);
-            else {
-              const pending = pendingWorkerTargets(rootAgent).map((child) => child.role).join(", ");
-              rootLogLine(`< root placement deferred: waiting on ${pending}`, "in");
+            if (placementReady(rootAgent)) {
+              scheduleOrchestratorPlacement(rootAgent, agent);
+              scheduleOrchestratorReview(rootAgent, agent);
+            } else {
+              rootLogLine("< root placement waiting for a renderable direct sub-assembly", "in");
             }
-            scheduleOrchestratorReview(rootAgent, agent);
           }
           break;
         }
         const parent = agents.get(parentId);
         if (parent === void 0) break;
-        appendAgentLog(parent, `< merged child update: ${agent.role}`, "in");
-        void submitAgentProject(parent);
-        if (placementReady(parent)) scheduleOrchestratorPlacement(parent, agent);
-        else {
-          const pending = pendingWorkerTargets(parent).map((child) => child.role).join(", ");
-          appendAgentLog(parent, `< placement deferred: waiting on ${pending}`, "in");
+        if (isReusableLibraryAgent(parent)) {
+          syncReusableLibraryMetadata(parent);
+          appendAgentLog(parent, `< BOM registry updated: ${agent.role}`, "in");
+          break;
         }
-        scheduleOrchestratorReview(parent, agent);
+        appendAgentLog(parent, `< merged child update: ${agent.role}`, "in");
+        syncAssemblyFileImports(parent);
+        void submitAgentProject(parent);
+        if (placementReady(parent)) {
+          scheduleOrchestratorPlacement(parent, agent);
+          scheduleOrchestratorReview(parent, agent);
+        } else {
+          appendAgentLog(parent, "< placement waiting for a renderable direct child", "in");
+        }
         parentId = parent.parentId;
       }
+      importConsumersFor(agent).forEach((consumer) => {
+        appendAgentLog(consumer, `< ${agent.scope === "shared_part" ? "shared component" : "import dependency"} ready: ${agent.role}`, "in");
+        void submitAgentProject(consumer);
+        if (placementReady(consumer)) {
+          scheduleOrchestratorPlacement(consumer, agent);
+          scheduleOrchestratorReview(consumer, agent);
+        } else {
+          appendAgentLog(consumer, "< placement waiting for a renderable direct child", "in");
+        }
+      });
+    };
+    const markAgentFailedAndRefreshAncestors = (agent, currentRun, reason) => {
+      if (!agentStillActive(agent, currentRun)) return;
+      let parentId = agent.parentId;
+      while (parentId !== "") {
+        if (parentId === rootAgentId) {
+          syncRootFileImports();
+          rootLogLine(`< degraded assembly: omitting failed ${agent.role}${reason ? ` (${reason})` : ""}`, "in");
+          const rootAgent = graphNode(rootAgentId);
+          if (rootAgent !== void 0) {
+            if (placementReady(rootAgent)) {
+              scheduleOrchestratorPlacement(rootAgent, agent, `Omit failed child ${agent.role}; record the omission in placement_warnings.`);
+              scheduleOrchestratorReview(rootAgent, agent);
+            } else {
+              rootLogLine("< root placement waiting for a renderable direct sub-assembly", "in");
+            }
+          }
+          break;
+        }
+        const parent = agents.get(parentId);
+        if (parent === void 0) break;
+        if (isReusableLibraryAgent(parent)) {
+          syncReusableLibraryMetadata(parent);
+          appendAgentLog(parent, `< BOM registry marked failed component: ${agent.role}${reason ? ` (${reason})` : ""}`, "in");
+          break;
+        }
+        syncAssemblyFileImports(parent);
+        appendAgentLog(parent, `< degraded assembly: omitting failed ${agent.role}${reason ? ` (${reason})` : ""}`, "in");
+        void submitAgentProject(parent);
+        if (placementReady(parent)) {
+          scheduleOrchestratorPlacement(parent, agent, `Omit failed child ${agent.role}; record the omission in placement_warnings.`);
+          scheduleOrchestratorReview(parent, agent);
+        } else {
+          appendAgentLog(parent, "< placement waiting for a renderable direct child", "in");
+        }
+        parentId = parent.parentId;
+      }
+      importConsumersFor(agent).forEach((consumer) => {
+        if (agent.scope === "shared_part") {
+          updateAgent(consumer, { imports: (consumer.imports ?? []).filter((filePath) => filePath !== agent.filePath) });
+          syncAssemblyFileImports(consumer);
+          appendAgentLog(consumer, `< removed failed shared component import: ${agent.role}`, "in");
+        } else {
+          appendAgentLog(consumer, `< degraded import dependency: ${agent.role}${reason ? ` (${reason})` : ""}`, "in");
+        }
+        void submitAgentProject(consumer);
+        if (placementReady(consumer)) {
+          scheduleOrchestratorPlacement(consumer, agent, `Omit failed imported dependency ${agent.role}; record the omission in placement_warnings.`);
+          scheduleOrchestratorReview(consumer, agent);
+        } else {
+          appendAgentLog(consumer, "< placement waiting for a renderable direct child", "in");
+        }
+      });
     };
     const createAgentPanel = (agent) => {
       const panel = document.createElement("section");
       panel.classList.add("agent-card", `agent-${agent.kind}`);
       panel.style.setProperty("--agent-color", agent.color);
+      panel.dataset.status = agent.status;
       const header = document.createElement("header");
       header.classList.add("agent-header");
       const title = document.createElement("div");
@@ -4094,12 +5039,19 @@ ${interfaces}` : "",
       const status = document.createElement("div");
       status.classList.add("agent-status");
       status.textContent = agent.status;
+      status.dataset.status = agent.status;
       agent.statusElement = status;
       const titleBlock = document.createElement("div");
       titleBlock.append(title, role);
       header.append(titleBlock, status);
       const viewerSlot = document.createElement("div");
       viewerSlot.classList.add("agent-viewer-slot");
+      agent.viewerSlot = viewerSlot;
+      const placeholder = document.createElement("div");
+      placeholder.classList.add("agent-viewer-placeholder");
+      placeholder.textContent = "Awaiting Zookeeper assignment";
+      agent.viewPlaceholder = placeholder;
+      viewerSlot.appendChild(placeholder);
       const log = document.createElement("div");
       log.classList.add("agent-log", "websocket-log");
       agent.logElement = log;
@@ -4117,88 +5069,614 @@ ${interfaces}` : "",
         body.append(viewerSlot, graph, log);
         panel.append(header, body);
       }
-      const view = new ZooWebView({
-        zooClient,
-        size: paneViewerSize(),
-        allowConcurrentViews: true,
-        showStartLogo: false
-      });
-      view.el.classList.add("wall-view", "agent-view");
-      agent.view = view;
-      view.addEventListener("status", (ev) => {
-        if (!(ev instanceof CustomEvent) || agent.logElement === void 0) return;
-        writeLog(agent.logElement, `rtc: ${String(ev.detail)}`);
-      });
-      view.addEventListener("error", (ev) => {
-        const message = ev instanceof CustomEvent ? errorToMessage(ev.detail) : "view error";
-        setAgentStatus(agent, "error");
-        if (agent.logElement !== void 0) writeLog(agent.logElement, `rtc error: ${message}`);
-      });
-      view.addEventListener("ready", (ev) => {
-        const webView = ev.currentTarget;
-        if (!(webView instanceof ZooWebView)) return;
-        if (agent.logElement !== void 0) writeLog(agent.logElement, "modeling websocket: connected", "in");
-        if (agent.logElement !== void 0) writeLog(agent.logElement, `loaded ${agent.filePath}`, "in");
-        void submitAgentProject(agent, () => {
-          startCameraInspection(agent);
-        });
-      });
-      viewerSlot.appendChild(view.el);
       agent.element = panel;
     };
+    const viewerPlaceholderText = (agent) => {
+      if (agent.status === "running" || agent.status === "reviewing") return "Awaiting Zookeeper result";
+      if (agent.status === "complete") return agent.snapshotUrl === void 0 ? "KCL complete - snapshot pending" : "Zookeeper result ready";
+      if (agent.status === "error") return "Zookeeper error";
+      return "Awaiting Zookeeper assignment";
+    };
+    const updateViewerPlaceholderText = (agent) => {
+      if (agent.viewPlaceholder === void 0) return;
+      if (agent.viewerSlot?.classList.contains("agent-viewer-queued")) return;
+      agent.viewPlaceholder.textContent = viewerPlaceholderText(agent);
+    };
     const setAgentStatus = (agent, status) => {
+      const previousStatus = agent.status;
+      agent.lastActivityAtMs = Date.now();
+      const isTimedStatus = (value) => value === "running" || value === "reviewing";
+      if (previousStatus !== status) {
+        const now = Date.now();
+        if (isTimedStatus(previousStatus) && agent.activeStartedAtMs !== void 0) {
+          agent.elapsedMs = (agent.elapsedMs ?? 0) + Math.max(0, now - agent.activeStartedAtMs);
+          agent.activeStartedAtMs = void 0;
+        }
+        if (isTimedStatus(status)) {
+          agent.activeStartedAtMs = now;
+        }
+      }
       agent.status = status;
       if (agent.statusElement !== void 0) {
         agent.statusElement.textContent = status;
         agent.statusElement.dataset.status = status;
       }
+      agent.element?.setAttribute("data-status", status);
+      updateViewerPlaceholderText(agent);
+      updateAggregateTime();
       renderAllGraphs();
+      broadcastWall({ type: "agent:status", agentId: agent.id, status });
     };
     const appendAgentLog = (agent, line, direction = "sys") => {
-      if (agent.logElement === void 0) return;
-      writeLog(agent.logElement, line, direction);
+      agent.lastActivityAtMs = Date.now();
+      if (agent.logElement !== void 0) writeLog(agent.logElement, line, direction);
+      broadcastWall({ type: "agent:log", agentId: agent.id, line, direction });
     };
     const startAgentView = (agent) => {
+      if (agent.viewStarted) return;
+      agent.viewStarted = true;
       agent.view?.start();
     };
     const startCameraInspection = (agent) => {
-      const webView = agent.view;
-      if (webView === void 0) return;
-      const agentIndex = Array.from(agents.keys()).indexOf(agent.id);
-      let step = 0;
-      const intervalMs = 1100 + agentIndex % 8 * 110;
-      const tick = () => {
-        sendInspectionCameraCommand(webView, Math.max(0, agentIndex), step);
-        step += 1;
-      };
-      const delay = window.setTimeout(() => {
-        cameraTimers.delete(delay);
-        tick();
-        const interval = window.setInterval(tick, intervalMs);
-        cameraTimers.add(interval);
-      }, 250 + agentIndex % 10 * 60);
-      cameraTimers.add(delay);
+      void agent;
+    };
+    const remainingWallAgentSlots = () => Math.max(0, maxWallAgents - agents.size);
+    const logWallAgentCap = () => {
+      if (capacityWarningRun === runId) return;
+      capacityWarningRun = runId;
+      rootLogLine(`< wall hard cap reached: ${maxWallAgents} total agents; further BOM children will not be created`, "in");
     };
     const addAgent = (agent) => {
+      if (agents.has(agent.id)) return true;
+      if (agents.size >= maxWallAgents) {
+        logWallAgentCap();
+        return false;
+      }
       createAgentPanel(agent);
       agents.set(agent.id, agent);
       layoutAgents();
       renderAllGraphs();
+      broadcastWall({
+        type: "agent:add",
+        agent: {
+          id: agent.id,
+          parentId: agent.parentId,
+          kind: agent.kind,
+          scope: agent.scope,
+          name: agent.name,
+          role: agent.role,
+          instruction: agent.instruction,
+          filePath: agent.filePath,
+          imports: agent.imports ?? [],
+          source: agent.source,
+          color: agent.color,
+          status: agent.status
+        }
+      });
       rootLogLine(`< zookeeper.spawn ${agent.name}`, "in");
       appendAgentLog(agent, `assigned parent: ${graphNode(agent.parentId)?.name ?? "unknown"}`);
+      appendAgentLog(agent, `scope: ${agent.scope ?? (agent.kind === "orchestrator" ? "assembly" : "part")}`);
       appendAgentLog(agent, `role: ${agent.role}`);
       appendAgentLog(agent, `instruction: ${agent.instruction}`);
       appendAgentLog(agent, `file: ${agent.filePath}`);
+      if ((agent.imports ?? []).length > 0) appendAgentLog(agent, `imports: ${(agent.imports ?? []).map(renderPathForFilePath).join(", ")}`);
       setAgentStatus(agent, "starting");
-      startAgentView(agent);
+      return true;
+    };
+    const updateAgent = (agent, update) => {
+      if (update.parentId !== void 0) agent.parentId = update.parentId;
+      if (update.imports !== void 0) agent.imports = [...new Set(update.imports)];
+      if (update.instruction !== void 0) agent.instruction = update.instruction;
+      if (update.role !== void 0) {
+        agent.role = update.role;
+        agent.element?.querySelector(".agent-role")?.replaceChildren(document.createTextNode(agent.role));
+      }
+      layoutAgents();
+      renderAllGraphs();
+      broadcastWall({
+        type: "agent:update",
+        agentId: agent.id,
+        parentId: update.parentId,
+        imports: update.imports,
+        instruction: update.instruction,
+        role: update.role
+      });
+    };
+    const updateProjectFile = (filePath, kcl) => {
+      kclFiles.set(filePath, kcl);
+      broadcastWall({ type: "project:file", filePath, kcl });
+    };
+    const syncReusableLibraryMetadata = (library) => {
+      const sharedChildren = graphChildren(library.id);
+      const lines = [
+        "// ZOOKEEPER_BOM_LIBRARY",
+        "// Metadata-only shared component registry for the wall run.",
+        "// This file is not imported into renderable assemblies.",
+        ...sharedChildren.flatMap((child) => [
+          `// component: ${child.role}`,
+          `// file: ${child.filePath}`,
+          `// status: ${child.status}`,
+          ...interfaceManifests.has(child.filePath) ? interfaceManifests.get(child.filePath).split("\n").slice(0, 12).map((line) => `//   ${line}`) : []
+        ]),
+        "// /ZOOKEEPER_BOM_LIBRARY",
+        ""
+      ];
+      updateProjectFile(library.filePath, lines.join("\n"));
+    };
+    const assemblyChildFiles = (agent) => graphChildren(agent.id).filter((child) => !isReusableLibraryAgent(child)).filter(placementComponentReady).map((child) => child.filePath);
+    const hasVisibleChildPlacement = (body, filePath) => {
+      const alias = escapeRegExp(aliasForFilePath(filePath));
+      const code = body.split("\n").filter((line) => !line.trim().startsWith("//")).join("\n");
+      return new RegExp(
+        `\\bclone\\s*\\(\\s*${alias}\\s*\\)|\\b${alias}\\b\\s*\\|>|=\\s*${alias}\\b`
+      ).test(code);
+    };
+    const directChildComposition = (filePaths, body) => {
+      const missingFiles = [...new Set(filePaths)].filter((filePath) => !hasVisibleChildPlacement(body, filePath));
+      if (missingFiles.length === 0) return "";
+      const clonedChildren = missingFiles.map((filePath) => `  clone(${aliasForFilePath(filePath)}),`).join("\n");
+      return [
+        directAssemblyBlockStart,
+        "// Temporary identity composition for ready direct children.",
+        "// The parent Zookeeper placement pass replaces each entry with its own transform.",
+        "wallDirectChildren = [",
+        clonedChildren,
+        "]",
+        "wallDirectChildren",
+        directAssemblyBlockEnd
+      ].join("\n");
+    };
+    const assemblyFileWithCurrentChildren = (currentFile, directChildFiles, additionalImports = []) => {
+      const body = stripDirectAssemblyBlock(stripImportLines(currentFile)).trim();
+      const importFiles = [.../* @__PURE__ */ new Set([...directChildFiles, ...additionalImports])];
+      const composition = directChildComposition(directChildFiles, body);
+      return [
+        mainFileFor(importFiles).trimEnd(),
+        body,
+        composition
+      ].filter(Boolean).join("\n\n").concat("\n");
+    };
+    const syncAssemblyFileImports = (agent) => {
+      if (isReusableLibraryAgent(agent)) {
+        syncReusableLibraryMetadata(agent);
+        return;
+      }
+      const filePath = agent.id === rootAgentId ? rootFilePath : agent.filePath;
+      const childFiles = assemblyChildFiles(agent);
+      updateProjectFile(filePath, assemblyFileWithCurrentChildren(
+        kclFiles.get(filePath) ?? "",
+        childFiles,
+        agent.imports ?? []
+      ));
+    };
+    const syncRootFileImports = () => {
+      const topLevelFiles = assemblyChildFiles(graphNode(rootAgentId));
+      updateProjectFile(rootFilePath, assemblyFileWithCurrentChildren(
+        kclFiles.get(rootFilePath) ?? "",
+        topLevelFiles,
+        Array.from(rootImports)
+      ));
+    };
+    const nextAgentSequence = (kind) => {
+      const prefix = kind === "orchestrator" ? "sub-orchestrator-" : "worker-";
+      const maxSequence = Array.from(agents.values()).reduce((max, agent) => {
+        if (!agent.id.startsWith(prefix)) return max;
+        return Math.max(max, Number(sequenceFromId(agent.id) ?? 0));
+      }, 0);
+      return maxSequence + 1;
+    };
+    const findReusableLibraryAgent = () => Array.from(agents.values()).find((agent) => isReusableLibraryAgent(agent));
+    const ensureReusableLibraryAgent = () => {
+      const existing = findReusableLibraryAgent();
+      if (existing !== void 0) return existing;
+      if (remainingWallAgentSlots() < 1) {
+        logWallAgentCap();
+        return void 0;
+      }
+      const sequence = nextAgentSequence("orchestrator");
+      const id = `sub-orchestrator-${String(sequence).padStart(4, "0")}`;
+      const agent = {
+        id,
+        parentId: rootAgentId,
+        kind: "orchestrator",
+        scope: "assembly",
+        name: `Zookeeper Sub-Orchestrator ${String(sequence).padStart(4, "0")}`,
+        role: "reusable component library",
+        instruction: "Own canonical shared component files for BOM reuse. Do not create assembly placement; child workers generate one reusable component each.",
+        color: agentColors[agents.size % agentColors.length],
+        status: "queued",
+        filePath: `generated/reusable-component-library-${String(sequence).padStart(4, "0")}.kcl`,
+        imports: [],
+        source: activeSource
+      };
+      plannedAgentCount += 1;
+      updateProjectFile(agent.filePath, "");
+      if (!addAgent(agent)) return void 0;
+      syncReusableLibraryMetadata(agent);
+      setAgentStatus(agent, "complete");
+      syncRootFileImports();
+      rootLogLine("< BOM graph update: added metadata-only reusable component library", "in");
+      return agent;
+    };
+    const findSharedAgentFor = (component) => {
+      const normalized = component.toLowerCase();
+      return Array.from(agents.values()).find((agent) => agent.scope === "shared_part" && (agent.role.toLowerCase() === normalized || agent.filePath.toLowerCase().includes(slugLabel(component)) || normalized.includes(agent.role.toLowerCase()) || agent.role.toLowerCase().includes(normalized)));
+    };
+    const createSharedComponentAgent = (request, currentRun) => {
+      const existing = findSharedAgentFor(request.role);
+      if (existing !== void 0) return existing;
+      const library = findReusableLibraryAgent();
+      const requiredSlots = library === void 0 ? 2 : 1;
+      if (remainingWallAgentSlots() < requiredSlots) {
+        logWallAgentCap();
+        return void 0;
+      }
+      const ensuredLibrary = library ?? ensureReusableLibraryAgent();
+      if (ensuredLibrary === void 0) return void 0;
+      const sequence = nextAgentSequence("worker");
+      const padded = String(sequence).padStart(4, "0");
+      const role = request.role.trim() || "shared component";
+      const agent = {
+        id: `worker-${padded}`,
+        parentId: ensuredLibrary.id,
+        kind: "worker",
+        scope: "shared_part",
+        name: `Zookeeper Worker ${padded}`,
+        role,
+        instruction: [
+          request.instruction || `Generate one canonical reusable ${role}.`,
+          "This is a BOM/shared-library component. Model exactly one reusable instance, not a set or repeated pattern.",
+          "Expose mate points, local axes, symmetry plane/axis, and reuse guidance so orchestrators can clone, mirror, and pattern it.",
+          request.reason ? `Reason: ${request.reason}` : ""
+        ].filter(Boolean).join(" "),
+        color: agentColors[agents.size % agentColors.length],
+        status: "queued",
+        filePath: `generated/library/${slugLabel(role)}-${padded}.kcl`,
+        imports: [],
+        source: activeSource
+      };
+      plannedAgentCount += 1;
+      updateProjectFile(agent.filePath, "");
+      if (!addAgent(agent)) return void 0;
+      syncReusableLibraryMetadata(ensuredLibrary);
+      syncRootFileImports();
+      rootLogLine(`< BOM graph update: added shared component ${role}`, "in");
+      after(650, () => {
+        if (!agentStillActive(agent, currentRun)) return;
+        void requestAgentWork(agent, currentRun);
+      });
+      return agent;
+    };
+    const findConsumerAgent = (text, fallback) => {
+      const candidates = Array.from(agents.values()).filter((agent) => agent.kind === "orchestrator" && agent.scope !== "shared_part" && !/\b(reusable|shared|library|catalog|standard)\b/i.test(agent.role));
+      const ranked = rankAgentTarget(candidates, {
+        target: text,
+        instruction: text,
+        reason: text
+      });
+      return ranked !== void 0 && ranked.score > 0 ? ranked.candidate : fallback;
+    };
+    const addImportToConsumer = (consumer, shared, reason = "") => {
+      if (consumer.kind !== "orchestrator") return;
+      if (consumer.id === rootAgentId) {
+        if (rootImports.has(shared.filePath)) return;
+        rootImports.add(shared.filePath);
+        syncRootFileImports();
+        scheduleRootProjectSubmit();
+        rootLogLine(`< BOM graph update: root imports ${shared.role}${reason ? ` (${reason})` : ""}`, "in");
+        return;
+      }
+      const imports = [.../* @__PURE__ */ new Set([...consumer.imports ?? [], shared.filePath])];
+      if ((consumer.imports ?? []).includes(shared.filePath)) return;
+      updateAgent(consumer, { imports });
+      syncAssemblyFileImports(consumer);
+      appendAgentLog(consumer, `< BOM import added: ${shared.role}${reason ? ` (${reason})` : ""}`, "in");
+      rootLogLine(`< BOM graph update: ${consumer.role} imports ${shared.role}`, "in");
+      void submitAgentProject(consumer);
+      if (placementReady(consumer)) {
+        scheduleOrchestratorPlacement(consumer, shared, reason);
+        scheduleOrchestratorReview(consumer, shared);
+      }
+      scheduleRootProjectSubmit();
+    };
+    const applyBomReview = (parent, bom, currentRun) => {
+      if (bom === void 0) return 0;
+      let applied = 0;
+      (bom.sharedComponents ?? []).forEach((request) => {
+        const role = request.role.trim();
+        if (role.length === 0) return;
+        const sharedAgent = createSharedComponentAgent({ ...request, role }, currentRun);
+        if (sharedAgent === void 0) {
+          reviewLogLine(parent, `< BOM review deferred shared ${role}: wall agent cap reached`, "in");
+          return;
+        }
+        const consumers = (request.consumers ?? []).length > 0 ? request.consumers : [parent.role];
+        consumers.forEach((consumerText) => {
+          const consumer = findConsumerAgent(consumerText, parent);
+          addImportToConsumer(consumer, sharedAgent, request.reason);
+        });
+        reviewLogLine(parent, `< BOM review: shared ${role}${request.reason ? ` (${request.reason})` : ""}`, "in");
+        applied += 1;
+      });
+      (bom.importUpdates ?? []).forEach((request) => {
+        const component = request.component.trim();
+        const consumerText = request.consumer.trim();
+        if (component.length === 0 || consumerText.length === 0) return;
+        const sharedAgent = findSharedAgentFor(component) ?? createSharedComponentAgent({
+          role: component,
+          reason: request.reason,
+          instruction: `Generate one canonical reusable ${component}. Model exactly one instance for BOM reuse.`,
+          consumers: [consumerText]
+        }, currentRun);
+        if (sharedAgent === void 0) {
+          reviewLogLine(parent, `< BOM review deferred import ${component}: wall agent cap reached`, "in");
+          return;
+        }
+        const consumer = findConsumerAgent(consumerText, parent);
+        addImportToConsumer(consumer, sharedAgent, request.reason);
+        reviewLogLine(parent, `< BOM review: ${consumer.role} should import ${sharedAgent.role}${request.reason ? ` (${request.reason})` : ""}`, "in");
+        applied += 1;
+      });
+      if (applied > 0) {
+        layoutAgents();
+        renderAllGraphs();
+        syncRootFileImports();
+      }
+      return applied;
+    };
+    const resolveBomImport = (reference, spawned) => {
+      const normalized = reference.trim().toLowerCase();
+      if (normalized.length === 0) return void 0;
+      const local = spawned.get(normalized);
+      if (local !== void 0) return local;
+      return Array.from(agents.values()).find((candidate) => candidate.id.toLowerCase() === normalized || candidate.role.toLowerCase() === normalized || candidate.filePath.toLowerCase() === normalized || renderPathForFilePath(candidate.filePath).toLowerCase() === normalized || slugLabel(candidate.role) === slugLabel(reference));
+    };
+    const createSubassemblyBomChild = (parent, seed, currentRun) => {
+      if (seed.scope === "shared_part") {
+        return createSharedComponentAgent({
+          role: seed.role,
+          reason: `Required by ${parent.role}'s direct BOM.`,
+          instruction: seed.instruction,
+          consumers: [parent.role]
+        }, currentRun);
+      }
+      if (remainingWallAgentSlots() < 1) {
+        logWallAgentCap();
+        return void 0;
+      }
+      const sequence = nextAgentSequence(seed.kind);
+      const padded = String(sequence).padStart(4, "0");
+      const id = `${seed.kind === "orchestrator" ? "sub-orchestrator" : "worker"}-${padded}`;
+      const agent = {
+        id,
+        parentId: parent.id,
+        kind: seed.kind,
+        scope: seed.scope,
+        name: `Zookeeper ${seed.kind === "orchestrator" ? "Sub-Orchestrator" : "Worker"} ${padded}`,
+        role: seed.role,
+        instruction: seed.instruction,
+        color: agentColors[agents.size % agentColors.length],
+        status: "queued",
+        filePath: `generated/${slugLabel(seed.role)}-${padded}.kcl`,
+        imports: [],
+        source: activeSource
+      };
+      plannedAgentCount += 1;
+      updateProjectFile(agent.filePath, "");
+      return addAgent(agent) ? agent : void 0;
+    };
+    const startSubassemblyBomChild = (agent, currentRun) => {
+      if (!agentStillActive(agent, currentRun) || agent.status === "error") return;
+      if (isReusableLibraryAgent(agent)) {
+        syncReusableLibraryMetadata(agent);
+        setWorkAgentStatus(agent, "complete");
+        return;
+      }
+      if (agent.scope === "shared_part") {
+        appendWorkAgentLog(agent, "< shared BOM worker queued for its canonical KCL run", "in");
+        return;
+      }
+      if (agent.kind === "orchestrator") {
+        setWorkAgentStatus(agent, "reviewing");
+        appendWorkAgentLog(agent, "-> plan direct sub-assembly BOM", "out");
+        void requestSubassemblyBom(agent, currentRun);
+        return;
+      }
+      setWorkAgentStatus(agent, "running");
+      appendWorkAgentLog(agent, "-> generate KCL candidate", "out");
+      void requestAgentWork(agent, currentRun);
+    };
+    const requestSubassemblyBom = async (agent, currentRun) => {
+      if (!agentStillActive(agent, currentRun) || agent.kind !== "orchestrator" || isReusableLibraryAgent(agent)) return;
+      if (bomPlanningAgentIds.has(agent.id)) return;
+      if (remainingWallAgentSlots() <= 0) {
+        logWallAgentCap();
+        appendWorkAgentLog(agent, "< direct BOM planning skipped: wall agent capacity reached", "in");
+        setWorkAgentStatus(agent, "complete");
+        return;
+      }
+      if (graphChildren(agent.id).some((child) => !isReusableLibraryAgent(child))) {
+        appendWorkAgentLog(agent, "< direct BOM already supplied; awaiting child KCL updates", "in");
+        return;
+      }
+      bomPlanningAgentIds.add(agent.id);
+      setWorkAgentStatus(agent, "running");
+      appendWorkAgentLog(agent, "-> hosted Zookeeper: plan direct BOM", "out");
+      try {
+        const update = await requestAgentWorkStream(agent, currentRun, {
+          sessionId: activeSessionId,
+          prompt: promptInput.value.trim() || defaultPrompt,
+          rootInstruction,
+          agent: {
+            id: agent.id,
+            parentId: agent.parentId,
+            kind: agent.kind,
+            scope: agent.scope,
+            name: agent.name,
+            role: agent.role,
+            instruction: agent.instruction,
+            filePath: agent.filePath,
+            imports: agent.imports ?? []
+          },
+          files: objectFromMap(kclFiles),
+          remainingAgentSlots: remainingWallAgentSlots(),
+          wallMaxAgents: maxWallAgents,
+          knownAgents: Array.from(agents.values()).map((candidate) => ({
+            id: candidate.id,
+            key: candidate.id,
+            name: candidate.name,
+            role: candidate.role,
+            scope: candidate.scope,
+            filePath: candidate.filePath
+          }))
+        }, "/api/zookeeper/bom-start");
+        if (!agentStillActive(agent, currentRun)) return;
+        if (!("children" in update)) throw new Error("Sub-assembly planner returned KCL instead of a direct BOM");
+        appendWorkAgentLog(agent, `< ${update.source} direct BOM: ${update.summary}`, "in");
+        const spawned = /* @__PURE__ */ new Map();
+        update.children.forEach((childSeed) => {
+          const child = createSubassemblyBomChild(agent, childSeed, currentRun);
+          if (child !== void 0) spawned.set(childSeed.key.trim().toLowerCase(), child);
+        });
+        update.children.forEach((childSeed) => {
+          ;
+          (childSeed.imports ?? []).forEach((reference) => {
+            const imported = resolveBomImport(reference, spawned);
+            if (imported === void 0 || imported.parentId === agent.id) return;
+            addImportToConsumer(agent, imported, `direct BOM reference: ${reference}`);
+          });
+        });
+        syncAssemblyFileImports(agent);
+        const skipped = update.children.length - spawned.size;
+        appendWorkAgentLog(agent, `< direct BOM accepted: ${spawned.size} child agent${spawned.size === 1 ? "" : "s"}; dispatching concurrently${skipped > 0 ? `; ${skipped} omitted at wall capacity` : ""}`, "in");
+        setWorkAgentStatus(agent, "reviewing");
+        Array.from(spawned.values()).forEach((child) => startSubassemblyBomChild(child, currentRun));
+      } catch (error) {
+        if (!agentStillActive(agent, currentRun)) return;
+        appendWorkAgentLog(agent, `< direct BOM planning failed: ${errorToMessage(error)}`);
+        setWorkAgentStatus(agent, "error");
+        markAgentFailedAndRefreshAncestors(agent, currentRun, errorToMessage(error));
+      } finally {
+        bomPlanningAgentIds.delete(agent.id);
+      }
+    };
+    const wakeFailedAgent = (agent, currentRun) => {
+      const now = Date.now();
+      const recoveries = agent.supervisorRecoveryCount ?? 0;
+      const lastRecovery = agent.lastSupervisorRecoveryAtMs ?? 0;
+      if (recoveries >= maxSupervisorRecoveryAttempts) return false;
+      if (now - lastRecovery < supervisorRecoveryCooldownMs) return false;
+      agent.supervisorRecoveryCount = recoveries + 1;
+      agent.lastSupervisorRecoveryAtMs = now;
+      const reason = `Root supervisor recovery ${agent.supervisorRecoveryCount}/${maxSupervisorRecoveryAttempts}`;
+      rootLogLine(`< supervisor waking ${agent.name}: ${reason}`, "in");
+      appendWorkAgentLog(agent, `< ${reason}; retaining current KCL and interface context`, "in");
+      if (agent.kind === "orchestrator" && !graphChildren(agent.id).some((child) => !isReusableLibraryAgent(child))) {
+        setWorkAgentStatus(agent, "reviewing");
+        void requestSubassemblyBom(agent, currentRun);
+        return true;
+      }
+      setWorkAgentStatus(agent, "reviewing");
+      void requestAgentWork(
+        agent,
+        currentRun,
+        "",
+        0,
+        "Root supervisor: resume this child using the current KCL, interfaces, and direct imports. Repair the failed operation and return a renderable result for the parent assembly."
+      );
+      return true;
+    };
+    const runRootSupervisorSweep = () => {
+      if (!isControllerWindow || !active) return;
+      const currentRun = runId;
+      const now = Date.now();
+      const statusCounts = /* @__PURE__ */ new Map();
+      let reviewScheduled = false;
+      for (const agent of agents.values()) {
+        statusCounts.set(agent.status, (statusCounts.get(agent.status) ?? 0) + 1);
+        if (!agentStillActive(agent, currentRun) || isReusableLibraryAgent(agent)) continue;
+        if (agent.status === "error") {
+          wakeFailedAgent(agent, currentRun);
+          continue;
+        }
+        const activityAge = now - (agent.lastActivityAtMs ?? now);
+        if ((agent.status === "queued" || agent.status === "starting") && activityAge >= supervisorQueuedWakeMs) {
+          rootLogLine(`< supervisor dispatching stalled ${agent.name}`, "in");
+          appendWorkAgentLog(agent, "< root supervisor: dispatching stalled queued child", "in");
+          startSubassemblyBomChild(agent, currentRun);
+          continue;
+        }
+        if (reviewScheduled || agent.kind !== "orchestrator") continue;
+        const readyChild = placementComponentsFor(agent)[0];
+        const lastReview = supervisorReviewAtMs.get(agent.id) ?? 0;
+        if (readyChild === void 0 || now - lastReview < supervisorSummaryIntervalMs) continue;
+        supervisorReviewAtMs.set(agent.id, now);
+        reviewScheduled = true;
+        appendWorkAgentLog(agent, `< root supervisor: scheduled health review after ${readyChild.role}`, "in");
+        scheduleOrchestratorReview(agent, readyChild);
+      }
+      const rootAgent = graphNode(rootAgentId);
+      const readyRootChild = rootAgent === void 0 ? void 0 : placementComponentsFor(rootAgent)[0];
+      const lastRootReview = supervisorReviewAtMs.get(rootAgentId) ?? 0;
+      if (!reviewScheduled && rootAgent !== void 0 && readyRootChild !== void 0 && now - lastRootReview >= supervisorSummaryIntervalMs) {
+        supervisorReviewAtMs.set(rootAgentId, now);
+        reviewScheduled = true;
+        rootLogLine(`< supervisor: scheduled root health review after ${readyRootChild.role}`, "in");
+        scheduleOrchestratorReview(rootAgent, readyRootChild);
+      }
+      if (now - supervisorLastSummaryAtMs >= supervisorSummaryIntervalMs) {
+        supervisorLastSummaryAtMs = now;
+        const summary = ["running", "reviewing", "complete", "error", "queued", "starting"].map((status) => `${status}:${statusCounts.get(status) ?? 0}`).join(", ");
+        rootLogLine(`< supervisor sweep: ${agents.size}/${maxWallAgents} agents (${summary})`, "in");
+      }
+    };
+    const startRootSupervisor = () => {
+      if (!isControllerWindow || supervisorTimer !== void 0) return;
+      supervisorLastSummaryAtMs = 0;
+      runRootSupervisorSweep();
+      supervisorTimer = window.setInterval(runRootSupervisorSweep, supervisorSweepIntervalMs);
     };
     const clearTimers = () => {
       for (const timer of timers) window.clearTimeout(timer);
       timers.clear();
+      if (rootRenderTimer !== void 0) {
+        window.clearTimeout(rootRenderTimer);
+        rootRenderTimer = void 0;
+      }
+      if (graphRenderTimer !== void 0) {
+        window.clearTimeout(graphRenderTimer);
+        graphRenderTimer = void 0;
+      }
+      if (layoutTimer !== void 0) {
+        window.clearTimeout(layoutTimer);
+        layoutTimer = void 0;
+      }
+      if (aggregateTimeTimer !== void 0) {
+        window.clearInterval(aggregateTimeTimer);
+        aggregateTimeTimer = void 0;
+      }
+      if (supervisorTimer !== void 0) {
+        window.clearInterval(supervisorTimer);
+        supervisorTimer = void 0;
+      }
+      supervisorReviewAtMs.clear();
+      supervisorLastSummaryAtMs = 0;
       for (const timer of reviewTimers.values()) window.clearTimeout(timer);
       reviewTimers.clear();
       for (const timer of placementTimers.values()) window.clearTimeout(timer);
       placementTimers.clear();
+      snapshotJobs.clear();
+      if (centerViewerReloadTimer !== void 0) {
+        window.clearTimeout(centerViewerReloadTimer);
+        centerViewerReloadTimer = void 0;
+      }
+      draftRenderChains.clear();
+      bomPlanningAgentIds.clear();
+      workWaiters.forEach((waiter) => waiter.reject(new Error("run reset")));
+      workWaiters.clear();
+      workEventAbort?.abort();
+      workEventAbort = void 0;
+      workEventSessionId = "";
     };
     const clearCameraTimers = () => {
       for (const timer of cameraTimers) {
@@ -4210,11 +5688,13 @@ ${interfaces}` : "",
     const resetAgents = () => {
       clearCameraTimers();
       agents.forEach((agent) => {
+        clearAgentViewerTimers(agent);
         void agent.view?.deconstructor();
         agent.element?.remove();
       });
       agents.clear();
       plannedAgentCount = 0;
+      updateAggregateTime();
       layoutAgents();
       renderAllGraphs();
     };
@@ -4228,16 +5708,7 @@ ${interfaces}` : "",
     const startCenterView = () => {
       centerView.start();
     };
-    centerView.addEventListener("status", (ev) => {
-      if (!(ev instanceof CustomEvent)) return;
-      centerStatus.textContent = `Center view: ${String(ev.detail)}`;
-    });
-    centerView.addEventListener("ready", (ev) => {
-      const webView = ev.currentTarget;
-      if (!(webView instanceof ZooWebView)) return;
-      centerStatus.textContent = "Center assembly connected";
-      submitRootProject();
-    });
+    attachCenterViewHandlers(centerView);
     const demoAgents = () => {
       const topLevelRoles = [
         "combustion sub-assembly",
@@ -4338,7 +5809,7 @@ ${interfaces}` : "",
           source: "fallback"
         });
       });
-      return seeds.slice(0, mockAgentCount);
+      return seeds;
     };
     const fallbackOrchestration = (prompt) => {
       const seeds = demoAgents();
@@ -4364,25 +5835,142 @@ ${interfaces}` : "",
     };
     const requestOrchestration = async (prompt) => {
       try {
-        const response = await fetch("/api/orchestrate", {
+        const response = await fetch("/api/orchestrate-stream", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            prompt,
-            maxAgents: mockAgentCount
-          })
+          body: JSON.stringify({ prompt, maxAgents: maxWallAgents })
         });
         if (!response.ok) {
           throw new Error(`orchestrate ${response.status}`);
         }
-        return await response.json();
+        if (response.body === null) throw new Error("orchestrate stream has no body");
+        let plan;
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        const handleEvent = (event) => {
+          if (event.type === "final") {
+            plan = event.plan;
+            return;
+          }
+          if (event.type === "error") throw new Error(event.summary);
+          const prefix = event.type === "bom" ? "BOM architect" : "architect";
+          rootLogLine(`< ${prefix}: ${event.message}`, "in");
+          if (event.type === "started" || event.type === "status") {
+            centerStatus.textContent = `Architect: ${event.message}`;
+          }
+        };
+        for (; ; ) {
+          const { done, value } = await reader.read();
+          buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          lines.forEach((line) => {
+            if (line.trim().length === 0) return;
+            handleEvent(JSON.parse(line));
+          });
+          if (done) break;
+        }
+        if (buffer.trim().length > 0) handleEvent(JSON.parse(buffer));
+        if (plan === void 0) throw new Error("orchestrate stream ended without a plan");
+        return plan;
       } catch (error) {
         rootLogLine(`system: OpenAI orchestration unavailable; using fallback (${errorToMessage(error)})`);
         return fallbackOrchestration(prompt);
       }
     };
+    const parseAgentWorkStreamEvent = (line) => {
+      if (line.trim().length === 0) return void 0;
+      return JSON.parse(line);
+    };
+    const handleAgentWorkEvent = (event) => {
+      if (event === void 0 || event.type === "ping") return;
+      const workId = event.workId;
+      if (workId === void 0) return;
+      const waiter = workWaiters.get(workId);
+      if (waiter === void 0) return;
+      const { agent, currentRun } = waiter;
+      if (!agentStillActive(agent, currentRun)) {
+        workWaiters.delete(workId);
+        return;
+      }
+      if (event.type === "started") {
+        appendWorkAgentLog(agent, "< hosted Zookeeper run started", "in");
+        return;
+      }
+      if (event.type === "dialog") {
+        appendWorkAgentLog(agent, `< ws: ${event.line}`, "in");
+        return;
+      }
+      if (event.type === "draft") {
+        queueDraftRender(agent, currentRun, event.kcl, event.draftIndex);
+        return;
+      }
+      if (event.type === "final") {
+        workWaiters.delete(workId);
+        waiter.resolve(event.update);
+        return;
+      }
+      workWaiters.delete(workId);
+      waiter.reject(new Error(event.summary));
+    };
+    const ensureWorkEventStream = (sessionId) => {
+      if (workEventAbort !== void 0 && workEventSessionId === sessionId) return;
+      workEventAbort?.abort();
+      workEventAbort = new AbortController();
+      workEventSessionId = sessionId;
+      const signal = workEventAbort.signal;
+      const readEvents = async () => {
+        const response = await fetch(`/api/zookeeper/events?sessionId=${encodeURIComponent(sessionId)}`, { signal });
+        if (!response.ok || response.body === null) throw new Error(`event stream ${response.status}`);
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        for (; ; ) {
+          const { done, value } = await reader.read();
+          buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          lines.forEach((line) => handleAgentWorkEvent(parseAgentWorkStreamEvent(line)));
+          if (done) break;
+        }
+        handleAgentWorkEvent(parseAgentWorkStreamEvent(buffer));
+      };
+      void readEvents().catch((error) => {
+        if (signal.aborted) return;
+        rootLogLine(`system: zookeeper event stream failed (${errorToMessage(error)})`);
+        Array.from(workWaiters.entries()).forEach(([workId, waiter]) => {
+          workWaiters.delete(workId);
+          waiter.reject(new Error(errorToMessage(error)));
+        });
+      });
+    };
+    const requestAgentWorkStream = async (agent, currentRun, payload, endpoint = "/api/zookeeper/work-start") => {
+      ensureWorkEventStream(activeSessionId);
+      const workId = randomId();
+      const body = { ...payload, workId };
+      const finalUpdate = new Promise((resolve, reject) => {
+        workWaiters.set(workId, { agent, currentRun, resolve, reject });
+      });
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      if (!response.ok) {
+        workWaiters.delete(workId);
+        throw new Error(`agent work start ${response.status}`);
+      }
+      return finalUpdate;
+    };
     const requestAgentWork = async (agent, currentRun, renderError = "", repairAttempt = 0, reviewInstruction = "", zooRetryAttempt = 0) => {
       if (!agentStillActive(agent, currentRun)) return;
+      if (isReusableLibraryAgent(agent)) {
+        syncReusableLibraryMetadata(agent);
+        setWorkAgentStatus(agent, "complete");
+        appendWorkAgentLog(agent, "< BOM registry only; no Zookeeper placement run needed", "in");
+        return;
+      }
       setWorkAgentStatus(agent, "running");
       if (zooRetryAttempt > 0) {
         appendWorkAgentLog(agent, `-> hosted Zookeeper retry ${zooRetryAttempt}/${maxZooFallbackRetries}`, "out");
@@ -4394,33 +5982,30 @@ ${interfaces}` : "",
         appendWorkAgentLog(agent, `-> repair iteration ${repairAttempt}: ${renderError.slice(0, 180)}`, "out");
       }
       try {
-        const response = await fetch("/api/zookeeper/work", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            sessionId: activeSessionId,
-            prompt: promptInput.value.trim() || defaultPrompt,
-            agent: {
-              id: agent.id,
-              parentId: agent.parentId,
-              kind: agent.kind,
-              name: agent.name,
-              role: agent.role,
-              instruction: agent.instruction,
-              filePath: agent.filePath
-            },
-            rootInstruction,
-            files: objectFromMap(kclFiles),
-            interfaces: objectFromMap(interfaceManifests),
-            currentKcl: kclFiles.get(agent.filePath) ?? "",
-            renderError,
-            reviewInstruction,
-            attempt: repairAttempt
-          })
+        const update = await requestAgentWorkStream(agent, currentRun, {
+          sessionId: activeSessionId,
+          prompt: promptInput.value.trim() || defaultPrompt,
+          agent: {
+            id: agent.id,
+            parentId: agent.parentId,
+            kind: agent.kind,
+            scope: agent.scope,
+            name: agent.name,
+            role: agent.role,
+            instruction: agent.instruction,
+            filePath: agent.filePath,
+            imports: agent.imports ?? []
+          },
+          rootInstruction,
+          files: objectFromMap(kclFiles),
+          interfaces: objectFromMap(interfaceManifests),
+          currentKcl: kclFiles.get(agent.filePath) ?? "",
+          renderError,
+          reviewInstruction,
+          attempt: repairAttempt
         });
-        if (!response.ok) throw new Error(`agent work ${response.status}`);
-        const update = await response.json();
         if (!agentStillActive(agent, currentRun)) return;
+        if (!("kcl" in update)) throw new Error("Zookeeper worker stream returned a BOM instead of KCL");
         if (isRetryableZooFallback(update)) {
           update.dialog?.slice(-3).forEach((line) => appendWorkAgentLog(agent, `< ws: ${line}`, "in"));
           appendWorkAgentLog(agent, `< hosted Zookeeper failed: ${update.summary}`, "in");
@@ -4434,14 +6019,25 @@ ${interfaces}` : "",
           }
           appendWorkAgentLog(agent, `< fallback refused after ${maxZooFallbackRetries} retries; no KCL accepted`);
           setWorkAgentStatus(agent, "error");
+          markAgentFailedAndRefreshAncestors(agent, currentRun, update.summary);
           return;
         }
+        await (draftRenderChains.get(agent.id) ?? Promise.resolve()).catch(() => {
+        });
+        if (!agentStillActive(agent, currentRun)) return;
         kclFiles.set(agent.filePath, update.kcl);
         updateInterfaceManifest(agent, update.kcl);
-        if (update.dialog !== void 0 && update.dialog.length > 0) {
+        broadcastWall({
+          type: "agent:final",
+          agentId: agent.id,
+          kcl: update.kcl,
+          manifest: interfaceManifests.get(agent.filePath)
+        });
+        if (!update.streamed && update.dialog !== void 0 && update.dialog.length > 0) {
           update.dialog.slice(-3).forEach((line) => appendWorkAgentLog(agent, `< ws: ${line}`, "in"));
         }
-        appendWorkAgentLog(agent, `< ${update.source === "zookeeper" ? "Zookeeper auto KCL" : "fallback KCL"}: ${update.summary}`, "in");
+        const draftText = update.drafts === void 0 || update.drafts === 0 ? "" : ` after ${update.drafts} draft${update.drafts === 1 ? "" : "s"}`;
+        appendWorkAgentLog(agent, `< ${update.source === "zookeeper" ? "Zookeeper final KCL" : "fallback KCL"}${draftText}: ${update.summary}`, "in");
         appendWorkAgentLog(agent, `< wrote ${agent.filePath}${repairAttempt === 0 ? "" : ` (repair ${repairAttempt})`}`, "in");
         setWorkAgentStatus(agent, agent.kind === "orchestrator" ? "reviewing" : "complete");
         const renderResult = await submitWorkAgentProject(agent);
@@ -4458,6 +6054,7 @@ ${interfaces}` : "",
           } else {
             appendWorkAgentLog(agent, `< renderer rejected KCL after ${maxAgentRepairAttempts} repair attempts: ${message}`);
             setWorkAgentStatus(agent, "error");
+            markAgentFailedAndRefreshAncestors(agent, currentRun, message);
           }
           return;
         }
@@ -4472,6 +6069,7 @@ ${interfaces}` : "",
         if (!agentStillActive(agent, currentRun)) return;
         appendWorkAgentLog(agent, `< agent update failed: ${errorToMessage(error)}`);
         setWorkAgentStatus(agent, "error");
+        markAgentFailedAndRefreshAncestors(agent, currentRun, errorToMessage(error));
       }
     };
     const runZookeeper = async () => {
@@ -4480,15 +6078,22 @@ ${interfaces}` : "",
       active = true;
       runId += 1;
       const currentRun = runId;
+      rootElapsedMs = 0;
+      rootActiveStartedAtMs = Date.now();
       startButton.disabled = true;
-      startButton.textContent = "Planning...";
+      startButton.textContent = "Architecting BOM...";
       stopButton.disabled = false;
       clearTimers();
       resetAgents();
+      startAggregateTimeTicker();
       rootReviewRounds = 0;
+      centerViewerReloadAttempts = 0;
+      capacityWarningRun = -1;
       rootLog.replaceChildren();
+      broadcastWall({ type: "reset" });
       const prompt = promptInput.value.trim() || defaultPrompt;
       rootLogLine("system: zookeeper orchestration opened");
+      rootLogLine("architect: beginning assembly and bill-of-materials design feed");
       rootLogLine(`system: retrying transient hosted Zoo fallbacks up to ${maxZooFallbackRetries} times`);
       rootLogLine(`-> prompt "${prompt}"`, "out");
       const plan = await requestOrchestration(prompt);
@@ -4498,14 +6103,27 @@ ${interfaces}` : "",
       rootInstruction = plan.root.instruction;
       kclFiles = new Map(Object.entries(plan.files));
       interfaceManifests = /* @__PURE__ */ new Map();
-      rootLogLine(`< ${plan.source} plan accepted: ${plan.agents.length} sub-agents`, "in");
+      rootImports = /* @__PURE__ */ new Set();
+      const seeds = plan.agents.slice(0, maxWallAgents);
+      if (plan.agents.length > seeds.length) {
+        rootLogLine(`< plan capped from ${plan.agents.length} to ${seeds.length} total agents`, "in");
+      }
+      broadcastWall({
+        type: "plan",
+        sessionId: plan.sessionId,
+        source: plan.source,
+        rootInstruction,
+        plannedAgentCount: seeds.length,
+        files: plan.files
+      });
+      rootLogLine(`< ${plan.source} plan accepted: ${seeds.length} sub-agents (hard cap ${maxWallAgents})`, "in");
       plan.notes?.forEach((note) => rootLogLine(`system: ${note}`));
       renderAllGraphs();
       startCenterView();
+      startRootSupervisor();
       await wait(700);
       if (currentRun !== runId) return;
       startButton.textContent = "Spooling agents...";
-      const seeds = plan.agents.slice(0, mockAgentCount);
       plannedAgentCount = seeds.length;
       layoutAgents();
       seeds.forEach((agentSeed, index) => {
@@ -4518,7 +6136,10 @@ ${interfaces}` : "",
             status: "queued"
           };
           addAgent(agent);
-          if (agent.kind === "orchestrator") {
+          if (isReusableLibraryAgent(agent)) {
+            appendAgentLog(agent, "< BOM registry initialized; shared workers render individually", "in");
+            syncReusableLibraryMetadata(agent);
+          } else if (agent.kind === "orchestrator") {
             appendAgentLog(agent, "-> decompose sub-assembly", "out");
             appendAgentLog(agent, "< child scope accepted", "in");
           } else {
@@ -4528,20 +6149,35 @@ ${interfaces}` : "",
           after(900 + index * 35, () => {
             if (currentRun !== runId || !agents.has(agent.id)) return;
             if (agent.status === "error") return;
+            if (isReusableLibraryAgent(agent)) {
+              syncReusableLibraryMetadata(agent);
+              setAgentStatus(agent, "complete");
+              rootLogLine(`< BOM registry ready: ${agent.role}`, "in");
+              return;
+            }
             setAgentStatus(agent, agent.kind === "orchestrator" ? "reviewing" : "running");
             appendAgentLog(agent, "< empty workspace initialized", "in");
             rootLogLine(`< ${agent.name} workspace_ready`, "in");
           });
-          after(1900 + index * 90, () => {
-            if (currentRun !== runId || !agents.has(agent.id)) return;
-            if (agent.status === "error") return;
-            if (agent.kind === "orchestrator") {
-              appendAgentLog(agent, "< waiting for child KCL updates", "in");
-              setAgentStatus(agent, "reviewing");
-              return;
-            }
-            void requestAgentWork(agent, currentRun);
-          });
+        });
+      });
+      after(450 + seeds.length * 120 + 1350, () => {
+        if (currentRun !== runId) return;
+        const initialAgents = seeds.map((seed) => agents.get(seed.id)).filter((agent) => agent !== void 0);
+        rootLogLine(`< dispatching ${initialAgents.length} initial agents without waiting for unrelated sub-assemblies`, "in");
+        initialAgents.forEach((agent) => {
+          if (agent.status === "error") return;
+          if (isReusableLibraryAgent(agent)) {
+            syncReusableLibraryMetadata(agent);
+            setWorkAgentStatus(agent, "complete");
+            return;
+          }
+          if (agent.kind === "orchestrator" && graphChildren(agent.id).some((child) => !isReusableLibraryAgent(child))) {
+            appendWorkAgentLog(agent, "< direct BOM supplied by parent architect; awaiting child KCL updates", "in");
+            setWorkAgentStatus(agent, "reviewing");
+            return;
+          }
+          startSubassemblyBomChild(agent, currentRun);
         });
       });
       after(450 + seeds.length * 120 + 2600, () => {
@@ -4552,8 +6188,98 @@ ${interfaces}` : "",
         startInProgress = false;
       });
     };
+    const handleWallBroadcast = (message) => {
+      if (isControllerWindow) return;
+      if (message.type === "reset") {
+        runId += 1;
+        active = false;
+        startInProgress = false;
+        clearTimers();
+        resetAgents();
+        rootReviewRounds = 0;
+        activeSessionId = "";
+        kclFiles = /* @__PURE__ */ new Map();
+        interfaceManifests = /* @__PURE__ */ new Map();
+        rootImports = /* @__PURE__ */ new Set();
+        rootLog.replaceChildren();
+        renderAllGraphs();
+        return;
+      }
+      if (message.type === "plan") {
+        runId += 1;
+        active = true;
+        activeSessionId = message.sessionId;
+        activeSource = message.source;
+        rootInstruction = message.rootInstruction;
+        plannedAgentCount = message.plannedAgentCount;
+        kclFiles = new Map(Object.entries(message.files));
+        interfaceManifests = /* @__PURE__ */ new Map();
+        rootImports = /* @__PURE__ */ new Set();
+        layoutAgents();
+        renderAllGraphs();
+        return;
+      }
+      if (message.type === "root:log") {
+        rootLogLine(message.line, message.direction);
+        return;
+      }
+      if (message.type === "agent:add") {
+        if (agents.has(message.agent.id)) return;
+        addAgent({
+          ...message.agent,
+          color: message.agent.color,
+          status: message.agent.status
+        });
+        return;
+      }
+      if (message.type === "project:file") {
+        kclFiles.set(message.filePath, message.kcl);
+        return;
+      }
+      const agentId = "agentId" in message ? message.agentId : void 0;
+      const agent = agentId === void 0 ? void 0 : agents.get(agentId);
+      if (agent === void 0) return;
+      if (message.type === "agent:update") {
+        updateAgent(agent, {
+          parentId: message.parentId,
+          imports: message.imports,
+          instruction: message.instruction,
+          role: message.role
+        });
+        return;
+      }
+      if (message.type === "agent:status") {
+        setAgentStatus(agent, message.status);
+        return;
+      }
+      if (message.type === "agent:log") {
+        appendAgentLog(agent, message.line, message.direction);
+        return;
+      }
+      if (message.type === "agent:draft") {
+        queueDraftRender(agent, runId, message.kcl, message.draftIndex);
+        return;
+      }
+      if (message.type === "agent:final") {
+        kclFiles.set(agent.filePath, message.kcl);
+        if (message.manifest !== void 0) interfaceManifests.set(agent.filePath, message.manifest);
+        void submitAgentProject(agent);
+        return;
+      }
+      if (message.type === "agent:snapshot") {
+        setAgentSnapshot(agent, message.snapshotUrl);
+      }
+    };
+    wallChannel?.addEventListener("message", (event) => {
+      handleWallBroadcast(event.data);
+    });
     stopButton.addEventListener("click", () => {
+      if (!isControllerWindow) return;
       runId += 1;
+      if (rootActiveStartedAtMs !== void 0) {
+        rootElapsedMs += Math.max(0, Date.now() - rootActiveStartedAtMs);
+        rootActiveStartedAtMs = void 0;
+      }
       active = false;
       startInProgress = false;
       clearTimers();
@@ -4562,25 +6288,35 @@ ${interfaces}` : "",
       activeSessionId = "";
       kclFiles = /* @__PURE__ */ new Map();
       interfaceManifests = /* @__PURE__ */ new Map();
+      rootImports = /* @__PURE__ */ new Set();
+      centerViewerReloadAttempts = 0;
+      snapshotJobs.clear();
+      void disposeSnapshotView();
       void centerView.deconstructor();
       rootLogLine("system: zookeeper stopped");
+      broadcastWall({ type: "reset" });
       startButton.disabled = false;
       startButton.textContent = "Start Zookeeper";
       stopButton.disabled = true;
-      centerStatus.textContent = "Mock websocket ready";
+      centerStatus.textContent = "Zookeeper ready";
       renderAllGraphs();
     });
     startButton.addEventListener("click", () => {
+      if (!isControllerWindow) return;
       void runZookeeper();
     });
     stopButton.disabled = true;
     for (let index = 0; index < rows * cols; index += 1) {
       if (index === centerIndex) {
+        centerTile.dataset.wallTileIndex = String(index);
+        if (isWallTileMode && wallTileIndex === index) centerTile.classList.add("wall-tile-active");
         root.appendChild(centerTile);
         continue;
       }
       const tile = document.createElement("section");
       tile.classList.add("wall-tile", "agent-monitor-tile");
+      tile.dataset.wallTileIndex = String(index);
+      if (isWallTileMode && wallTileIndex === index) tile.classList.add("wall-tile-active");
       const monitor = document.createElement("div");
       monitor.classList.add("agent-monitor", "agent-monitor-empty");
       monitor.dataset.monitorIndex = String(index);
