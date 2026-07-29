@@ -2,6 +2,13 @@
 
 These instructions apply only to the Zoo Web View Wall multi-agent runs.
 
+- Read `docs/puget-wall-debugging.md` before diagnosing Puget connectivity,
+  monitor layout, renderer memory, blank snapshots, or `Visual Queued` states.
+  Check the Codex app's macOS Local Network permission when Puget unexpectedly
+  becomes unreachable. Use DevTools `Runtime.evaluate` for DOM state and direct
+  X11/PIL monitor captures for visuals; do not repeatedly use CDP
+  `Page.captureScreenshot` on the nine 4K pages because its capture surfaces can
+  distort Chrome GPU-memory diagnostics.
 - Do not model screw/fastener threads, helical thread geometry, or cosmetic
   thread grooves unless the user's wall-run prompt explicitly asks for threads.
   Use simplified cylindrical shafts, holes, and fastener bodies by default.
@@ -35,3 +42,8 @@ These instructions apply only to the Zoo Web View Wall multi-agent runs.
 - If a sub-assembly import evaluates to no return value or `none`, repair that
   sub-assembly file so it returns an aggregate. Do not work around it by adding
   grandchild imports to the parent assembly.
+- A wall run is complete only when every agent is complete, every parent
+  assembly composes all direct children, every renderable agent has a persisted
+  nonblank snapshot, the final root render succeeds, and all work/review/render
+  queues are empty. Once complete, keep the final static wall visible and stop
+  all WebRTC sessions, event streams, watchdogs, supervisors, and timers.

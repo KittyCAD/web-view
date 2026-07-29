@@ -179,6 +179,10 @@ export class ZooWebView extends EventTarget {
     zooWebRTC.addEventListener('track', onTrack, { once: true })
 
     const onConnected = (_event: Event) => {
+      if (this.state === ZooWebViewState.Killed) {
+        zooWebRTC.deconstructor()
+        return
+      }
       void this.elVideo.play().catch(console.warn)
 
       this.rtc = zooWebRTC
@@ -195,24 +199,44 @@ export class ZooWebView extends EventTarget {
       console.error('ZooWebView failed to start', error)
       this.dispatchEvent(new CustomEvent('status', { detail: 'start failed' }))
       this.dispatchEvent(new CustomEvent('error', { detail: error }))
+      if (this.rtc === zooWebRTC) void this.deconstructor()
     })
   }
   
   deconstructor() {
     this.state = ZooWebViewState.Killed
-    
+
+    const registeredViews = window.zoo?.kittycadWebViews
+    const registeredIndex = registeredViews?.indexOf(this) ?? -1
+    if (registeredViews !== undefined && registeredIndex >= 0) {
+      registeredViews.splice(registeredIndex, 1)
+    }
+
     // Never remove this event listener.
     // elStart.removeEventListener('click', elStartClick)
-    
+
     this.elVideo.pause()
-    
+    const videoStream = this.elVideo.srcObject
+    this.elVideo.srcObject = null
+    if (videoStream instanceof MediaStream) {
+      videoStream.getTracks().forEach(track => track.stop())
+    }
+
     ZooWebView.decoOff(this.size, this.el, this.elStart)
-    
-    return Promise.allSettled([
-      this.rtc?.deconstructor()
-    ]).finally(() => {
-      this.rtc = undefined
-    })
+
+    const activeRtc = this.rtc
+    this.rtc = undefined
+    const disposeRtc = async () => {
+      if (activeRtc === undefined) return
+      try {
+        activeRtc.removeMouseEvents()
+      } catch {}
+      try {
+        activeRtc.removeResizeObserver()
+      } catch {}
+      activeRtc.deconstructor()
+    }
+    return Promise.allSettled([disposeRtc()])
   }
 
   static decoOff(size: Size, elZooWebView: HTMLElement, elStart: HTMLElement) {

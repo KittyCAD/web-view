@@ -7,6 +7,7 @@ import mimetypes
 import os
 import queue
 import re
+import shutil
 import socket
 import ssl
 import struct
@@ -17,8 +18,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from collections import deque
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 PORT = int(os.environ.get("PORT", "3000"))
 PUBLIC_DIR = Path(os.environ.get("WALL_PUBLIC_DIR", Path.cwd() / "public")).resolve()
@@ -35,13 +37,66 @@ ROOT_FILE_PATH = "main.kcl"
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 EVENT_QUEUES = {}
 EVENT_QUEUES_LOCK = threading.Lock()
+EVENT_QUEUE_WARNED = set()
+SESSION_WORK = {}
+SESSION_WORK_LOCK = threading.Lock()
+SESSION_CONTEXT = threading.local()
 LOG_DIR = Path(os.environ.get("WALL_LOG_DIR", Path.cwd() / "logs")).resolve()
 EVENT_LOG_PATH = Path(os.environ.get("WALL_EVENT_LOG", LOG_DIR / "wall-events.jsonl")).resolve()
 TRACE_DIR = Path(os.environ.get("WALL_TRACE_DIR", LOG_DIR / "traces")).resolve()
 SNAPSHOT_DIR = Path(os.environ.get("WALL_SNAPSHOT_DIR", PUBLIC_DIR / "snapshots")).resolve()
+PROJECT_DIR = Path(os.environ.get("WALL_PROJECT_DIR", LOG_DIR / "projects")).resolve()
 MAX_SNAPSHOT_BYTES = int(os.environ.get("WALL_MAX_SNAPSHOT_BYTES", str(16 * 1024 * 1024)))
+SNAPSHOT_MAX_FILES = max(16, int(os.environ.get("WALL_SNAPSHOT_MAX_FILES", "256")))
+SNAPSHOT_MAX_TOTAL_BYTES = max(
+    MAX_SNAPSHOT_BYTES,
+    int(os.environ.get("WALL_SNAPSHOT_MAX_TOTAL_BYTES", str(512 * 1024 * 1024))),
+)
 WALL_MAX_AGENTS = max(1, int(os.environ.get("WALL_MAX_AGENTS", "48")))
+EVENT_QUEUE_MAX = max(64, int(os.environ.get("WALL_EVENT_QUEUE_MAX", "256")))
+EVENT_QUEUE_RESERVED_FINALS = min(EVENT_QUEUE_MAX // 2, WALL_MAX_AGENTS + 16)
+ZOOKEEPER_TEXT_BUFFER_MAX = max(100000, int(os.environ.get("WALL_ZOOKEEPER_TEXT_BUFFER_MAX", "1000000")))
+MAX_KCL_CHARS = max(100000, int(os.environ.get("WALL_MAX_KCL_CHARS", "1000000")))
+MAX_WEBSOCKET_MESSAGE_BYTES = max(
+    1024 * 1024,
+    int(os.environ.get("WALL_MAX_WEBSOCKET_MESSAGE_BYTES", str(16 * 1024 * 1024))),
+)
+ZOOKEEPER_REVIEW_TIMEOUT = max(60, int(os.environ.get("WALL_ZOOKEEPER_REVIEW_TIMEOUT", "600")))
+ZOOKEEPER_REVIEW_IDLE_TIMEOUT = max(30, int(os.environ.get("WALL_ZOOKEEPER_REVIEW_IDLE_TIMEOUT", "120")))
+REVIEW_CONCURRENCY = max(1, int(os.environ.get("WALL_REVIEW_CONCURRENCY", "2")))
+EVENT_LOG_MAX_BYTES = max(1024 * 1024, int(os.environ.get("WALL_EVENT_LOG_MAX_BYTES", str(32 * 1024 * 1024))))
+EVENT_LOG_BACKUPS = max(1, int(os.environ.get("WALL_EVENT_LOG_BACKUPS", "3")))
+TRACE_MAX_FILES = max(10, int(os.environ.get("WALL_TRACE_MAX_FILES", "200")))
+TRACE_MAX_TOTAL_BYTES = max(
+    16 * 1024 * 1024,
+    int(os.environ.get("WALL_TRACE_MAX_TOTAL_BYTES", str(256 * 1024 * 1024))),
+)
+PROJECT_MAX_FILES = max(1, int(os.environ.get("WALL_PROJECT_MAX_FILES", "24")))
+PROJECT_MAX_BYTES = max(
+    16 * 1024 * 1024,
+    int(os.environ.get("WALL_PROJECT_MAX_BYTES", str(128 * 1024 * 1024))),
+)
+PROJECT_MAX_TOTAL_BYTES = max(
+    PROJECT_MAX_BYTES,
+    int(os.environ.get("WALL_PROJECT_MAX_TOTAL_BYTES", str(2 * 1024 * 1024 * 1024))),
+)
+MAX_REQUEST_BYTES = max(
+    PROJECT_MAX_BYTES,
+    int(os.environ.get("WALL_MAX_REQUEST_BYTES", str(2 * PROJECT_MAX_BYTES))),
+)
 LOG_LOCK = threading.Lock()
+TRACE_LOCK = threading.Lock()
+PROJECT_LOCK = threading.Lock()
+SNAPSHOT_LOCK = threading.Lock()
+REVIEW_SEMAPHORE = threading.BoundedSemaphore(REVIEW_CONCURRENCY)
+
+
+class SessionCancelled(RuntimeError):
+    pass
+
+
+class RequestBodyTooLarge(RuntimeError):
+    pass
 
 COLORS = [
     "#00A3FF",
@@ -219,17 +274,72 @@ def log_event(kind, payload):
     try:
         EVENT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with LOG_LOCK:
+            if EVENT_LOG_PATH.exists() and EVENT_LOG_PATH.stat().st_size >= EVENT_LOG_MAX_BYTES:
+                oldest = Path(f"{EVENT_LOG_PATH}.{EVENT_LOG_BACKUPS}")
+                oldest.unlink(missing_ok=True)
+                for index in range(EVENT_LOG_BACKUPS - 1, 0, -1):
+                    source = Path(f"{EVENT_LOG_PATH}.{index}")
+                    if source.exists():
+                        os.replace(source, Path(f"{EVENT_LOG_PATH}.{index + 1}"))
+                os.replace(EVENT_LOG_PATH, Path(f"{EVENT_LOG_PATH}.1"))
             with EVENT_LOG_PATH.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, sort_keys=True) + "\n")
     except OSError:
         pass
 
 
+def log_runtime_event(body):
+    phase = sanitize_text(body.get("phase"), "unknown")[:32]
+    root_status = sanitize_text(body.get("rootStatus"), "unknown")[:32]
+    event = sanitize_text(body.get("event"), "phase")[:80]
+    blockers = sanitize_text(body.get("blockers"), "")[:2000]
+    numeric_fields = {}
+    for key in (
+        "agents",
+        "complete",
+        "error",
+        "activeWork",
+        "activeReviews",
+        "queuedReviews",
+        "snapshotJobs",
+        "persistenceJobs",
+    ):
+        try:
+            numeric_fields[key] = max(0, int(body.get(key) or 0))
+        except (TypeError, ValueError):
+            numeric_fields[key] = 0
+    log_event("wall.runtime", {
+        "event": event,
+        "phase": phase,
+        "rootStatus": root_status,
+        "blockers": blockers,
+        **numeric_fields,
+    })
+    return {"ok": True}
+
+
 def write_trace_file(prefix, payload):
     trace_id = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:10]}"
     path = TRACE_DIR / f"{prefix}-{trace_id}.json"
-    TRACE_DIR.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(clip_for_log(payload), indent=2, sort_keys=True), encoding="utf-8")
+    with TRACE_LOCK:
+        TRACE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(clip_for_log(payload), indent=2, sort_keys=True), encoding="utf-8")
+        traces = sorted(
+            TRACE_DIR.glob("*.json"),
+            key=lambda candidate: candidate.stat().st_mtime,
+            reverse=True,
+        )
+        retained_bytes = 0
+        for index, candidate in enumerate(traces):
+            candidate_bytes = candidate.stat().st_size
+            keep = (
+                index < TRACE_MAX_FILES and
+                (index == 0 or retained_bytes + candidate_bytes <= TRACE_MAX_TOTAL_BYTES)
+            )
+            if keep:
+                retained_bytes += candidate_bytes
+            else:
+                candidate.unlink(missing_ok=True)
     return str(path)
 
 
@@ -249,16 +359,40 @@ def persist_snapshot(body):
         raise RuntimeError(f"snapshot size must be between 1 and {MAX_SNAPSHOT_BYTES} bytes")
 
     filename = f"{slug(agent_id)}.webp"
-    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-    destination = (SNAPSHOT_DIR / filename).resolve()
+    snapshot_root = SNAPSHOT_DIR.resolve()
+    destination = (snapshot_root / filename).resolve()
     try:
-        destination.relative_to(SNAPSHOT_DIR)
+        destination.relative_to(snapshot_root)
     except ValueError as error:
         raise RuntimeError("invalid snapshot destination") from error
 
-    temporary = SNAPSHOT_DIR / f".{filename}.{uuid.uuid4().hex}.tmp"
-    temporary.write_bytes(image_bytes)
-    os.replace(temporary, destination)
+    with SNAPSHOT_LOCK:
+        snapshot_root.mkdir(parents=True, exist_ok=True)
+        temporary = snapshot_root / f".{filename}.{uuid.uuid4().hex}.tmp"
+        try:
+            temporary.write_bytes(image_bytes)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
+        snapshots = sorted(
+            snapshot_root.glob("*.webp"),
+            key=lambda candidate: (
+                candidate == destination,
+                candidate.stat().st_mtime_ns,
+            ),
+            reverse=True,
+        )
+        retained_bytes = 0
+        for index, candidate in enumerate(snapshots):
+            candidate_bytes = candidate.stat().st_size
+            keep = (
+                index < SNAPSHOT_MAX_FILES and
+                (index == 0 or retained_bytes + candidate_bytes <= SNAPSHOT_MAX_TOTAL_BYTES)
+            )
+            if keep:
+                retained_bytes += candidate_bytes
+            else:
+                candidate.unlink(missing_ok=True)
     revision = hashlib.sha1(image_bytes).hexdigest()[:12]
     log_event("snapshot.saved", {
         "agentId": agent_id,
@@ -267,6 +401,113 @@ def persist_snapshot(body):
         "revision": revision,
     })
     return {"url": f"/snapshots/{urllib.parse.quote(filename)}?v={revision}"}
+
+
+def directory_size(path):
+    return sum(
+        candidate.stat().st_size
+        for candidate in path.rglob("*")
+        if candidate.is_file()
+    )
+
+
+def prune_projects():
+    projects = sorted(
+        (
+            candidate
+            for candidate in PROJECT_DIR.iterdir()
+            if candidate.is_dir() and not candidate.name.startswith(".")
+        ),
+        key=lambda candidate: candidate.stat().st_mtime,
+        reverse=True,
+    )
+    retained_bytes = 0
+    for index, project in enumerate(projects):
+        project_bytes = directory_size(project)
+        keep = (
+            index < PROJECT_MAX_FILES and
+            (index == 0 or retained_bytes + project_bytes <= PROJECT_MAX_TOTAL_BYTES)
+        )
+        if keep:
+            retained_bytes += project_bytes
+        else:
+            shutil.rmtree(project, ignore_errors=True)
+
+
+def persist_project(body):
+    files = body.get("files") or {}
+    if not isinstance(files, dict) or not files:
+        raise RuntimeError("completed project requires at least one KCL file")
+    normalized_files = {}
+    total_bytes = 0
+    for raw_path, raw_contents in files.items():
+        file_path = PurePosixPath(str(raw_path or ""))
+        if (
+            file_path.is_absolute() or
+            not file_path.parts or
+            ".." in file_path.parts or
+            file_path.suffix.lower() != ".kcl"
+        ):
+            raise RuntimeError(f"invalid completed project path: {raw_path}")
+        contents = str(raw_contents or "")
+        contents_bytes = len(contents.encode("utf-8"))
+        if contents_bytes > MAX_KCL_CHARS:
+            raise RuntimeError(f"completed KCL file exceeds {MAX_KCL_CHARS} characters: {file_path}")
+        total_bytes += contents_bytes
+        normalized_files[str(file_path)] = contents
+    if total_bytes > PROJECT_MAX_BYTES:
+        raise RuntimeError(f"completed project exceeds {PROJECT_MAX_BYTES} bytes")
+
+    session_id = sanitize_text(body.get("sessionId"), str(uuid.uuid4()))
+    project_id = f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{slug(session_id)}"
+    temporary = PROJECT_DIR / f".{project_id}-{uuid.uuid4().hex[:8]}.tmp"
+    destination = PROJECT_DIR / project_id
+    metadata = {
+        "projectId": project_id,
+        "sessionId": session_id,
+        "savedAt": utc_timestamp(),
+        "prompt": str(body.get("prompt") or "")[:10000],
+        "rootFile": sanitize_text(body.get("rootFile"), ROOT_FILE_PATH),
+        "fileCount": len(normalized_files),
+        "fileBytes": total_bytes,
+        "interfaces": clip_for_log(body.get("interfaces") or {}, 10000),
+        "agents": clip_for_log(body.get("agents") or [], 10000),
+    }
+
+    with PROJECT_LOCK:
+        PROJECT_DIR.mkdir(parents=True, exist_ok=True)
+        temporary.mkdir(parents=True, exist_ok=False)
+        try:
+            for file_path, contents in normalized_files.items():
+                target = temporary.joinpath(*PurePosixPath(file_path).parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(contents, encoding="utf-8")
+            (temporary / "wall-project.json").write_text(
+                json.dumps(metadata, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            if destination.exists():
+                shutil.rmtree(destination)
+            os.replace(temporary, destination)
+            prune_projects()
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary, ignore_errors=True)
+
+    log_event("project.saved", {
+        "projectId": project_id,
+        "sessionId": session_id,
+        "path": str(destination),
+        "fileCount": len(normalized_files),
+        "fileBytes": total_bytes,
+    })
+    return {
+        "ok": True,
+        "projectId": project_id,
+        "path": str(destination),
+        "fileCount": len(normalized_files),
+        "fileBytes": total_bytes,
+    }
 
 
 def json_size(value):
@@ -918,6 +1159,10 @@ def websocket_recv_frame(sock):
         length = struct.unpack("!H", read_exact(sock, 2))[0]
     elif length == 127:
         length = struct.unpack("!Q", read_exact(sock, 8))[0]
+    if length > MAX_WEBSOCKET_MESSAGE_BYTES:
+        raise RuntimeError(
+            f"websocket frame exceeds {MAX_WEBSOCKET_MESSAGE_BYTES} bytes"
+        )
     mask = read_exact(sock, 4) if masked else b""
     payload = read_exact(sock, length) if length else b""
     if masked:
@@ -927,6 +1172,7 @@ def websocket_recv_frame(sock):
 
 def websocket_recv_text(sock):
     fragments = []
+    message_bytes = 0
     text_started = False
     while True:
         fin, opcode, payload = websocket_recv_frame(sock)
@@ -940,10 +1186,16 @@ def websocket_recv_text(sock):
         if opcode == 0x1:
             text_started = True
             fragments.append(payload)
+            message_bytes += len(payload)
         elif opcode == 0x0 and text_started:
             fragments.append(payload)
+            message_bytes += len(payload)
         else:
             continue
+        if message_bytes > MAX_WEBSOCKET_MESSAGE_BYTES:
+            raise RuntimeError(
+                f"websocket message exceeds {MAX_WEBSOCKET_MESSAGE_BYTES} bytes"
+            )
         if fin:
             return b"".join(fragments).decode("utf-8", errors="replace")
 
@@ -1063,18 +1315,21 @@ class DialogDeltaBuffer:
             return lines
 
         stripped = self.pending.strip()
-        if len(stripped) >= self.min_sentence_chars and re.search(r'[.!?]["\')\]]?\s*$', stripped):
+        if (
+            self.min_sentence_chars <= len(stripped) < self.max_chars and
+            re.search(r'[.!?]["\')\]]?\s*$', stripped)
+        ):
             lines.append(self.pending)
             self.pending = ""
             return lines
 
-        if len(stripped) >= self.max_chars:
+        while len(self.pending) >= self.max_chars:
             split_at = max(
-                self.pending.rfind(". "),
-                self.pending.rfind("! "),
-                self.pending.rfind("? "),
-                self.pending.rfind("; "),
-                self.pending.rfind(", "),
+                self.pending.rfind(". ", 0, self.max_chars),
+                self.pending.rfind("! ", 0, self.max_chars),
+                self.pending.rfind("? ", 0, self.max_chars),
+                self.pending.rfind("; ", 0, self.max_chars),
+                self.pending.rfind(", ", 0, self.max_chars),
             )
             if split_at < self.max_chars // 2:
                 split_at = self.pending.rfind(" ", 0, self.max_chars)
@@ -1114,36 +1369,125 @@ def is_error_frame(frame):
     return "error" in frame_type
 
 
+def session_cancelled():
+    cancel_event = getattr(SESSION_CONTEXT, "cancel_event", None)
+    return cancel_event is not None and cancel_event.is_set()
+
+
+def raise_if_session_cancelled():
+    if session_cancelled():
+        raise SessionCancelled("wall session cancelled")
+
+
+class BoundedTextBuffer:
+    def __init__(self, max_chars=ZOOKEEPER_TEXT_BUFFER_MAX):
+        self.max_chars = max_chars
+        self.parts = []
+        self.length = 0
+
+    def append(self, value):
+        if self.length >= self.max_chars:
+            return
+        text = str(value or "")[:self.max_chars - self.length]
+        if not text:
+            return
+        self.parts.append(text)
+        self.length += len(text)
+        if len(self.parts) >= 256:
+            self.parts = ["".join(self.parts)]
+
+    def clear(self):
+        self.parts.clear()
+        self.length = 0
+
+    def value(self):
+        if len(self.parts) > 1:
+            self.parts = ["".join(self.parts)]
+        return self.parts[0] if self.parts else ""
+
+
+def begin_session_work(session_id, work_id):
+    with SESSION_WORK_LOCK:
+        session = SESSION_WORK.setdefault(session_id, {
+            "cancelEvent": threading.Event(),
+            "workIds": set(),
+        })
+        if session["cancelEvent"].is_set():
+            raise SessionCancelled(f"wall session {session_id} is closed")
+        session["workIds"].add(work_id)
+        return session["cancelEvent"]
+
+
+def finish_session_work(session_id, work_id):
+    with SESSION_WORK_LOCK:
+        session = SESSION_WORK.get(session_id)
+        if session is None:
+            return
+        session["workIds"].discard(work_id)
+        if not session["workIds"]:
+            SESSION_WORK.pop(session_id, None)
+
+
+def close_session(body):
+    session_id = sanitize_text(body.get("sessionId"), "")
+    reason = sanitize_text(body.get("reason"), "client close")[:500]
+    if not session_id:
+        return {"ok": True, "sessionId": "", "cancelledWork": 0}
+    with SESSION_WORK_LOCK:
+        session = SESSION_WORK.pop(session_id, None)
+        active_work = len(session["workIds"]) if session is not None else 0
+        if session is not None:
+            session["cancelEvent"].set()
+    with EVENT_QUEUES_LOCK:
+        EVENT_QUEUES.pop(session_id, None)
+        EVENT_QUEUE_WARNED.discard(session_id)
+    log_event("session.closed", {
+        "sessionId": session_id,
+        "reason": reason,
+        "cancelledWork": active_work,
+    })
+    return {
+        "ok": True,
+        "sessionId": session_id,
+        "cancelledWork": active_work,
+    }
+
+
 def zookeeper_turn(
     user_message,
     current_files,
     project_name,
     timeout=300,
+    idle_timeout=None,
     stop_on_kcl=False,
     stop_when=None,
     on_kcl=None,
     on_dialog=None,
 ):
+    raise_if_session_cancelled()
     sock = websocket_connect(timeout=30)
     started = time.monotonic()
-    frames = []
+    frame_count = 0
     latest_kcl = None
     kcl_frames = 0
-    dialog = []
-    raw_dialog = []
-    raw_delta_text = []
-    raw_response_text = []
+    dialog = deque(maxlen=64)
+    response_buffer = BoundedTextBuffer()
     dialog_buffer = DialogDeltaBuffer()
     final_text = ""
+    last_frame_at = started
+    last_frame_type = "connect"
+    client_ping_count = 0
 
     def record_dialog_line(line):
         dialog_line = sanitize_dialog_text(line, line)
         if re.match(r'^\s*\{\s*"(?:assembly_title|summary)"\s*:', dialog_line):
             return
-        raw_dialog.append(dialog_line)
-        dialog.append(dialog_line)
-        if on_dialog:
-            on_dialog(dialog[-1])
+        chunks = range(0, len(dialog_line), 4000) if dialog_line else (0,)
+        for index in chunks:
+            chunk = dialog_line[index:index + 4000]
+            dialog.append(chunk)
+            if on_dialog:
+                on_dialog(chunk)
 
     def flush_dialog_buffer():
         for buffered_line in dialog_buffer.flush():
@@ -1153,6 +1497,7 @@ def zookeeper_turn(
         sock.settimeout(10)
         initial_deadline = time.monotonic() + 20
         while time.monotonic() < initial_deadline:
+            raise_if_session_cancelled()
             try:
                 raw = websocket_recv_text(sock)
             except socket.timeout:
@@ -1161,7 +1506,9 @@ def zookeeper_turn(
                 frame = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            frames.append(frame)
+            frame_count += 1
+            last_frame_at = time.monotonic()
+            last_frame_type = sanitize_text(frame.get("type") if isinstance(frame, dict) else "", "unknown")
             if isinstance(frame, dict) and "conversation_id" in frame:
                 break
         websocket_send_json(sock, {
@@ -1171,36 +1518,55 @@ def zookeeper_turn(
             "current_files": current_files,
             "project_name": project_name,
         })
-        sock.settimeout(45)
+        sock.settimeout(10)
         while time.monotonic() - started < timeout:
+            raise_if_session_cancelled()
             try:
                 raw = websocket_recv_text(sock)
             except socket.timeout:
+                raise_if_session_cancelled()
+                websocket_send_frame(sock, 0x9, b"wall-keepalive")
+                client_ping_count += 1
+                if idle_timeout is not None and time.monotonic() - last_frame_at >= idle_timeout:
+                    raise RuntimeError(
+                        f"Zookeeper websocket idle timed out after {int(time.monotonic() - last_frame_at)}s "
+                        f"without a frame (frames={frame_count}, kclFrames={kcl_frames}, lastType={last_frame_type})"
+                    )
                 continue
             try:
                 frame = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            frames.append(frame)
+            frame_count += 1
+            last_frame_at = time.monotonic()
+            last_frame_type = sanitize_text(frame.get("type") if isinstance(frame, dict) else "", "unknown")
             line = extract_dialog_line(frame)
             if line:
-                raw_response_text.append(line)
+                line = line[:ZOOKEEPER_TEXT_BUFFER_MAX]
+                response_buffer.append(f"{line}\n")
                 if is_dialog_delta_frame(frame):
-                    raw_delta_text.append(line)
                     for buffered_line in dialog_buffer.append(line):
                         record_dialog_line(buffered_line)
                 else:
                     flush_dialog_buffer()
                     record_dialog_line(line)
                 if isinstance(frame, dict) and isinstance(frame.get("whole_response"), str):
-                    final_text = frame["whole_response"]
+                    final_text = frame["whole_response"][:ZOOKEEPER_TEXT_BUFFER_MAX]
+                    response_buffer.clear()
                 if stop_when:
-                    response_text = final_text or "".join(raw_delta_text) or "\n".join(raw_response_text)
+                    should_parse = (
+                        bool(final_text) or
+                        frame_count % 64 == 0 or
+                        line.rstrip().endswith(("}", "]", "```"))
+                    )
+                    response_text = final_text or (response_buffer.value() if should_parse else "")
                     if response_text and stop_when(response_text):
                         flush_dialog_buffer()
                         break
             kcl = extract_kcl_output(frame)
             if kcl:
+                if len(kcl) > MAX_KCL_CHARS:
+                    raise RuntimeError(f"Zookeeper KCL output exceeded {MAX_KCL_CHARS} characters")
                 flush_dialog_buffer()
                 latest_kcl = kcl
                 kcl_frames += 1
@@ -1216,16 +1582,37 @@ def zookeeper_turn(
                 break
         else:
             flush_dialog_buffer()
-            raise RuntimeError("Zookeeper websocket turn timed out")
+            raise RuntimeError(
+                f"Zookeeper websocket turn timed out after {timeout}s "
+                f"(frames={frame_count}, kclFrames={kcl_frames}, lastFrameAge={int(time.monotonic() - last_frame_at)}s, "
+                f"lastType={last_frame_type})"
+            )
+    except Exception as error:
+        log_event("zookeeper.turn_error", {
+            "projectName": project_name,
+            "durationMs": int((time.monotonic() - started) * 1000),
+            "timeoutSeconds": timeout,
+            "idleTimeoutSeconds": idle_timeout,
+            "frames": frame_count,
+            "kclFrames": kcl_frames,
+            "lastFrameAgeMs": int((time.monotonic() - last_frame_at) * 1000),
+            "lastFrameType": last_frame_type,
+            "clientPings": client_ping_count,
+            "responseChars": response_buffer.length,
+            "error": str(error),
+            "errorType": type(error).__name__,
+        })
+        raise
     finally:
         websocket_close(sock)
     flush_dialog_buffer()
+    raw_response_text = response_buffer.value()
     return {
         "kcl": latest_kcl,
         "summary": sanitize_text(final_text or (dialog[-1] if dialog else ""), "Zookeeper auto completed."),
-        "rawText": final_text or "".join(raw_delta_text) or "\n".join(raw_response_text) or "\n".join(raw_dialog[-24:]),
-        "dialog": dialog[-12:],
-        "frames": len(frames),
+        "rawText": final_text or raw_response_text or "\n".join(list(dialog)[-12:]),
+        "dialog": list(dialog)[-12:],
+        "frames": frame_count,
         "kclFrames": kcl_frames,
     }
 
@@ -1521,7 +1908,7 @@ def is_retryable_zookeeper_connection_error(error):
     ))
 
 
-def zookeeper_review(body):
+def zookeeper_review_with_logging(body, on_dialog=None):
     review_id = uuid.uuid4().hex[:12]
     started = time.monotonic()
     metrics = review_metrics(body)
@@ -1533,7 +1920,7 @@ def zookeeper_review(body):
         attempts = 0
         while True:
             try:
-                result = zookeeper_review_impl(body, review_id)
+                result = zookeeper_review_impl(body, review_id, on_dialog=on_dialog)
                 break
             except Exception as error:
                 attempts += 1
@@ -1585,7 +1972,20 @@ def zookeeper_review(body):
         raise RuntimeError(f"review {review_id} failed: {error}; trace={trace_path}") from error
 
 
-def zookeeper_review_impl(body, review_id):
+def zookeeper_review(body):
+    session_id = sanitize_text(body.get("sessionId"), "default")
+    work_id = f"review-{uuid.uuid4().hex[:12]}"
+    cancel_event = begin_session_work(session_id, work_id)
+    SESSION_CONTEXT.cancel_event = cancel_event
+    try:
+        return zookeeper_review_with_logging(body)
+    finally:
+        finish_session_work(session_id, work_id)
+        if hasattr(SESSION_CONTEXT, "cancel_event"):
+            del SESSION_CONTEXT.cancel_event
+
+
+def zookeeper_review_impl(body, review_id, on_dialog=None):
     agent = body.get("agent") or {}
     child = body.get("child") or {}
     files = body.get("files") or {}
@@ -1653,9 +2053,11 @@ def zookeeper_review_impl(body, review_id):
         prompt,
         current_files,
         slug(f"{name or role or 'zookeeper-review'}-{review_id}"),
-        timeout=240,
+        timeout=ZOOKEEPER_REVIEW_TIMEOUT,
+        idle_timeout=ZOOKEEPER_REVIEW_IDLE_TIMEOUT,
         stop_on_kcl=False,
         stop_when=lambda text: bool(parse_review_payload(text)),
+        on_dialog=on_dialog,
     )
     text = result.get("rawText") or result["summary"] or "\n".join(result["dialog"])
     payload = parse_review_payload(text)
@@ -2167,13 +2569,19 @@ def subassembly_bom_stream(body, emit):
     try:
         dialog("Planning this sub-assembly's direct BOM through hosted Zookeeper auto mode.")
         result = zookeeper_subassembly_bom(body, emit_dialog=dialog)
+    except SessionCancelled:
+        raise
     except Exception as zoo_error:
+        raise_if_session_cancelled()
         dialog(f"Hosted BOM planning failed: {sanitize_dialog_text(zoo_error, 'unknown error')}")
         try:
             dialog(f"OpenAI fallback is planning {sanitize_text(agent.get('role'), 'the sub-assembly')}'s direct BOM; it does not emit Zoo websocket frames.")
             result = openai_subassembly_bom(body)
             dialog("OpenAI fallback returned the direct BOM.")
+        except SessionCancelled:
+            raise
         except Exception as openai_error:
+            raise_if_session_cancelled()
             dialog(f"OpenAI BOM fallback failed: {sanitize_dialog_text(openai_error, 'unknown error')}")
             result = fallback_subassembly_bom(body, openai_error)
             dialog("Deterministic direct BOM fallback returned two concrete workers.")
@@ -2316,12 +2724,55 @@ def event_queue_for(session_id):
     key = str(session_id or "default")
     with EVENT_QUEUES_LOCK:
         if key not in EVENT_QUEUES:
-            EVENT_QUEUES[key] = queue.Queue()
+            EVENT_QUEUES[key] = queue.Queue(maxsize=EVENT_QUEUE_MAX)
         return EVENT_QUEUES[key]
 
 
 def publish_event(session_id, event):
-    event_queue_for(session_id).put(event)
+    key = str(session_id or "default")
+    events = event_queue_for(key)
+    event_type = str((event or {}).get("type") or "")
+    critical = event_type in {"final", "error", "review-final", "review-error"}
+    if not critical and events.qsize() >= EVENT_QUEUE_MAX - EVENT_QUEUE_RESERVED_FINALS:
+        with EVENT_QUEUES_LOCK:
+            should_log = key not in EVENT_QUEUE_WARNED
+            EVENT_QUEUE_WARNED.add(key)
+        if should_log:
+            log_event("event_queue.backpressure", {
+                "sessionId": key,
+                "queueSize": events.qsize(),
+                "queueMax": EVENT_QUEUE_MAX,
+                "droppedType": event_type,
+            })
+        return False
+    try:
+        events.put_nowait(event)
+        return True
+    except queue.Full:
+        if not critical:
+            return False
+        try:
+            events.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            events.put_nowait(event)
+            return True
+        except queue.Full:
+            log_event("event_queue.critical_drop", {
+                "sessionId": key,
+                "queueSize": events.qsize(),
+                "queueMax": EVENT_QUEUE_MAX,
+                "droppedType": event_type,
+            })
+            return False
+
+
+def publish_session_event(session_id, cancel_event, event):
+    with SESSION_WORK_LOCK:
+        if cancel_event.is_set():
+            raise SessionCancelled("wall session cancelled")
+        return publish_event(session_id, event)
 
 
 def agent_work_stream(body, emit):
@@ -2333,6 +2784,8 @@ def agent_work_stream(body, emit):
     attempt = int(clamp(float(body.get("attempt") or 0), 0, 4))
     try:
         result = zookeeper_agent_work(body, agent, imports, current_kcl, render_error, attempt, emit=emit)
+    except SessionCancelled:
+        raise
     except Exception as error:
         result = retained_kcl_fallback(role, imports, current_kcl, error)
     result["streamed"] = True
@@ -2344,20 +2797,29 @@ def agent_work_start(body):
     work_id = sanitize_text(body.get("workId"), str(uuid.uuid4()))
     agent = body.get("agent") or {}
     agent_id = sanitize_text(agent.get("id"), "agent")
+    cancel_event = begin_session_work(session_id, work_id)
 
     def emit(event):
         payload = dict(event)
         payload["sessionId"] = session_id
         payload["workId"] = work_id
         payload["agentId"] = agent_id
-        publish_event(session_id, payload)
+        publish_session_event(session_id, cancel_event, payload)
 
     def run():
+        SESSION_CONTEXT.cancel_event = cancel_event
         try:
             emit({"type": "started"})
             agent_work_stream(body, emit)
+        except SessionCancelled:
+            pass
         except Exception as error:
-            emit({"type": "error", "summary": str(error)})
+            if not cancel_event.is_set():
+                emit({"type": "error", "summary": str(error)})
+        finally:
+            finish_session_work(session_id, work_id)
+            if hasattr(SESSION_CONTEXT, "cancel_event"):
+                del SESSION_CONTEXT.cancel_event
 
     thread = threading.Thread(target=run, name=f"zookeeper-work-{agent_id}", daemon=True)
     thread.start()
@@ -2369,24 +2831,84 @@ def agent_bom_start(body):
     work_id = sanitize_text(body.get("workId"), str(uuid.uuid4()))
     agent = body.get("agent") or {}
     agent_id = sanitize_text(agent.get("id"), "agent")
+    cancel_event = begin_session_work(session_id, work_id)
 
     def emit(event):
         payload = dict(event)
         payload["sessionId"] = session_id
         payload["workId"] = work_id
         payload["agentId"] = agent_id
-        publish_event(session_id, payload)
+        publish_session_event(session_id, cancel_event, payload)
 
     def run():
+        SESSION_CONTEXT.cancel_event = cancel_event
         try:
             emit({"type": "started"})
             subassembly_bom_stream(body, emit)
+        except SessionCancelled:
+            pass
         except Exception as error:
-            emit({"type": "error", "summary": str(error)})
+            if not cancel_event.is_set():
+                emit({"type": "error", "summary": str(error)})
+        finally:
+            finish_session_work(session_id, work_id)
+            if hasattr(SESSION_CONTEXT, "cancel_event"):
+                del SESSION_CONTEXT.cancel_event
 
     thread = threading.Thread(target=run, name=f"zookeeper-bom-{agent_id}", daemon=True)
     thread.start()
     return {"ok": True, "sessionId": session_id, "workId": work_id, "agentId": agent_id}
+
+
+def review_start(body):
+    session_id = sanitize_text(body.get("sessionId"), "default")
+    work_id = sanitize_text(body.get("workId"), str(uuid.uuid4()))
+    agent = body.get("agent") or {}
+    agent_id = sanitize_text(agent.get("id"), "agent")
+    cancel_event = begin_session_work(session_id, work_id)
+
+    def emit(event):
+        payload = dict(event)
+        payload["sessionId"] = session_id
+        payload["workId"] = work_id
+        payload["agentId"] = agent_id
+        publish_session_event(session_id, cancel_event, payload)
+
+    def run():
+        acquired = False
+        SESSION_CONTEXT.cancel_event = cancel_event
+        try:
+            emit({"type": "review-queued"})
+            while not acquired:
+                raise_if_session_cancelled()
+                acquired = REVIEW_SEMAPHORE.acquire(timeout=0.5)
+            emit({"type": "review-started"})
+            result = zookeeper_review_with_logging(
+                body,
+                on_dialog=lambda line: emit({"type": "review-dialog", "line": line}),
+            )
+            emit({"type": "review-final", "review": result})
+        except SessionCancelled:
+            pass
+        except Exception as error:
+            if not cancel_event.is_set():
+                emit({"type": "review-error", "summary": str(error)})
+        finally:
+            if acquired:
+                REVIEW_SEMAPHORE.release()
+            finish_session_work(session_id, work_id)
+            if hasattr(SESSION_CONTEXT, "cancel_event"):
+                del SESSION_CONTEXT.cancel_event
+
+    thread = threading.Thread(target=run, name=f"zookeeper-review-{agent_id}", daemon=True)
+    thread.start()
+    return {
+        "ok": True,
+        "sessionId": session_id,
+        "workId": work_id,
+        "agentId": agent_id,
+        "reviewConcurrency": REVIEW_CONCURRENCY,
+    }
 
 
 class WallHandler(SimpleHTTPRequestHandler):
@@ -2413,10 +2935,25 @@ class WallHandler(SimpleHTTPRequestHandler):
         return mimetypes.guess_type(path)[0] or "application/octet-stream"
 
     def read_json(self):
-        length = int(self.headers.get("content-length") or "0")
+        try:
+            length = int(self.headers.get("content-length") or "0")
+        except ValueError as error:
+            raise RuntimeError("invalid content-length header") from error
+        if length < 0:
+            raise RuntimeError("content-length must not be negative")
+        if length > MAX_REQUEST_BYTES:
+            self.close_connection = True
+            raise RequestBodyTooLarge(
+                f"request body exceeds {MAX_REQUEST_BYTES} bytes"
+            )
         if length == 0:
             return {}
-        return json.loads(self.rfile.read(length).decode("utf-8"))
+        payload = self.rfile.read(length)
+        if len(payload) != length:
+            raise RuntimeError(
+                f"incomplete request body: expected {length} bytes, received {len(payload)}"
+            )
+        return json.loads(payload.decode("utf-8"))
 
     def send_json(self, status, value):
         payload = json.dumps(value).encode("utf-8")
@@ -2441,16 +2978,23 @@ class WallHandler(SimpleHTTPRequestHandler):
 
     def send_event_stream(self, session_id):
         self.start_ndjson()
+        self.connection.settimeout(15)
         events = event_queue_for(session_id)
-        while True:
-            try:
-                event = events.get(timeout=15)
-            except queue.Empty:
-                event = {"type": "ping", "sessionId": session_id, "time": time.time()}
-            try:
-                self.send_ndjson(event)
-            except (BrokenPipeError, ConnectionError):
-                return
+        try:
+            while True:
+                try:
+                    event = events.get(timeout=15)
+                except queue.Empty:
+                    event = {"type": "ping", "sessionId": session_id, "time": time.time()}
+                try:
+                    self.send_ndjson(event)
+                except (BrokenPipeError, ConnectionError, OSError):
+                    return
+        finally:
+            close_session({
+                "sessionId": session_id,
+                "reason": "event stream disconnected",
+            })
 
     def send_wall_config(self):
         token = json.dumps(ZOO_API_TOKEN) if ZOO_API_TOKEN else "undefined"
@@ -2502,23 +3046,40 @@ class WallHandler(SimpleHTTPRequestHandler):
                 self.send_json(200, agent_bom_start(self.read_json()))
                 return
             if self.path == "/api/zookeeper/review":
-                self.send_json(200, zookeeper_review(self.read_json()))
+                self.read_json()
+                self.send_json(409, {
+                    "error": "synchronous review transport is disabled; reload the wall client",
+                })
+                return
+            if self.path == "/api/zookeeper/review-start":
+                self.send_json(200, review_start(self.read_json()))
+                return
+            if self.path == "/api/zookeeper/session-close":
+                self.send_json(200, close_session(self.read_json()))
                 return
             if self.path == "/api/snapshot":
                 self.send_json(200, persist_snapshot(self.read_json()))
                 return
+            if self.path == "/api/project":
+                self.send_json(200, persist_project(self.read_json()))
+                return
+            if self.path == "/api/runtime-event":
+                self.send_json(200, log_runtime_event(self.read_json()))
+                return
             self.send_error(404)
         except Exception as error:
             error_id = uuid.uuid4().hex[:12]
+            status = 413 if isinstance(error, RequestBodyTooLarge) else 500
             log_event("http.error", {
                 "errorId": error_id,
                 "method": "POST",
                 "path": self.path,
+                "status": status,
                 "error": str(error),
                 "errorType": type(error).__name__,
                 "traceback": traceback.format_exc(),
             })
-            self.send_json(500, {"error": str(error), "errorId": error_id})
+            self.send_json(status, {"error": str(error), "errorId": error_id})
 
 
 if __name__ == "__main__":

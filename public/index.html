@@ -279,6 +279,7 @@
       }
 
       .assembly-renderer {
+        position: relative;
         flex: 1;
         min-height: 0;
         margin-top: 8px;
@@ -288,8 +289,24 @@
         background: rgba(0, 0, 0, 0.42);
       }
 
+      .assembly-renderer .center-view-staging {
+        position: absolute;
+        inset: 0;
+        z-index: -1;
+        opacity: 0;
+        pointer-events: none;
+      }
+
       .assembly-renderer .start {
         display: none;
+      }
+
+      .orchestrator-final-snapshot {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        background: #05070b;
       }
 
       .orchestrator-graph {

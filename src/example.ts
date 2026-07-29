@@ -14,6 +14,8 @@ type Size = {
 
 type AgentKind = 'orchestrator' | 'worker'
 type AgentStatus = 'queued' | 'starting' | 'running' | 'reviewing' | 'complete' | 'error'
+type SnapshotState = 'queued' | 'rendering' | 'persisting' | 'ready' | 'error'
+type RunPhase = 'idle' | 'architecting' | 'running' | 'finalizing' | 'complete'
 
 type Agent = {
   id: string,
@@ -41,6 +43,14 @@ type Agent = {
   viewerReloadAttempts?: number,
   viewerHealthTimer?: number,
   snapshotUrl?: string,
+  snapshotObjectUrl?: string,
+  snapshotLoadId?: number,
+  snapshotState?: SnapshotState,
+  snapshotMessage?: string,
+  snapshotRecoveryCount?: number,
+  lastSnapshotRecoveryAtMs?: number,
+  lastGoodKcl?: string,
+  lastGoodSnapshotUrl?: string,
   reviewRounds?: number,
   activeStartedAtMs?: number,
   elapsedMs?: number,
@@ -133,13 +143,59 @@ type AgentWorkStreamEvent = {
   type: 'error',
   workId?: string,
   summary: string,
+} | {
+  type: 'review-queued' | 'review-started',
+  workId?: string,
+} | {
+  type: 'review-dialog',
+  workId?: string,
+  line: string,
+} | {
+  type: 'review-final',
+  workId?: string,
+  review: AgentReviewResponse,
+} | {
+  type: 'review-error',
+  workId?: string,
+  summary: string,
 }
 
 type AgentWorkWaiter = {
   agent: Agent,
   currentRun: number,
+  workRevision?: number,
   resolve: (update: AgentStreamResponse) => void,
   reject: (error: Error) => void,
+}
+
+type AgentWorkQueueWaiter = {
+  resolve: () => void,
+  reject: (error: Error) => void,
+}
+
+type AgentWorkQueueRequest = {
+  agent: Agent,
+  currentRun: number,
+  renderError: string,
+  repairAttempt: number,
+  reviewInstruction: string,
+  zooRetryAttempt: number,
+  workRevision: number,
+  waiters: AgentWorkQueueWaiter[],
+}
+
+type ReviewWaiter = {
+  parent: Agent,
+  currentRun: number,
+  resolve: (review: AgentReviewResponse) => void,
+  reject: (error: Error) => void,
+}
+
+type QueuedReview = {
+  parent: Agent,
+  changedChild: Agent,
+  currentRun: number,
+  revision: string,
 }
 
 type ReworkRequest = {
@@ -186,7 +242,27 @@ type SnapshotJob = {
   currentRun: number,
   project: RenderProject,
   label: string,
+  kind: 'draft' | 'final',
   attempt: number,
+  sourceKcl: string,
+}
+
+type SnapshotPersistenceJob = {
+  agentId: string,
+  currentRun: number,
+  dataUrl: string,
+  sourceKcl: string,
+}
+
+type CenterRenderWaiter = {
+  resolve: () => void,
+  reject: (error: Error) => void,
+}
+
+type CenterRenderRequest = {
+  project: RenderProject,
+  label: string,
+  waiters: CenterRenderWaiter[],
 }
 
 type RankedAgent = {
@@ -207,6 +283,8 @@ type BomUsage = {
 
 type WallBroadcastMessage = {
   type: 'reset',
+} | {
+  type: 'run:complete',
 } | {
   type: 'plan',
   sessionId: string,
@@ -255,6 +333,11 @@ type WallBroadcastMessage = {
   type: 'agent:snapshot',
   agentId: string,
   snapshotUrl: string,
+} | {
+  type: 'agent:snapshot-status',
+  agentId: string,
+  state: SnapshotState,
+  message?: string,
 }
 
 const rows = 3
@@ -267,24 +350,31 @@ const maxLiveAgentViews = 24
 const maxAgentRepairAttempts = 2
 const maxZooFallbackRetries = 3
 const zooFallbackRetryBackoffMs = 2200
+const maxConcurrentReviews = 2
 const maxViewerReloadAttempts = 5
 const supervisorSweepIntervalMs = 15000
 const supervisorSummaryIntervalMs = 60000
 const supervisorQueuedWakeMs = 45000
 const supervisorRecoveryCooldownMs = 20000
-const maxSupervisorRecoveryAttempts = 3
+const snapshotRecoveryCooldownMs = 15000
+const snapshotRetriesBeforeKclRepair = 2
+const runCompletionSettleMs = 5000
+const runCompletionRetryMs = 3000
 const viewerHealthPollMs = 10000
 const viewerStalledReloadMs = 45000
 const useAgentCadSnapshots = true
-const snapshotViewerSize: Size = { width: 2560, height: 1440 }
+const snapshotViewerSize: Size = { width: 1280, height: 720 }
+const maxQueuedDraftSnapshots = 4
 const snapshotFrameWaitMs = 900
 const snapshotSubmitTimeoutMs = 35000
 const snapshotCaptureTimeoutMs = 12000
-const snapshotPersistTimeoutMs = 20000
+const snapshotPersistTimeoutMs = 120000
+const snapshotImageFetchTimeoutMs = 30000
 const snapshotDisposeTimeoutMs = 5000
-// Long-lived WebRTC/GPUs accumulate renderer state even when each image is
-// serialized. Recreate the hidden renderer on a steady cadence.
-const snapshotRendererRecycleIntervalMs = 120000
+const maxSnapshotSubmissionsPerRenderer = 4
+const centerRendererSubmitTimeoutMs = 90000
+const maxCenterSubmissionsPerRenderer = 6
+const maxRootDraftVisualizations = 1
 const defaultPrompt = 'A terminator robot endoskeleton display assembly. Build a metallic humanoid inspection robot with roughly 28-40 concrete parts organized through nested sub-orchestrators: skull/head, neck/spine, ribcage/torso, pelvis/hips, left arm, right arm, left leg, right leg, hands/feet, exposed actuator links, and cable routing. Workers should each own one physical part file, not a set: individual skull plate, eye lens, jaw link, vertebra, rib hoop, shoulder yoke, upper-arm bone, forearm piston, finger segment, hip bracket, thigh strut, shin strut, foot plate, etc. Use shared reusable components for repeated hardware such as bolts, pins, bushings, bearings, washers, spacers, cable clips, and small actuator clevises; model each reusable component once and have orchestrators clone/place the required counts. For mirrored limbs, paired brackets, repeated ribs, bolt circles, and other arrays, create one canonical part when possible and have orchestrators apply the mirrored, radial, or linear placement transforms with BOM comments. Every sub-orchestrator should place only direct child/subassembly imports and explicit shared reusable imports, add BOM comments for reused parts, align by named mate points/local axes/dimensions, and return one renderable aggregate so parent assemblies can place it. Avoid weapons; focus on the mechanical robot body, exposed structure, and assembled presentation.'
 const rootFilePath = 'main.kcl'
 const interfaceBlockStart = 'ZOOKEEPER_INTERFACE'
@@ -366,6 +456,7 @@ const installWorkerWebSocketSendQueuePatch = () => {
 
       const patchedUrl = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }))
       super(patchedUrl, options)
+      URL.revokeObjectURL(patchedUrl)
     }
   } as typeof Worker
 }
@@ -837,11 +928,20 @@ document.addEventListener('DOMContentLoaded', () => {
   const reviewTimers = new Map<string, number>()
   const placementTimers = new Map<string, number>()
   const draftRenderChains = new Map<string, Promise<void>>()
+  const agentWorkRevisions = new Map<string, number>()
+  const activeAgentWorkIds = new Set<string>()
+  const pendingAgentWorkRequests = new Map<string, AgentWorkQueueRequest>()
   const snapshotJobs = new Map<string, SnapshotJob>()
   const workWaiters = new Map<string, AgentWorkWaiter>()
+  const reviewWaiters = new Map<string, ReviewWaiter>()
+  const reviewQueue = new Map<string, QueuedReview>()
+  const activeReviewRevisions = new Map<string, string>()
+  const completedReviewRevisions = new Map<string, string>()
   const bomPlanningAgentIds = new Set<string>()
+  const activeReviewRequests = new Set<string>()
   const supervisorReviewAtMs = new Map<string, number>()
   let workEventAbort: AbortController | undefined
+  let runRequestAbort: AbortController | undefined
   let rootRenderTimer: number | undefined
   let graphRenderTimer: number | undefined
   let layoutTimer: number | undefined
@@ -852,6 +952,11 @@ document.addEventListener('DOMContentLoaded', () => {
   let runId = 0
   let startInProgress = false
   let active = false
+  let runPhase: RunPhase = 'idle'
+  let rootStatus: AgentStatus = 'queued'
+  let completionCheckTimer: number | undefined
+  let completionCandidateAtMs: number | undefined
+  let finalizationPromise: Promise<void> | undefined
   let plannedAgentCount = 0
   let activeSessionId = ''
   let rootActiveStartedAtMs: number | undefined
@@ -865,10 +970,14 @@ document.addEventListener('DOMContentLoaded', () => {
   let snapshotView: ZooWebView | undefined
   let snapshotViewStarting: Promise<ZooWebView> | undefined
   let snapshotViewDisposing: Promise<void> | undefined
+  let snapshotViewSubmissionCount = 0
   let snapshotDrainPromise: Promise<void> | undefined
-  let snapshotRecycleTimer: number | undefined
-  let snapshotRecycleRequested = false
-  let snapshotRecycleReason = ''
+  const snapshotPersistenceJobs = new Map<string, SnapshotPersistenceJob>()
+  let snapshotPersistenceDrainPromise: Promise<void> | undefined
+  const snapshotCanvas = document.createElement('canvas')
+  const snapshotValidationCanvas = document.createElement('canvas')
+  snapshotValidationCanvas.width = 64
+  snapshotValidationCanvas.height = 36
   let capacityWarningRun = -1
 
   const broadcastWall = (message: WallBroadcastMessage) => {
@@ -894,10 +1003,96 @@ document.addEventListener('DOMContentLoaded', () => {
   let centerViewerReloadTimer: number | undefined
   let centerViewerReloadAttempts = 0
   let centerViewerHealthTimer: number | undefined
+  let centerRenderPending: CenterRenderRequest | undefined
+  let centerRenderDrainPromise: Promise<void> | undefined
+  let centerRebuildPromise: Promise<void> | undefined
+  let centerCoalescedRenderCount = 0
+  let centerViewSubmissionCount = 0
+  let lastGoodCenterProject: RenderProject | undefined
 
   const centerStatus = document.createElement('div')
   centerStatus.classList.add('center-status')
   centerStatus.textContent = 'Zookeeper ready'
+
+  const reportRuntimeEvent = (event: string) => {
+    if (!isControllerWindow) return
+    const statuses = Array.from(agents.values()).reduce((counts, agent) => {
+      counts.set(agent.status, (counts.get(agent.status) ?? 0) + 1)
+      return counts
+    }, new Map<AgentStatus, number>())
+    void fetch('/api/runtime-event', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        event,
+        phase: runPhase,
+        rootStatus,
+        blockers: root.dataset.completionBlockers ?? '',
+        agents: agents.size,
+        complete: statuses.get('complete') ?? 0,
+        error: statuses.get('error') ?? 0,
+        activeWork: workWaiters.size + bomPlanningAgentIds.size,
+        activeReviews: activeReviewRequests.size,
+        queuedReviews: reviewQueue.size,
+        snapshotJobs: snapshotJobs.size,
+        persistenceJobs: snapshotPersistenceJobs.size,
+      }),
+    }).catch(() => {})
+  }
+
+  const closeActiveSession = (reason: string) => {
+    const sessionId = activeSessionId
+    if (sessionId.length === 0) return
+    void fetch('/api/zookeeper/session-close', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId, reason }),
+      keepalive: true,
+    }).catch(() => {})
+  }
+
+  const runFetch = (input: RequestInfo | URL, init: RequestInit = {}) => fetch(input, {
+    ...init,
+    signal: runRequestAbort?.signal,
+  })
+
+  const runFetchWithTimeout = async (
+    input: RequestInfo | URL,
+    init: RequestInit,
+    timeoutMs: number,
+    label: string,
+  ) => {
+    const controller = new AbortController()
+    const runSignal = runRequestAbort?.signal
+    let timedOut = false
+    const abortFromRun = () => controller.abort()
+    if (runSignal?.aborted) controller.abort()
+    else runSignal?.addEventListener('abort', abortFromRun, { once: true })
+    const timeout = window.setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, timeoutMs)
+    try {
+      return await fetch(input, { ...init, signal: controller.signal })
+    } catch (error: unknown) {
+      if (timedOut) {
+        throw new Error(`${label} timed out after ${Math.ceil(timeoutMs / 1000)}s`)
+      }
+      throw error
+    } finally {
+      window.clearTimeout(timeout)
+      runSignal?.removeEventListener('abort', abortFromRun)
+    }
+  }
+
+  const setRunPhase = (phase: RunPhase, status: AgentStatus = rootStatus) => {
+    runPhase = phase
+    rootStatus = status
+    root.dataset.runPhase = phase
+    root.dataset.rootStatus = status
+    renderAllGraphs()
+    reportRuntimeEvent('phase')
+  }
 
   const aggregateTime = document.createElement('div')
   aggregateTime.classList.add('aggregate-time')
@@ -1036,7 +1231,7 @@ document.addEventListener('DOMContentLoaded', () => {
         role: 'root assembly planner',
         instruction: rootInstruction,
         color: '#FFFFFF',
-        status: active ? 'running' : 'queued',
+        status: rootStatus,
         filePath: rootFilePath,
         imports: Array.from(rootImports),
         source: activeSource,
@@ -1235,8 +1430,10 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   const renderAllGraphsNow = () => {
-    renderGraphFor(rootGraph, rootAgentId, false)
-    graphPanel.querySelector('.graph-count')!.textContent = `${agents.size} agents`
+    if (!isWallTileMode || isControllerWindow) {
+      renderGraphFor(rootGraph, rootAgentId, false)
+      graphPanel.querySelector('.graph-count')!.textContent = `${agents.size} agents`
+    }
     for (const agent of agents.values()) {
       if (agent.kind !== 'orchestrator' || agent.graphElement === undefined) continue
       renderGraphFor(agent.graphElement, agent.id, true)
@@ -1383,31 +1580,65 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  const snapshotHasVisibleGeometry = () => {
+    const context = snapshotValidationCanvas.getContext('2d', { willReadFrequently: true })
+    if (context === null) return true
+    context.drawImage(
+      snapshotCanvas,
+      0,
+      0,
+      snapshotValidationCanvas.width,
+      snapshotValidationCanvas.height,
+    )
+    const pixels = context.getImageData(
+      0,
+      0,
+      snapshotValidationCanvas.width,
+      snapshotValidationCanvas.height,
+    ).data
+    let minimumLuminance = 255
+    let maximumLuminance = 0
+    for (let index = 0; index < pixels.length; index += 4) {
+      const luminance = (pixels[index] * 0.2126) + (pixels[index + 1] * 0.7152) + (pixels[index + 2] * 0.0722)
+      minimumLuminance = Math.min(minimumLuminance, luminance)
+      maximumLuminance = Math.max(maximumLuminance, luminance)
+    }
+    context.clearRect(0, 0, snapshotValidationCanvas.width, snapshotValidationCanvas.height)
+    return maximumLuminance - minimumLuminance >= 8
+  }
+
   const captureSnapshotDataUrl = async (view: ZooWebView) => {
     const video = view.el.querySelector<HTMLVideoElement>('video')
     if (video === null) throw new Error('snapshot renderer video is missing')
-    await wait(snapshotFrameWaitMs)
-    if (video.videoWidth === 0 || video.videoHeight === 0) {
-      throw new Error('snapshot renderer has no video frame')
-    }
+    let image: Blob | undefined
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await wait(attempt === 0 ? snapshotFrameWaitMs : 1200)
+      if (video.videoWidth === 0 || video.videoHeight === 0) continue
 
-    const scale = Math.min(1, snapshotViewerSize.width / video.videoWidth, snapshotViewerSize.height / video.videoHeight)
-    const width = Math.max(1, Math.round(video.videoWidth * scale))
-    const height = Math.max(1, Math.round(video.videoHeight * scale))
-    const canvas = document.createElement('canvas')
-    canvas.width = width
-    canvas.height = height
-    const context = canvas.getContext('2d')
-    if (context === null) throw new Error('snapshot canvas is unavailable')
-    context.fillStyle = '#05070b'
-    context.fillRect(0, 0, width, height)
-    context.drawImage(video, 0, 0, width, height)
-    const image = await withTimeout(new Promise<Blob>((resolve, reject) => {
-      canvas.toBlob((blob) => {
-        if (blob === null) reject(new Error('snapshot canvas returned no image'))
-        else resolve(blob)
-      }, 'image/webp', 0.86)
-    }), snapshotCaptureTimeoutMs, 'snapshot canvas encoding')
+      const scale = Math.min(1, snapshotViewerSize.width / video.videoWidth, snapshotViewerSize.height / video.videoHeight)
+      const width = Math.max(1, Math.round(video.videoWidth * scale))
+      const height = Math.max(1, Math.round(video.videoHeight * scale))
+      if (snapshotCanvas.width !== width) snapshotCanvas.width = width
+      if (snapshotCanvas.height !== height) snapshotCanvas.height = height
+      const context = snapshotCanvas.getContext('2d', { willReadFrequently: true })
+      if (context === null) throw new Error('snapshot canvas is unavailable')
+      try {
+        context.fillStyle = '#05070b'
+        context.fillRect(0, 0, width, height)
+        context.drawImage(video, 0, 0, width, height)
+        if (!snapshotHasVisibleGeometry()) continue
+        image = await withTimeout(new Promise<Blob>((resolve, reject) => {
+          snapshotCanvas.toBlob((blob) => {
+            if (blob === null) reject(new Error('snapshot canvas returned no image'))
+            else resolve(blob)
+          }, 'image/webp', 0.86)
+        }), snapshotCaptureTimeoutMs, 'snapshot canvas encoding')
+        break
+      } finally {
+        context.clearRect(0, 0, snapshotCanvas.width, snapshotCanvas.height)
+      }
+    }
+    if (image === undefined) throw new Error('snapshot renderer returned a blank frame')
     return await withTimeout(new Promise<string>((resolve, reject) => {
       const reader = new FileReader()
       reader.addEventListener('load', () => {
@@ -1419,18 +1650,96 @@ document.addEventListener('DOMContentLoaded', () => {
     }), snapshotCaptureTimeoutMs, 'snapshot data URL conversion')
   }
 
-  const persistAgentSnapshot = async (agent: Agent, dataUrl: string) => {
-    const response = await withTimeout(fetch('/api/snapshot', {
+  const persistSnapshot = async (agentId: string, dataUrl: string) => {
+    const response = await runFetchWithTimeout('/api/snapshot', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ agentId: agent.id, dataUrl }),
-    }), snapshotPersistTimeoutMs, 'snapshot upload')
+      body: JSON.stringify({ agentId, dataUrl }),
+    }, snapshotPersistTimeoutMs, 'snapshot upload')
     if (!response.ok) throw await httpErrorFromResponse(response, 'snapshot')
     const payload = await response.json() as { url?: unknown }
     if (typeof payload.url !== 'string' || payload.url.length === 0) {
       throw new Error('snapshot endpoint returned no URL')
     }
     return payload.url
+  }
+
+  const persistCompletedProject = async () => {
+    const response = await runFetchWithTimeout('/api/project', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: activeSessionId,
+        prompt: promptInput.value.trim() || defaultPrompt,
+        rootFile: rootFilePath,
+        files: objectFromMap(kclFiles),
+        interfaces: objectFromMap(interfaceManifests),
+        agents: Array.from(agents.values()).map(agent => ({
+          id: agent.id,
+          parentId: agent.parentId,
+          kind: agent.kind,
+          scope: agent.scope,
+          name: agent.name,
+          role: agent.role,
+          instruction: agent.instruction,
+          filePath: agent.filePath,
+          imports: agent.imports ?? [],
+          status: agent.status,
+          elapsedMs: agent.elapsedMs ?? 0,
+        })),
+      }),
+    }, snapshotPersistTimeoutMs, 'completed project persistence')
+    if (!response.ok) throw await httpErrorFromResponse(response, 'completed project')
+    const payload = await response.json() as { path?: unknown, fileCount?: unknown, fileBytes?: unknown }
+    if (typeof payload.path !== 'string' || payload.path.length === 0) {
+      throw new Error('completed project endpoint returned no path')
+    }
+    return {
+      path: payload.path,
+      fileCount: Number(payload.fileCount) || kclFiles.size,
+      fileBytes: Number(payload.fileBytes) || 0,
+    }
+  }
+
+  const drainSnapshotPersistence = async () => {
+    while (snapshotPersistenceJobs.size > 0) {
+      const next = snapshotPersistenceJobs.entries().next().value as [string, SnapshotPersistenceJob] | undefined
+      if (next === undefined) break
+      const [agentId, job] = next
+      snapshotPersistenceJobs.delete(agentId)
+      const agent = agents.get(agentId)
+      if (agent === undefined || !agentStillActive(agent, job.currentRun)) continue
+      try {
+        const persistedUrl = await persistSnapshot(agent.id, job.dataUrl)
+        if (agentStillActive(agent, job.currentRun)) {
+          if (job.sourceKcl.trim().length > 0) agent.lastGoodKcl = job.sourceKcl
+          agent.lastGoodSnapshotUrl = persistedUrl
+          setAgentSnapshotState(agent, 'ready', 'persisted CAD snapshot')
+          setAgentSnapshot(agent, persistedUrl)
+          broadcastWall({ type: 'agent:snapshot', agentId: agent.id, snapshotUrl: persistedUrl })
+          appendAgentLog(agent, '< CAD snapshot persisted to disk', 'in')
+        }
+      } catch (error: unknown) {
+        if (agentStillActive(agent, job.currentRun)) {
+          setAgentSnapshotState(agent, 'error', `snapshot persistence failed: ${errorToMessage(error)}`)
+          appendAgentLog(agent, `< CAD snapshot persistence failed: ${errorToMessage(error)}`)
+        }
+      }
+    }
+  }
+
+  const ensureSnapshotPersistenceDrain = () => {
+    if (snapshotPersistenceDrainPromise !== undefined) return
+    snapshotPersistenceDrainPromise = drainSnapshotPersistence().finally(() => {
+      snapshotPersistenceDrainPromise = undefined
+      if (snapshotPersistenceJobs.size > 0) ensureSnapshotPersistenceDrain()
+      else scheduleRunCompletionCheck()
+    })
+  }
+
+  const queueSnapshotPersistence = (agent: Agent, currentRun: number, dataUrl: string, sourceKcl: string) => {
+    snapshotPersistenceJobs.set(agent.id, { agentId: agent.id, currentRun, dataUrl, sourceKcl })
+    ensureSnapshotPersistenceDrain()
   }
 
   const disposeSnapshotView = async () => {
@@ -1452,31 +1761,42 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       await disposing
     } finally {
+      snapshotViewSubmissionCount = 0
       if (snapshotViewDisposing === disposing) snapshotViewDisposing = undefined
     }
   }
 
-  const recycleSnapshotViewAfterCurrentJob = async (agent?: Agent) => {
-    if (!snapshotRecycleRequested) return
-    const reason = snapshotRecycleReason || 'scheduled renderer recycle'
-    snapshotRecycleRequested = false
-    snapshotRecycleReason = ''
-    if (agent !== undefined) appendAgentLog(agent, `< recycling CAD snapshot renderer: ${reason}`, 'in')
-    await disposeSnapshotView()
-  }
-
-  const requestSnapshotViewRecycle = (reason: string) => {
-    if (!isControllerWindow || !useAgentCadSnapshots) return
-    snapshotRecycleRequested = true
-    snapshotRecycleReason = reason
-    // A drain owns the renderer until it has captured the current frame.
-    if (snapshotDrainPromise !== undefined) return
-    void recycleSnapshotViewAfterCurrentJob()
+  const setAgentSnapshotState = (agent: Agent, state: SnapshotState, message = '') => {
+    agent.snapshotState = state
+    agent.snapshotMessage = message
+    if (state === 'ready') {
+      agent.snapshotRecoveryCount = 0
+      agent.lastSnapshotRecoveryAtMs = undefined
+    }
+    updateViewerPlaceholderText(agent)
+    broadcastWall({
+      type: 'agent:snapshot-status',
+      agentId: agent.id,
+      state,
+      message: message || undefined,
+    })
+    scheduleRunCompletionCheck()
   }
 
   const drainAgentSnapshots = async () => {
     while (snapshotJobs.size > 0) {
-      const next = snapshotJobs.entries().next().value as [string, SnapshotJob] | undefined
+      const next = Array.from(snapshotJobs.entries()).sort((left, right) => {
+        const leftAgent = agents.get(left[0])
+        const rightAgent = agents.get(right[0])
+        const priority = (agent: Agent | undefined, job: SnapshotJob) => {
+          const missingVisual = agent?.snapshotUrl === undefined
+          if (missingVisual && job.kind === 'final') return 0
+          if (missingVisual) return 1
+          if (job.kind === 'final') return 2
+          return 3
+        }
+        return priority(leftAgent, left[1]) - priority(rightAgent, right[1])
+      })[0]
       if (next === undefined) break
       const [agentId, job] = next
       snapshotJobs.delete(agentId)
@@ -1484,30 +1804,51 @@ document.addEventListener('DOMContentLoaded', () => {
       if (agent === undefined || !agentStillActive(agent, job.currentRun)) continue
 
       try {
+        setAgentSnapshotState(agent, 'rendering', job.label)
         appendAgentLog(agent, `< rendering CAD snapshot: ${job.label}`, 'in')
         const view = await waitForSnapshotView()
+        snapshotViewSubmissionCount += 1
         await withTimeout(submitProject(view, job.project, (message) => {
           throw new Error(message)
         }), snapshotSubmitTimeoutMs, 'snapshot renderer submit')
-        const snapshotUrl = await persistAgentSnapshot(agent, await captureSnapshotDataUrl(view))
+        const snapshotDataUrl = await captureSnapshotDataUrl(view)
         if (!agentStillActive(agent, job.currentRun)) continue
-        setAgentSnapshot(agent, snapshotUrl)
-        broadcastWall({ type: 'agent:snapshot', agentId: agent.id, snapshotUrl })
-        appendAgentLog(agent, `< CAD snapshot updated: ${job.label}`, 'in')
-        await recycleSnapshotViewAfterCurrentJob(agent)
+        setAgentSnapshotState(agent, 'persisting', job.label)
+        if (job.kind === 'final' && job.sourceKcl.trim().length > 0) agent.lastGoodKcl = job.sourceKcl
+        queueSnapshotPersistence(agent, job.currentRun, snapshotDataUrl, job.sourceKcl)
+        appendAgentLog(agent, `< CAD snapshot captured; persisting: ${job.label}`, 'in')
       } catch (error: unknown) {
         const message = errorToMessage(error)
         appendAgentLog(agent, `< CAD snapshot failed: ${message}`)
+        if (message.includes('blank frame')) {
+          if (
+            job.kind === 'final' &&
+            job.attempt < 1 &&
+            agentStillActive(agent, job.currentRun)
+          ) {
+            snapshotJobs.set(agent.id, { ...job, attempt: job.attempt + 1 })
+            setAgentSnapshotState(agent, 'queued', 'retry after blank frame')
+            appendAgentLog(agent, '< CAD snapshot retrying after blank frame', 'in')
+          } else if (agentStillActive(agent, job.currentRun)) {
+            setAgentSnapshotState(agent, 'error', 'rendered frame contained no visible geometry')
+          }
+          continue
+        }
         await disposeSnapshotView()
-        // A failed renderer was already replaced, so do not recycle it again.
-        snapshotRecycleRequested = false
-        snapshotRecycleReason = ''
         if (job.attempt < 1 && agentStillActive(agent, job.currentRun)) {
           snapshotJobs.set(agent.id, { ...job, attempt: job.attempt + 1 })
+          setAgentSnapshotState(agent, 'queued', 'retry after renderer recovery')
           appendAgentLog(agent, `< CAD snapshot retrying after renderer recovery`, 'in')
+        } else if (agentStillActive(agent, job.currentRun)) {
+          setAgentSnapshotState(agent, 'error', message)
+        }
+      } finally {
+        if (snapshotViewSubmissionCount >= maxSnapshotSubmissionsPerRenderer) {
+          await disposeSnapshotView()
         }
       }
     }
+    if (snapshotJobs.size === 0) await disposeSnapshotView()
   }
 
   const ensureSnapshotDrain = () => {
@@ -1515,23 +1856,45 @@ document.addEventListener('DOMContentLoaded', () => {
     snapshotDrainPromise = drainAgentSnapshots().finally(() => {
       snapshotDrainPromise = undefined
       if (snapshotJobs.size > 0) ensureSnapshotDrain()
+      else scheduleRunCompletionCheck()
     })
   }
 
-  const queueAgentSnapshot = (agent: Agent, currentRun: number, project: RenderProject, label: string) => {
+  const queueAgentSnapshot = (
+    agent: Agent,
+    currentRun: number,
+    project: RenderProject,
+    label: string,
+    kind: SnapshotJob['kind'],
+  ) => {
     if (!useAgentCadSnapshots || !isControllerWindow) return
-    snapshotJobs.set(agent.id, { agentId: agent.id, currentRun, project, label, attempt: 0 })
-    if (agent.snapshotUrl === undefined) setAgentViewerPlaceholder(agent, 'Rendering CAD snapshot')
+    // One intermediary visual is enough to show progress. Once an agent has a
+    // snapshot, or while its first draft is rendering, preserve capacity for
+    // blank agents and final KCL.
+    if (
+      kind === 'draft' &&
+      (
+        agent.snapshotUrl !== undefined ||
+        agent.snapshotState === 'rendering' ||
+        agent.snapshotState === 'persisting' ||
+        snapshotJobs.size >= maxQueuedDraftSnapshots
+      )
+    ) return
+    const sourceKcl = kind === 'final'
+      ? (kclFiles.get(agent.filePath) ?? project.files.get(project.mainFilePath) ?? '')
+      : (project.files.get(project.mainFilePath) ?? '')
+    snapshotJobs.set(agent.id, {
+      agentId: agent.id,
+      currentRun,
+      project,
+      label,
+      kind,
+      attempt: 0,
+      sourceKcl,
+    })
+    setAgentSnapshotState(agent, 'queued', label)
+    if (agent.snapshotUrl === undefined) setAgentViewerPlaceholder(agent, viewerPlaceholderText(agent))
     ensureSnapshotDrain()
-  }
-
-  if (isControllerWindow && useAgentCadSnapshots) {
-    snapshotRecycleTimer = window.setInterval(() => {
-      requestSnapshotViewRecycle('scheduled two-minute recycle')
-    }, snapshotRendererRecycleIntervalMs)
-    window.addEventListener('beforeunload', () => {
-      if (snapshotRecycleTimer !== undefined) window.clearInterval(snapshotRecycleTimer)
-    }, { once: true })
   }
 
   const agentForFilePath = (filePath: string) => Array.from(agents.values())
@@ -1601,6 +1964,20 @@ document.addEventListener('DOMContentLoaded', () => {
     ),
   })
 
+  const requestContextFor = (entryFilePath: string, includeEntry = true) => {
+    const filePaths = renderFilePathsFor(entryFilePath)
+    const project = renderProjectFor(entryFilePath)
+    if (!includeEntry) project.files.delete(renderPathForFilePath(entryFilePath))
+    return {
+      files: objectFromMap(project.files),
+      interfaces: Object.fromEntries(
+        filePaths
+          .filter(filePath => interfaceManifests.has(filePath))
+          .map(filePath => [filePath, interfaceManifests.get(filePath)!]),
+      ) as Record<string, string>,
+    }
+  }
+
   const viewerReloadDelay = (attempt: number) => Math.min(15000, 1000 * 2 ** Math.min(attempt, 4))
 
   const isViewerFailureMessage = (message: string) => {
@@ -1614,6 +1991,11 @@ document.addEventListener('DOMContentLoaded', () => {
       /\b(peerconnection|ice|dtls|srtp).*\b(closed|failed|disconnect|error)\b/,
     ].some(pattern => pattern.test(text))
   }
+
+  const isTransientControlPlaneError = (message: string) => (
+    /\b(failed to fetch|networkerror|load failed|event stream|agent work start|review start|aborterror|connection reset|connection aborted|broken pipe|socket|timed out|timeout|http 50[0234])\b/i
+      .test(message)
+  )
 
   const installViewHealthWatchdog = (
     view: ZooWebView,
@@ -1653,6 +2035,7 @@ document.addEventListener('DOMContentLoaded', () => {
     centerViewerHealthTimer = installViewHealthWatchdog(view, scheduleCenterViewerReload)
 
     view.addEventListener('status', (ev: Event) => {
+      if (view !== centerView) return
       if (!(ev instanceof CustomEvent)) return
       const message = String(ev.detail)
       centerStatus.textContent = `Center view: ${message}`
@@ -1660,32 +2043,111 @@ document.addEventListener('DOMContentLoaded', () => {
     })
 
     view.addEventListener('error', (ev: Event) => {
+      if (view !== centerView) return
       const message = ev instanceof CustomEvent ? errorToMessage(ev.detail) : 'center view error'
       scheduleCenterViewerReload(message)
     })
 
     view.addEventListener('ready', (ev: Event) => {
+      if (view !== centerView) return
       const webView = ev.currentTarget
       if (!(webView instanceof ZooWebView)) return
       centerViewerReloadAttempts = 0
       centerStatus.textContent = 'Center assembly connected'
       submitRootProject()
+      ensureCenterRenderDrain()
     })
   }
 
   async function rebuildCenterViewer(reason: string) {
-    const previousView = centerView
-    centerView = createCenterView()
-    attachCenterViewHandlers(centerView)
-    assemblyRenderer.replaceChildren(centerView.el)
-    await previousView.deconstructor()
-    centerStatus.textContent = 'Center renderer restarting'
-    centerView.start()
-    if (kclFiles.size > 0) scheduleRootProjectSubmit()
-    rootLogLine(`< center renderer recreated: ${reason}`, 'in')
+    if (centerRebuildPromise !== undefined) {
+      await centerRebuildPromise
+      return
+    }
+    const rebuilding = (async () => {
+      const previousView = centerView
+      const candidate = createCenterView()
+      const recoveryProject = lastGoodCenterProject === undefined
+        ? undefined
+        : {
+          files: new Map(lastGoodCenterProject.files),
+          mainFilePath: lastGoodCenterProject.mainFilePath,
+        }
+      candidate.el.classList.add('center-view-staging')
+      assemblyRenderer.append(candidate.el)
+      centerStatus.textContent = 'Center renderer restarting; preserving last good frame'
+      const startedAt = Date.now()
+      try {
+        await withTimeout(new Promise<void>((resolve, reject) => {
+          const cleanup = () => {
+            candidate.removeEventListener('ready', onReady)
+            candidate.removeEventListener('error', onError)
+          }
+          const onReady = () => {
+            cleanup()
+            resolve()
+          }
+          const onError = (ev: Event) => {
+            cleanup()
+            reject(new Error(ev instanceof CustomEvent ? errorToMessage(ev.detail) : 'center staging view error'))
+          }
+          candidate.addEventListener('ready', onReady)
+          candidate.addEventListener('error', onError)
+          candidate.start()
+        }), 30000, 'center renderer restart')
+
+        if (recoveryProject !== undefined) {
+          await withTimeout(
+            submitProject(candidate, recoveryProject, (message) => {
+              throw new Error(message)
+            }),
+            centerRendererSubmitTimeoutMs,
+            'center last-good recovery render',
+          )
+        }
+
+        centerView = candidate
+        candidate.el.classList.remove('center-view-staging')
+        attachCenterViewHandlers(candidate)
+        assemblyRenderer.replaceChildren(candidate.el)
+        centerViewSubmissionCount = recoveryProject === undefined ? 0 : 1
+        centerViewerReloadAttempts = 0
+        centerStatus.textContent = recoveryProject === undefined
+          ? 'Center assembly connected'
+          : 'Center assembly restored'
+        await withTimeout(
+          Promise.resolve(previousView.deconstructor()),
+          snapshotDisposeTimeoutMs,
+          'previous center renderer shutdown',
+        ).catch(() => {})
+        rootLogLine(`< center renderer recovered in ${Math.round((Date.now() - startedAt) / 1000)}s: ${reason}`, 'in')
+        reportRuntimeEvent('center.rebuild.success')
+        submitRootProject()
+        ensureCenterRenderDrain()
+      } catch (error: unknown) {
+        candidate.el.remove()
+        await withTimeout(
+          Promise.resolve(candidate.deconstructor()),
+          snapshotDisposeTimeoutMs,
+          'failed center renderer shutdown',
+        ).catch(() => {})
+        const message = errorToMessage(error)
+        centerStatus.textContent = `Center recovery failed; preserving prior frame: ${message.slice(0, 100)}`
+        rootLogLine(`< center renderer recovery failed; prior frame preserved: ${message}`)
+        reportRuntimeEvent('center.rebuild.error')
+      }
+    })()
+    centerRebuildPromise = rebuilding
+    try {
+      await rebuilding
+    } finally {
+      if (centerRebuildPromise === rebuilding) centerRebuildPromise = undefined
+    }
   }
 
   function scheduleCenterViewerReload(reason: string) {
+    if (!active || runPhase === 'idle' || runPhase === 'finalizing' || runPhase === 'complete') return
+    if (centerRebuildPromise !== undefined) return
     if (centerViewerReloadTimer !== undefined) return
     if (centerViewerReloadAttempts >= maxViewerReloadAttempts) {
       rootLogLine(`< center renderer reload limit reached: ${reason}`)
@@ -1699,18 +2161,87 @@ document.addEventListener('DOMContentLoaded', () => {
     centerStatus.textContent = `Center renderer restarting: ${reason.slice(0, 120)}`
     centerViewerReloadTimer = window.setTimeout(() => {
       centerViewerReloadTimer = undefined
-      void rebuildCenterViewer(reason)
+      if (!active || runPhase === 'idle' || runPhase === 'finalizing' || runPhase === 'complete') return
+      void rebuildCenterViewer(`error recovery: ${reason}`)
     }, delay)
   }
 
+  const drainCenterRenders = async () => {
+    while (centerRenderPending !== undefined) {
+      if (centerRebuildPromise !== undefined) await centerRebuildPromise
+      if (centerView.rtc === undefined) return
+      if (centerViewSubmissionCount >= maxCenterSubmissionsPerRenderer) {
+        await rebuildCenterViewer('bounded renderer lifecycle')
+        return
+      }
+
+      const request = centerRenderPending
+      centerRenderPending = undefined
+      const renderStartedAt = Date.now()
+      try {
+        centerViewSubmissionCount += 1
+        await withTimeout(submitProject(centerView, request.project, () => {}, () => {
+          sendRootCameraCommand(centerView)
+        }), centerRendererSubmitTimeoutMs, `center render ${request.label}`)
+        lastGoodCenterProject = {
+          files: new Map(request.project.files),
+          mainFilePath: request.project.mainFilePath,
+        }
+        reportRuntimeEvent('center.render.success')
+        request.waiters.forEach(waiter => waiter.resolve())
+        if (centerCoalescedRenderCount > 0) {
+          rootLogLine(`< center renderer skipped ${centerCoalescedRenderCount} superseded update${centerCoalescedRenderCount === 1 ? '' : 's'}`, 'in')
+          centerCoalescedRenderCount = 0
+        }
+      } catch (error: unknown) {
+        const renderError = error instanceof Error ? error : new Error(errorToMessage(error))
+        request.waiters.forEach(waiter => waiter.reject(renderError))
+        const message = errorToMessage(error)
+        rootLogLine(`< center render failed after ${Math.round((Date.now() - renderStartedAt) / 1000)}s: ${message}`)
+        reportRuntimeEvent('center.render.error')
+        centerStatus.textContent = `Center KCL failed: ${message}`
+        if (isViewerFailureMessage(message) || message.includes('timed out')) {
+          scheduleCenterViewerReload(message)
+          return
+        }
+      }
+    }
+  }
+
+  function ensureCenterRenderDrain() {
+    if (centerRenderDrainPromise !== undefined) return
+    centerRenderDrainPromise = drainCenterRenders().finally(() => {
+      centerRenderDrainPromise = undefined
+      if (
+        centerRenderPending !== undefined &&
+        centerView.rtc !== undefined &&
+        centerRebuildPromise === undefined
+      ) ensureCenterRenderDrain()
+      else scheduleRunCompletionCheck()
+    })
+  }
+
+  const queueCenterProject = (project: RenderProject, label: string) => new Promise<void>((resolve, reject) => {
+    const waiter: CenterRenderWaiter = { resolve, reject }
+    if (centerRenderPending === undefined) {
+      centerRenderPending = { project, label, waiters: [waiter] }
+    } else {
+      // Every waiting caller is satisfied by the newest complete assembly.
+      centerRenderPending.project = project
+      centerRenderPending.label = label
+      centerRenderPending.waiters.push(waiter)
+      centerCoalescedRenderCount += 1
+    }
+    ensureCenterRenderDrain()
+  })
+
   const submitRootProject = () => {
     if (kclFiles.size === 0) return
-    void submitProject(centerView, renderProjectFor(rootFilePath), (message) => {
+    void queueCenterProject(renderProjectFor(rootFilePath), 'root assembly update').catch((error: unknown) => {
+      const message = errorToMessage(error)
       centerStatus.textContent = `Center KCL failed: ${message}`
       if (isViewerFailureMessage(message)) scheduleCenterViewerReload(message)
-    }, () => {
-      sendRootCameraCommand(centerView)
-    }).catch(() => {})
+    })
   }
 
   const scheduleRootProjectSubmit = () => {
@@ -1749,17 +2280,71 @@ document.addEventListener('DOMContentLoaded', () => {
     viewerSlot.replaceChildren(placeholder)
   }
 
+  const releaseAgentSnapshotDisplay = (agent: Agent) => {
+    agent.snapshotLoadId = (agent.snapshotLoadId ?? 0) + 1
+    agent.viewerSlot?.querySelector<HTMLImageElement>('img.agent-cad-snapshot')?.removeAttribute('src')
+    if (agent.snapshotObjectUrl !== undefined) {
+      URL.revokeObjectURL(agent.snapshotObjectUrl)
+      agent.snapshotObjectUrl = undefined
+    }
+  }
+
+  const shouldDisplayAgentSnapshot = (agent: Agent) => (
+    !isWallTileMode ||
+    (!isControllerWindow && agentTileIndex(agent) === wallTileIndex)
+  )
+
   const setAgentSnapshot = (agent: Agent, snapshotUrl: string) => {
+    agent.snapshotUrl = snapshotUrl
     const viewerSlot = agent.viewerSlot
     if (viewerSlot === undefined) return
-    const image = document.createElement('img')
-    image.classList.add('agent-cad-snapshot')
-    image.alt = `CAD snapshot for ${agent.name}`
-    image.src = snapshotUrl
-    agent.snapshotUrl = snapshotUrl
-    agent.viewPlaceholder = undefined
-    viewerSlot.classList.remove('agent-viewer-queued')
-    viewerSlot.replaceChildren(image)
+    if (!shouldDisplayAgentSnapshot(agent)) {
+      releaseAgentSnapshotDisplay(agent)
+      return
+    }
+    const loadId = (agent.snapshotLoadId ?? 0) + 1
+    agent.snapshotLoadId = loadId
+
+    void (async () => {
+      const response = await runFetchWithTimeout(
+        snapshotUrl,
+        { cache: 'no-store' },
+        snapshotImageFetchTimeoutMs,
+        'snapshot image fetch',
+      )
+      if (!response.ok) throw await httpErrorFromResponse(response, 'snapshot image')
+      const objectUrl = URL.createObjectURL(await response.blob())
+      if (agent.snapshotLoadId !== loadId || agent.snapshotUrl !== snapshotUrl) {
+        URL.revokeObjectURL(objectUrl)
+        return
+      }
+
+      const image = document.createElement('img')
+      image.classList.add('agent-cad-snapshot')
+      image.alt = `CAD snapshot for ${agent.name}`
+      image.decoding = 'async'
+      image.src = objectUrl
+      await image.decode()
+
+      if (agent.snapshotLoadId !== loadId || agent.snapshotUrl !== snapshotUrl) {
+        image.removeAttribute('src')
+        URL.revokeObjectURL(objectUrl)
+        return
+      }
+
+      const previousImage = viewerSlot.querySelector<HTMLImageElement>('img.agent-cad-snapshot')
+      previousImage?.removeAttribute('src')
+      const previousObjectUrl = agent.snapshotObjectUrl
+      agent.snapshotObjectUrl = objectUrl
+      agent.viewPlaceholder = undefined
+      viewerSlot.classList.remove('agent-viewer-queued')
+      viewerSlot.replaceChildren(image)
+      if (previousObjectUrl !== undefined) URL.revokeObjectURL(previousObjectUrl)
+    })().catch((error: unknown) => {
+      if (agent.snapshotLoadId !== loadId) return
+      appendAgentLog(agent, `< snapshot display failed: ${errorToMessage(error)}`)
+      if (agent.snapshotObjectUrl === undefined) setAgentViewerPlaceholder(agent, 'Snapshot unavailable')
+    })
   }
 
   const clearAgentViewerTimers = (agent: Agent) => {
@@ -1785,6 +2370,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function scheduleAgentViewerReload(agent: Agent, reason: string) {
+    if (!active || runPhase === 'idle' || runPhase === 'finalizing' || runPhase === 'complete') return
     if (!shouldRenderAgentLocally(agent) || isReusableLibraryAgent(agent)) return
     if (agent.viewerReloadTimer !== undefined) return
     if (agent.viewerReloadAttempts !== undefined && agent.viewerReloadAttempts >= maxViewerReloadAttempts) {
@@ -1799,6 +2385,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setAgentViewerPlaceholder(agent, `Renderer restarting: ${reason.slice(0, 120)}`)
     agent.viewerReloadTimer = window.setTimeout(() => {
       agent.viewerReloadTimer = undefined
+      if (!active || runPhase === 'idle' || runPhase === 'finalizing' || runPhase === 'complete') return
       void (async () => {
         await disposeAgentView(agent)
         if (!agents.has(agent.id)) return
@@ -1876,7 +2463,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (isReusableLibraryAgent(agent)) return { ok: true, message: 'BOM library is metadata only' }
     if (useAgentCadSnapshots) {
       if (!isControllerWindow) return { ok: true, message: 'snapshot rendered by controller' }
-      queueAgentSnapshot(agent, runId, renderProjectFor(agent.filePath), 'latest KCL')
+      queueAgentSnapshot(agent, runId, renderProjectFor(agent.filePath), 'latest KCL', 'final')
       onSuccess?.()
       return { ok: true, message: 'CAD snapshot queued' }
     }
@@ -1902,7 +2489,11 @@ document.addEventListener('DOMContentLoaded', () => {
       }, onSuccess)
       return { ok: true }
     } catch (error: unknown) {
-      if (viewerFailure || isViewerFailureMessage(failureMessage || errorToMessage(error))) {
+      if (
+        viewerFailure ||
+        isViewerFailureMessage(failureMessage || errorToMessage(error)) ||
+        errorToMessage(error).includes('timed out')
+      ) {
         scheduleAgentViewerReload(agent, failureMessage || errorToMessage(error))
         return { ok: true, message: 'renderer restarting after transport error' }
       }
@@ -1924,7 +2515,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const setWorkAgentStatus = (agent: Agent, status: AgentStatus) => {
     if (agent.id === rootAgentId) {
+      rootStatus = status
       renderAllGraphs()
+      scheduleRunCompletionCheck()
       return
     }
     setAgentStatus(agent, status)
@@ -1941,30 +2534,20 @@ document.addEventListener('DOMContentLoaded', () => {
   const submitWorkAgentProject = async (agent: Agent, onSuccess?: () => void): Promise<RenderResult> => {
     if (agent.id !== rootAgentId) return submitAgentProject(agent, onSuccess)
     if (kclFiles.size === 0) return { ok: false, message: 'root view not ready' }
-    let viewerFailure = false
-    let failureMessage = ''
     try {
-      await submitProject(centerView, renderProjectFor(rootFilePath), (message) => {
-        failureMessage = message
-        if (isViewerFailureMessage(message)) {
-          viewerFailure = true
-          scheduleCenterViewerReload(message)
-          rootLogLine(`root renderer transport failed: ${message}`)
-          return
-        }
-        centerStatus.textContent = `Center KCL failed: ${message}`
-        rootLogLine(`root kcl failed: ${message}`)
-      }, () => {
-        sendRootCameraCommand(centerView)
-        onSuccess?.()
-      })
+      await queueCenterProject(renderProjectFor(rootFilePath), 'root agent result')
+      onSuccess?.()
       return { ok: true }
     } catch (error: unknown) {
-      if (viewerFailure || isViewerFailureMessage(failureMessage || errorToMessage(error))) {
-        scheduleCenterViewerReload(failureMessage || errorToMessage(error))
+      const message = errorToMessage(error)
+      if (isViewerFailureMessage(message) || message.includes('timed out')) {
+        scheduleCenterViewerReload(message)
+        rootLogLine(`root renderer transport failed: ${message}`)
         return { ok: true, message: 'center renderer restarting after transport error' }
       }
-      return { ok: false, message: errorToMessage(error) }
+      centerStatus.textContent = `Center KCL failed: ${message}`
+      rootLogLine(`root kcl failed: ${message}`)
+      return { ok: false, message }
     }
   }
 
@@ -1982,7 +2565,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const entryFilePath = agent.id === rootAgentId ? rootFilePath : agent.filePath
     if (agent.id !== rootAgentId && useAgentCadSnapshots) {
       if (!isControllerWindow) return { ok: true, message: 'snapshot rendered by controller' }
-      queueAgentSnapshot(agent, currentRun, renderProjectForDraft(entryFilePath, draftKcl), `draft KCL ${draftIndex}`)
+      queueAgentSnapshot(agent, currentRun, renderProjectForDraft(entryFilePath, draftKcl), `draft KCL ${draftIndex}`, 'draft')
       return { ok: true, message: 'CAD snapshot queued' }
     }
     if (agent.id !== rootAgentId && !shouldRenderAgentLocally(agent)) {
@@ -1998,18 +2581,24 @@ document.addEventListener('DOMContentLoaded', () => {
     let failureMessage = ''
     let viewerFailure = false
     try {
-      await submitProject(view, renderProjectForDraft(entryFilePath, draftKcl), (message) => {
-        failureMessage = message
-        if (!isViewerFailureMessage(message)) return
-        viewerFailure = true
-        if (agent.id === rootAgentId) scheduleCenterViewerReload(message)
-        else scheduleAgentViewerReload(agent, message)
-      }, () => {
-        if (agent.id === rootAgentId) sendRootCameraCommand(centerView)
-      })
+      const project = renderProjectForDraft(entryFilePath, draftKcl)
+      if (agent.id === rootAgentId) {
+        await queueCenterProject(project, `root draft ${draftIndex}`)
+      } else {
+        await submitProject(view, project, (message) => {
+          failureMessage = message
+          if (!isViewerFailureMessage(message)) return
+          viewerFailure = true
+          scheduleAgentViewerReload(agent, message)
+        })
+      }
       return { ok: true }
     } catch (error: unknown) {
-      if (viewerFailure || isViewerFailureMessage(failureMessage || errorToMessage(error))) {
+      if (
+        viewerFailure ||
+        isViewerFailureMessage(failureMessage || errorToMessage(error)) ||
+        errorToMessage(error).includes('timed out')
+      ) {
         const message = failureMessage || errorToMessage(error)
         if (agent.id === rootAgentId) scheduleCenterViewerReload(message)
         else scheduleAgentViewerReload(agent, message)
@@ -2019,11 +2608,25 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  const queueDraftRender = (agent: Agent, currentRun: number, draftKcl: string, draftIndex: number) => {
-    broadcastWall({ type: 'agent:draft', agentId: agent.id, kcl: draftKcl, draftIndex })
+  const queueDraftRender = (
+    agent: Agent,
+    currentRun: number,
+    draftKcl: string,
+    draftIndex: number,
+    workRevision?: number,
+  ) => {
+    if (workRevision !== undefined && agentWorkRevisions.get(agent.id) !== workRevision) return
+    if (!useAgentCadSnapshots) {
+      broadcastWall({ type: 'agent:draft', agentId: agent.id, kcl: draftKcl, draftIndex })
+    }
+    if (agent.id === rootAgentId && draftIndex > maxRootDraftVisualizations) {
+      appendWorkAgentLog(agent, `< draft KCL ${draftIndex}; reasoning streamed, intermediary CAD render skipped`, 'in')
+      return
+    }
     const chain = draftRenderChains.get(agent.id) ?? Promise.resolve()
     const next = chain.catch(() => {}).then(async () => {
       if (!active || !agentStillActive(agent, currentRun)) return
+      if (workRevision !== undefined && agentWorkRevisions.get(agent.id) !== workRevision) return
       appendWorkAgentLog(agent, `< draft KCL ${draftIndex}; rendering intermediary`, 'in')
       const result = await submitDraftWorkAgentProject(agent, currentRun, draftKcl, draftIndex)
       if (!active || !agentStillActive(agent, currentRun)) return
@@ -2203,6 +2806,11 @@ document.addEventListener('DOMContentLoaded', () => {
     return files
   }
 
+  const reviewInterfacesFor = (agent: Agent) => {
+    const entryFilePath = agent.id === rootAgentId ? rootFilePath : agent.filePath
+    return requestContextFor(entryFilePath).interfaces
+  }
+
   const agentKclReady = (agent: Agent) => stripImportLines(kclFiles.get(agent.filePath) ?? '')
     .split('\n')
     .map(line => line.replace(/\/\/.*$/, '').trim())
@@ -2328,7 +2936,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   const scheduleOrchestratorPlacement = (parent: Agent, changedChild: Agent, extraInstruction = '') => {
-    if (!active || parent.kind !== 'orchestrator') return
+    if (!active || runPhase !== 'running' || parent.kind !== 'orchestrator') return
     if (!placementReady(parent)) {
       appendWorkAgentLog(parent, `< placement waiting for first renderable direct child`, 'in')
       return
@@ -2345,14 +2953,18 @@ document.addEventListener('DOMContentLoaded', () => {
     placementTimers.set(parent.id, timer)
   }
 
-  const requestOrchestratorReview = async (parent: Agent, changedChild: Agent, currentRun: number) => {
-    if (currentRun !== runId || !active) return
+  const requestOrchestratorReview = async (
+    parent: Agent,
+    changedChild: Agent,
+    currentRun: number,
+  ): Promise<boolean> => {
+    if (currentRun !== runId || !active || runPhase !== 'running') return false
 
     const children = reviewWorkerTargets(parent)
     const readyChildren = children.filter(workerBodyReady)
     if (readyChildren.length === 0) {
       reviewLogLine(parent, '< visual review waiting for the first child KCL result', 'in')
-      return
+      return true
     }
     const pendingChildren = pendingWorkerTargets(parent)
     if (pendingChildren.length > 0) {
@@ -2365,10 +2977,7 @@ document.addEventListener('DOMContentLoaded', () => {
     reviewLogLine(parent, `-> visual review ${reviewCount + 1} after ${changedChild.role} update`, 'out')
 
     try {
-      const response = await fetch('/api/zookeeper/review', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
+      const review = await requestReviewStream(parent, currentRun, {
           sessionId: activeSessionId,
           prompt: promptInput.value.trim() || defaultPrompt,
           agent: {
@@ -2408,12 +3017,9 @@ document.addEventListener('DOMContentLoaded', () => {
             imports: agent.imports ?? [],
           })),
           files: reviewFilesFor(parent),
-          interfaces: objectFromMap(interfaceManifests),
-        }),
+          interfaces: reviewInterfacesFor(parent),
       })
-      if (!response.ok) throw await httpErrorFromResponse(response, 'review')
-      const review = await response.json() as AgentReviewResponse
-      if (currentRun !== runId || !active) return
+      if (currentRun !== runId || !active) return false
 
       review.dialog?.slice(-2).forEach(line => reviewLogLine(parent, `< review ws: ${line}`, 'in'))
       reviewLogLine(parent, `< visual review: ${review.summary}`, 'in')
@@ -2423,7 +3029,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       if (review.rework.length === 0) {
         reviewLogLine(parent, '< visual review: no child rework requested', 'in')
-        return
+        return true
       }
 
       review.rework.forEach((item) => {
@@ -2449,20 +3055,82 @@ document.addEventListener('DOMContentLoaded', () => {
         appendAgentLog(target, `-> orchestrator rework: ${instruction}`, 'out')
         void requestAgentWork(target, currentRun, '', 0, instruction)
       })
+      return true
     } catch (error: unknown) {
-      if (currentRun !== runId || !active) return
+      if (currentRun !== runId || !active) return false
       reviewLogLine(parent, `< visual review failed: ${errorToMessage(error)}`)
+      return false
     }
   }
 
+  const reviewRevisionFor = (parent: Agent) => {
+    let hash = 2166136261
+    const append = (value: string) => {
+      for (let index = 0; index < value.length; index += 1) {
+        hash ^= value.charCodeAt(index)
+        hash = Math.imul(hash, 16777619)
+      }
+    }
+    const files = reviewFilesFor(parent)
+    Object.keys(files).sort().forEach((filePath) => {
+      append(filePath)
+      append(files[filePath] ?? '')
+    })
+    const interfaces = reviewInterfacesFor(parent)
+    Object.keys(interfaces).sort().forEach((filePath) => {
+      append(filePath)
+      append(interfaces[filePath] ?? '')
+    })
+    reviewWorkerTargets(parent).forEach((agent) => append(`${agent.id}:${agent.status}:${agent.filePath}`))
+    return `${Object.keys(files).length}:${(hash >>> 0).toString(16)}`
+  }
+
+  function drainReviewQueue() {
+    while (activeReviewRequests.size < maxConcurrentReviews && reviewQueue.size > 0) {
+      const next = reviewQueue.entries().next().value as [string, QueuedReview] | undefined
+      if (next === undefined) return
+      const [parentId, request] = next
+      reviewQueue.delete(parentId)
+      if (!agentStillActive(request.parent, request.currentRun) || runPhase !== 'running') continue
+      if (completedReviewRevisions.get(parentId) === request.revision) continue
+
+      activeReviewRequests.add(parentId)
+      activeReviewRevisions.set(parentId, request.revision)
+      void requestOrchestratorReview(request.parent, request.changedChild, request.currentRun)
+        .then((completed) => {
+          if (completed && request.currentRun === runId) {
+            completedReviewRevisions.set(parentId, request.revision)
+          }
+        })
+        .finally(() => {
+          activeReviewRequests.delete(parentId)
+          activeReviewRevisions.delete(parentId)
+          scheduleRunCompletionCheck()
+          drainReviewQueue()
+        })
+    }
+  }
+
+  const enqueueOrchestratorReview = (parent: Agent, changedChild: Agent, currentRun: number) => {
+    if (!agentStillActive(parent, currentRun) || runPhase !== 'running') return
+    const revision = reviewRevisionFor(parent)
+    if (
+      completedReviewRevisions.get(parent.id) === revision ||
+      activeReviewRevisions.get(parent.id) === revision ||
+      reviewQueue.get(parent.id)?.revision === revision
+    ) return
+    reviewQueue.set(parent.id, { parent, changedChild, currentRun, revision })
+    drainReviewQueue()
+  }
+
   const scheduleOrchestratorReview = (parent: Agent, changedChild: Agent) => {
-    if (!active) return
+    if (!active || runPhase !== 'running') return
     const currentRun = runId
     const existing = reviewTimers.get(parent.id)
     if (existing !== undefined) window.clearTimeout(existing)
     const timer = window.setTimeout(() => {
       reviewTimers.delete(parent.id)
-      void requestOrchestratorReview(parent, changedChild, currentRun)
+      enqueueOrchestratorReview(parent, changedChild, currentRun)
     }, 1800)
     reviewTimers.set(parent.id, timer)
   }
@@ -2518,6 +3186,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const markAgentFailedAndRefreshAncestors = (agent: Agent, currentRun: number, reason: string) => {
     if (!agentStillActive(agent, currentRun)) return
+    if (agent.lastGoodKcl !== undefined && agent.lastGoodKcl.trim().length > 0) {
+      kclFiles.set(agent.filePath, agent.lastGoodKcl)
+      updateInterfaceManifest(agent, agent.lastGoodKcl)
+      setWorkAgentStatus(agent, 'complete')
+      if (agent.lastGoodSnapshotUrl !== undefined && agent.snapshotUrl !== agent.lastGoodSnapshotUrl) {
+        setAgentSnapshotState(agent, 'ready', 'restored last good CAD snapshot')
+        setAgentSnapshot(agent, agent.lastGoodSnapshotUrl)
+      }
+      appendWorkAgentLog(agent, `< update failed; retained last validated KCL${reason ? ` (${reason})` : ''}`, 'in')
+      refreshAncestorProjects(agent)
+      return
+    }
     let parentId = agent.parentId
     while (parentId !== '') {
       if (parentId === rootAgentId) {
@@ -2635,9 +3315,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const viewerPlaceholderText = (agent: Agent) => {
     if (agent.status === 'running' || agent.status === 'reviewing') return 'Awaiting Zookeeper result'
-    if (agent.status === 'complete') return agent.snapshotUrl === undefined
-      ? 'KCL complete - snapshot pending'
-      : 'Zookeeper result ready'
+    if (agent.status === 'complete') {
+      if (isReusableLibraryAgent(agent)) return 'KCL complete - metadata only'
+      if (agent.snapshotState === 'error') return 'KCL propagated - visual unavailable'
+      if (agent.snapshotState === 'rendering') return 'KCL propagated - rendering visual'
+      if (agent.snapshotState === 'persisting') return 'KCL propagated - saving visual'
+      if (agent.snapshotState === 'queued' || agent.snapshotUrl === undefined) {
+        return 'KCL propagated - visual queued'
+      }
+      return 'Zookeeper result ready'
+    }
     if (agent.status === 'error') return 'Zookeeper error'
     return 'Awaiting Zookeeper assignment'
   }
@@ -2672,6 +3359,7 @@ document.addEventListener('DOMContentLoaded', () => {
     updateAggregateTime()
     renderAllGraphs()
     broadcastWall({ type: 'agent:status', agentId: agent.id, status })
+    scheduleRunCompletionCheck()
   }
 
   const appendAgentLog = (agent: Agent, line: string, direction: 'in' | 'out' | 'sys' = 'sys') => {
@@ -2704,8 +3392,13 @@ document.addEventListener('DOMContentLoaded', () => {
       logWallAgentCap()
       return false
     }
-    createAgentPanel(agent)
     agents.set(agent.id, agent)
+    if (
+      !isWallTileMode ||
+      (!isControllerWindow && agentTileIndex(agent) === wallTileIndex)
+    ) {
+      createAgentPanel(agent)
+    }
     layoutAgents()
     renderAllGraphs()
     broadcastWall({
@@ -2757,8 +3450,11 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   const updateProjectFile = (filePath: string, kcl: string) => {
+    if (kclFiles.get(filePath) === kcl) return
     kclFiles.set(filePath, kcl)
-    broadcastWall({ type: 'project:file', filePath, kcl })
+    completionCandidateAtMs = undefined
+    if (!useAgentCadSnapshots) broadcastWall({ type: 'project:file', filePath, kcl })
+    scheduleRunCompletionCheck()
   }
 
   const syncReusableLibraryMetadata = (library: Agent) => {
@@ -2785,6 +3481,16 @@ document.addEventListener('DOMContentLoaded', () => {
     .filter(child => !isReusableLibraryAgent(child))
     .filter(placementComponentReady)
     .map(child => child.filePath)
+
+  const allowedAssemblyImports = (agent: Agent) => (agent.imports ?? [])
+    .filter((filePath) => {
+      const dependency = agentForFilePath(filePath)
+      return (
+        dependency === undefined ||
+        dependency.parentId === agent.id ||
+        dependency.scope === 'shared_part'
+      )
+    })
 
   const hasVisibleChildPlacement = (body: string, filePath: string) => {
     const alias = escapeRegExp(aliasForFilePath(filePath))
@@ -2841,7 +3547,7 @@ document.addEventListener('DOMContentLoaded', () => {
     updateProjectFile(filePath, assemblyFileWithCurrentChildren(
       kclFiles.get(filePath) ?? '',
       childFiles,
-      agent.imports ?? [],
+      allowedAssemblyImports(agent),
     ))
   }
 
@@ -3123,13 +3829,19 @@ document.addEventListener('DOMContentLoaded', () => {
     void requestAgentWork(agent, currentRun)
   }
 
-  const requestSubassemblyBom = async (agent: Agent, currentRun: number) => {
+  const requestSubassemblyBom = async (agent: Agent, currentRun: number, retryAttempt = 0) => {
     if (!agentStillActive(agent, currentRun) || agent.kind !== 'orchestrator' || isReusableLibraryAgent(agent)) return
     if (bomPlanningAgentIds.has(agent.id)) return
     if (remainingWallAgentSlots() <= 0) {
       logWallAgentCap()
-      appendWorkAgentLog(agent, '< direct BOM planning skipped: wall agent capacity reached', 'in')
-      setWorkAgentStatus(agent, 'complete')
+      appendWorkAgentLog(agent, '< direct BOM capacity exhausted; generating this scope as one terminal sub-assembly', 'in')
+      void requestAgentWork(
+        agent,
+        currentRun,
+        '',
+        0,
+        'No child agent slots remain. Generate one complete, renderable KCL sub-assembly for this assigned scope directly. Do not leave an imports-only or empty file. Include a ZOOKEEPER_INTERFACE block so the parent can place the result.',
+      )
       return
     }
     if (graphChildren(agent.id).some(child => !isReusableLibraryAgent(child))) {
@@ -3141,6 +3853,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setWorkAgentStatus(agent, 'running')
     appendWorkAgentLog(agent, '-> hosted Zookeeper: plan direct BOM', 'out')
     try {
+      const context = requestContextFor(agent.filePath)
       const update = await requestAgentWorkStream(agent, currentRun, {
         sessionId: activeSessionId,
         prompt: promptInput.value.trim() || defaultPrompt,
@@ -3156,7 +3869,7 @@ document.addEventListener('DOMContentLoaded', () => {
           filePath: agent.filePath,
           imports: agent.imports ?? [],
         },
-        files: objectFromMap(kclFiles),
+        files: context.files,
         remainingAgentSlots: remainingWallAgentSlots(),
         wallMaxAgents: maxWallAgents,
         knownAgents: Array.from(agents.values()).map(candidate => ({
@@ -3189,28 +3902,327 @@ document.addEventListener('DOMContentLoaded', () => {
       syncAssemblyFileImports(agent)
       const skipped = update.children.length - spawned.size
       appendWorkAgentLog(agent, `< direct BOM accepted: ${spawned.size} child agent${spawned.size === 1 ? '' : 's'}; dispatching concurrently${skipped > 0 ? `; ${skipped} omitted at wall capacity` : ''}`, 'in')
+      if (spawned.size === 0) {
+        appendWorkAgentLog(agent, '< direct BOM returned no dispatchable children; generating a terminal sub-assembly instead', 'in')
+        await requestAgentWork(
+          agent,
+          currentRun,
+          '',
+          0,
+          'The direct BOM produced no dispatchable child agents. Generate one complete, renderable KCL sub-assembly for this assigned scope directly. Do not return an imports-only or empty file. Include a ZOOKEEPER_INTERFACE block for parent placement.',
+        )
+        return
+      }
       setWorkAgentStatus(agent, 'reviewing')
       Array.from(spawned.values()).forEach((child) => startSubassemblyBomChild(child, currentRun))
     } catch (error: unknown) {
       if (!agentStillActive(agent, currentRun)) return
-      appendWorkAgentLog(agent, `< direct BOM planning failed: ${errorToMessage(error)}`)
+      const message = errorToMessage(error)
+      if (isTransientControlPlaneError(message) && retryAttempt < maxZooFallbackRetries) {
+        const nextRetry = retryAttempt + 1
+        appendWorkAgentLog(agent, `< direct BOM control-plane interruption: ${message}`, 'in')
+        appendWorkAgentLog(agent, `-> retrying direct BOM ${nextRetry}/${maxZooFallbackRetries}`, 'out')
+        bomPlanningAgentIds.delete(agent.id)
+        await wait(zooFallbackRetryBackoffMs * nextRetry)
+        if (agentStillActive(agent, currentRun)) await requestSubassemblyBom(agent, currentRun, nextRetry)
+        return
+      }
+      appendWorkAgentLog(agent, `< direct BOM planning failed: ${message}`)
       setWorkAgentStatus(agent, 'error')
-      markAgentFailedAndRefreshAncestors(agent, currentRun, errorToMessage(error))
+      markAgentFailedAndRefreshAncestors(agent, currentRun, message)
     } finally {
       bomPlanningAgentIds.delete(agent.id)
     }
+  }
+
+  const assemblyCoverageIssues = () => {
+    const rootAgent = graphNode(rootAgentId)
+    if (rootAgent === undefined) return ['root agent is unavailable']
+    const issues: string[] = []
+    const assemblyAgents = [
+      rootAgent,
+      ...Array.from(agents.values())
+        .filter(agent => agent.kind === 'orchestrator' && !isReusableLibraryAgent(agent)),
+    ]
+
+    for (const agent of agents.values()) {
+      if (isReusableLibraryAgent(agent)) continue
+      if (!agentKclReady(agent)) issues.push(`${agent.role}: no renderable KCL body`)
+    }
+
+    for (const parent of assemblyAgents) {
+      const filePath = parent.id === rootAgentId ? rootFilePath : parent.filePath
+      const source = kclFiles.get(filePath) ?? ''
+      if (!agentKclReady(parent)) issues.push(`${parent.role}: assembly file has no renderable body`)
+      const expectedComponents = [...reviewChildren(parent), ...importedAgentsFor(parent)]
+        .filter(component => !isReusableLibraryAgent(component))
+        .filter(component => component.status === 'complete')
+      const seen = new Set<string>()
+      expectedComponents.forEach((component) => {
+        if (seen.has(component.filePath)) return
+        seen.add(component.filePath)
+        const importLine = `import "${renderPathForFilePath(component.filePath)}" as ${aliasForFilePath(component.filePath)}`
+        if (!source.includes(importLine)) {
+          issues.push(`${parent.role}: missing import for ${component.role}`)
+          return
+        }
+        if (!hasVisibleChildPlacement(source, component.filePath)) {
+          issues.push(`${parent.role}: ${component.role} is imported but not composed`)
+        }
+      })
+    }
+    return [...new Set(issues)]
+  }
+
+  const synchronizeCompletedAssemblies = () => {
+    const depth = (agent: Agent) => {
+      let value = 0
+      let parentId = agent.parentId
+      while (parentId !== '' && parentId !== rootAgentId) {
+        value += 1
+        parentId = agents.get(parentId)?.parentId ?? ''
+      }
+      return value
+    }
+    Array.from(agents.values())
+      .filter(agent => agent.kind === 'orchestrator' && !isReusableLibraryAgent(agent))
+      .sort((left, right) => depth(right) - depth(left))
+      .forEach(syncAssemblyFileImports)
+    syncRootFileImports()
+  }
+
+  const runHasPendingWork = () => (
+    timers.size > 0 ||
+    reviewTimers.size > 0 ||
+    placementTimers.size > 0 ||
+    draftRenderChains.size > 0 ||
+    activeAgentWorkIds.size > 0 ||
+    pendingAgentWorkRequests.size > 0 ||
+    snapshotJobs.size > 0 ||
+    snapshotPersistenceJobs.size > 0 ||
+    workWaiters.size > 0 ||
+    bomPlanningAgentIds.size > 0 ||
+    activeReviewRequests.size > 0 ||
+    reviewQueue.size > 0 ||
+    reviewWaiters.size > 0 ||
+    snapshotDrainPromise !== undefined ||
+    snapshotPersistenceDrainPromise !== undefined ||
+    snapshotViewStarting !== undefined ||
+    snapshotViewDisposing !== undefined ||
+    centerRenderPending !== undefined ||
+    centerRenderDrainPromise !== undefined ||
+    centerRebuildPromise !== undefined ||
+    rootRenderTimer !== undefined ||
+    graphRenderTimer !== undefined ||
+    layoutTimer !== undefined ||
+    centerViewerReloadTimer !== undefined
+  )
+
+  const runHasCompleteVisuals = () => Array.from(agents.values()).every(agent => (
+    isReusableLibraryAgent(agent) ||
+    (
+      agent.snapshotState === 'ready' &&
+      typeof agent.snapshotUrl === 'string' &&
+      agent.snapshotUrl.length > 0
+    )
+  ))
+
+  const recoverAgentVisual = (agent: Agent, currentRun: number, now: number) => {
+    if (
+      !useAgentCadSnapshots ||
+      isReusableLibraryAgent(agent) ||
+      agent.status !== 'complete' ||
+      (agent.snapshotState === 'ready' && agent.snapshotUrl !== undefined) ||
+      agent.snapshotState === 'queued' ||
+      agent.snapshotState === 'rendering' ||
+      agent.snapshotState === 'persisting'
+    ) return false
+
+    const lastRecovery = agent.lastSnapshotRecoveryAtMs ?? 0
+    if (now - lastRecovery < snapshotRecoveryCooldownMs) return false
+    agent.lastSnapshotRecoveryAtMs = now
+    agent.snapshotRecoveryCount = (agent.snapshotRecoveryCount ?? 0) + 1
+    const recovery = agent.snapshotRecoveryCount
+
+    if (agent.snapshotState === 'error' && recovery % snapshotRetriesBeforeKclRepair === 0) {
+      const reason = agent.snapshotMessage || 'snapshot contained no visible geometry'
+      appendWorkAgentLog(agent, `< visual supervisor requesting KCL repair after ${recovery} failed snapshot attempts: ${reason}`, 'in')
+      void requestAgentWork(
+        agent,
+        currentRun,
+        reason,
+        0,
+        'The final CAD snapshot is blank or unavailable. Inspect the current KCL, ensure it produces visible solid geometry or a visible imported assembly, preserve the assigned scope, and return corrected renderable KCL.',
+      )
+      return true
+    }
+
+    appendWorkAgentLog(agent, `< visual supervisor retrying final snapshot ${recovery}`, 'in')
+    queueAgentSnapshot(agent, currentRun, renderProjectFor(agent.filePath), `final visual recovery ${recovery}`, 'final')
+    return true
+  }
+
+  const replaceCenterWithStaticSnapshot = async (snapshotUrl: string) => {
+    const image = document.createElement('img')
+    image.classList.add('agent-cad-snapshot', 'orchestrator-final-snapshot')
+    image.alt = 'Completed root CAD assembly'
+    image.decoding = 'async'
+    image.src = snapshotUrl
+    await withTimeout(image.decode(), 20000, 'final root snapshot decode')
+    assemblyRenderer.replaceChildren(image)
+  }
+
+  const stopCompletedRunRuntime = async () => {
+    if (supervisorTimer !== undefined) {
+      window.clearInterval(supervisorTimer)
+      supervisorTimer = undefined
+    }
+    if (aggregateTimeTimer !== undefined) {
+      window.clearInterval(aggregateTimeTimer)
+      aggregateTimeTimer = undefined
+    }
+    if (centerViewerHealthTimer !== undefined) {
+      window.clearInterval(centerViewerHealthTimer)
+      centerViewerHealthTimer = undefined
+    }
+    if (centerViewerReloadTimer !== undefined) {
+      window.clearTimeout(centerViewerReloadTimer)
+      centerViewerReloadTimer = undefined
+    }
+    if (completionCheckTimer !== undefined) {
+      window.clearTimeout(completionCheckTimer)
+      completionCheckTimer = undefined
+    }
+    clearCameraTimers()
+    closeActiveSession('run complete')
+    runRequestAbort?.abort()
+    runRequestAbort = undefined
+    workEventAbort?.abort()
+    workEventAbort = undefined
+    workEventSessionId = ''
+    await disposeSnapshotView()
+    await centerView.deconstructor()
+    snapshotCanvas.width = 1
+    snapshotCanvas.height = 1
+  }
+
+  async function finalizeCompletedRun(currentRun: number) {
+    if (finalizationPromise !== undefined || currentRun !== runId || !active) return
+    const finalizing = (async () => {
+      setRunPhase('finalizing', 'reviewing')
+      centerStatus.textContent = 'Finalizing complete assembly'
+      rootLogLine('< completion gate passed; rendering final root assembly', 'in')
+
+      synchronizeCompletedAssemblies()
+      const finalProject = renderProjectFor(rootFilePath)
+      await queueCenterProject(finalProject, 'final complete root assembly')
+      sendRootCameraCommand(centerView)
+      const snapshotDataUrl = await captureSnapshotDataUrl(centerView)
+      let snapshotUrl = snapshotDataUrl
+      try {
+        snapshotUrl = await persistSnapshot(rootAgentId, snapshotDataUrl)
+      } catch (error: unknown) {
+        rootLogLine(`< final root snapshot persistence failed; retaining bounded in-memory image: ${errorToMessage(error)}`, 'in')
+      }
+      if (currentRun !== runId) return
+
+      const projectArtifact = await persistCompletedProject()
+      rootLogLine(
+        `< completed KCL project persisted: ${projectArtifact.fileCount} files, ${projectArtifact.fileBytes} bytes at ${projectArtifact.path}`,
+        'in',
+      )
+      await replaceCenterWithStaticSnapshot(snapshotUrl)
+      await stopCompletedRunRuntime()
+      if (currentRun !== runId) return
+
+      if (rootActiveStartedAtMs !== undefined) {
+        rootElapsedMs += Math.max(0, Date.now() - rootActiveStartedAtMs)
+        rootActiveStartedAtMs = undefined
+      }
+      active = false
+      startInProgress = false
+      completionCandidateAtMs = undefined
+      kclFiles = new Map()
+      interfaceManifests = new Map()
+      updateAggregateTime()
+      setRunPhase('complete', 'complete')
+      centerStatus.textContent = 'Run complete - static assembly'
+      startButton.disabled = false
+      startButton.textContent = 'Start New Run'
+      stopButton.disabled = false
+      rootLogLine('< run complete: every agent, assembly import, visual, and persistence queue settled', 'in')
+      rootLogLine('< runtime quiesced: WebRTC renderers, event stream, watchdogs, and agent timers stopped', 'in')
+      broadcastWall({ type: 'run:complete' })
+    })()
+    finalizationPromise = finalizing
+    try {
+      await finalizing
+    } catch (error: unknown) {
+      if (currentRun === runId) {
+        rootLogLine(`< finalization deferred: ${errorToMessage(error)}`)
+        centerStatus.textContent = `Finalization retry: ${errorToMessage(error).slice(0, 120)}`
+        completionCandidateAtMs = undefined
+        setRunPhase('running', 'complete')
+        scheduleCenterViewerReload(errorToMessage(error))
+        scheduleRunCompletionCheck(runCompletionRetryMs)
+      }
+    } finally {
+      if (finalizationPromise === finalizing) finalizationPromise = undefined
+    }
+  }
+
+  function scheduleRunCompletionCheck(delayMs = 250) {
+    if (!isControllerWindow || !active || runPhase !== 'running') return
+    if (completionCheckTimer !== undefined) return
+    completionCheckTimer = window.setTimeout(() => {
+      completionCheckTimer = undefined
+      if (!active || runPhase !== 'running') return
+      if (agents.size === 0 || Array.from(agents.values()).some(agent => agent.status !== 'complete')) {
+        completionCandidateAtMs = undefined
+        return
+      }
+
+      synchronizeCompletedAssemblies()
+      const coverageIssues = assemblyCoverageIssues()
+      if (coverageIssues.length > 0 || !runHasCompleteVisuals() || runHasPendingWork() || rootStatus !== 'complete') {
+        root.dataset.completionBlockers = [
+          ...coverageIssues.slice(0, 4),
+          !runHasCompleteVisuals() ? 'agent visuals pending' : '',
+          runHasPendingWork() ? 'runtime queues pending' : '',
+          rootStatus !== 'complete' ? `root status ${rootStatus}` : '',
+        ].filter(Boolean).join(' | ')
+        completionCandidateAtMs = undefined
+        scheduleRunCompletionCheck(runCompletionRetryMs)
+        return
+      }
+      root.dataset.completionBlockers = ''
+
+      const now = Date.now()
+      if (completionCandidateAtMs === undefined) {
+        completionCandidateAtMs = now
+        rootLogLine(`< completion candidate: all ${agents.size} agents and assembly visuals are settled`, 'in')
+        reportRuntimeEvent('completion-candidate')
+        scheduleRunCompletionCheck(runCompletionSettleMs)
+        return
+      }
+      const remaining = runCompletionSettleMs - (now - completionCandidateAtMs)
+      if (remaining > 0) {
+        scheduleRunCompletionCheck(remaining)
+        return
+      }
+      void finalizeCompletedRun(runId)
+    }, delayMs)
   }
 
   const wakeFailedAgent = (agent: Agent, currentRun: number) => {
     const now = Date.now()
     const recoveries = agent.supervisorRecoveryCount ?? 0
     const lastRecovery = agent.lastSupervisorRecoveryAtMs ?? 0
-    if (recoveries >= maxSupervisorRecoveryAttempts) return false
     if (now - lastRecovery < supervisorRecoveryCooldownMs) return false
 
     agent.supervisorRecoveryCount = recoveries + 1
     agent.lastSupervisorRecoveryAtMs = now
-    const reason = `Root supervisor recovery ${agent.supervisorRecoveryCount}/${maxSupervisorRecoveryAttempts}`
+    const reason = `Root supervisor recovery ${agent.supervisorRecoveryCount}`
     rootLogLine(`< supervisor waking ${agent.name}: ${reason}`, 'in')
     appendWorkAgentLog(agent, `< ${reason}; retaining current KCL and interface context`, 'in')
 
@@ -3232,7 +4244,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   const runRootSupervisorSweep = () => {
-    if (!isControllerWindow || !active) return
+    if (!isControllerWindow || !active || runPhase !== 'running') return
     const currentRun = runId
     const now = Date.now()
     const statusCounts = new Map<AgentStatus, number>()
@@ -3247,6 +4259,8 @@ document.addEventListener('DOMContentLoaded', () => {
         continue
       }
 
+      if (recoverAgentVisual(agent, currentRun, now)) continue
+
       const activityAge = now - (agent.lastActivityAtMs ?? now)
       if ((agent.status === 'queued' || agent.status === 'starting') && activityAge >= supervisorQueuedWakeMs) {
         rootLogLine(`< supervisor dispatching stalled ${agent.name}`, 'in')
@@ -3255,6 +4269,7 @@ document.addEventListener('DOMContentLoaded', () => {
         continue
       }
 
+      if (agent.status === 'complete') continue
       if (reviewScheduled || agent.kind !== 'orchestrator') continue
       const readyChild = placementComponentsFor(agent)[0]
       const lastReview = supervisorReviewAtMs.get(agent.id) ?? 0
@@ -3263,6 +4278,18 @@ document.addEventListener('DOMContentLoaded', () => {
       reviewScheduled = true
       appendWorkAgentLog(agent, `< root supervisor: scheduled health review after ${readyChild.role}`, 'in')
       scheduleOrchestratorReview(agent, readyChild)
+    }
+
+    if (
+      agents.size > 0 &&
+      Array.from(agents.values()).every(agent => agent.status === 'complete')
+    ) {
+      scheduleRunCompletionCheck()
+      if (now - supervisorLastSummaryAtMs >= supervisorSummaryIntervalMs) {
+        supervisorLastSummaryAtMs = now
+        rootLogLine(`< supervisor sweep: ${agents.size}/${maxWallAgents} agents complete; validating final assembly and snapshots`, 'in')
+      }
+      return
     }
 
     const rootAgent = graphNode(rootAgentId)
@@ -3292,6 +4319,9 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   const clearTimers = () => {
+    closeActiveSession('run reset')
+    runRequestAbort?.abort()
+    runRequestAbort = undefined
     for (const timer of timers) window.clearTimeout(timer)
     timers.clear()
     if (rootRenderTimer !== undefined) {
@@ -3314,6 +4344,16 @@ document.addEventListener('DOMContentLoaded', () => {
       window.clearInterval(supervisorTimer)
       supervisorTimer = undefined
     }
+    if (completionCheckTimer !== undefined) {
+      window.clearTimeout(completionCheckTimer)
+      completionCheckTimer = undefined
+    }
+    completionCandidateAtMs = undefined
+    finalizationPromise = undefined
+    activeReviewRequests.clear()
+    activeReviewRevisions.clear()
+    completedReviewRevisions.clear()
+    reviewQueue.clear()
     supervisorReviewAtMs.clear()
     supervisorLastSummaryAtMs = 0
     for (const timer of reviewTimers.values()) window.clearTimeout(timer)
@@ -3321,14 +4361,27 @@ document.addEventListener('DOMContentLoaded', () => {
     for (const timer of placementTimers.values()) window.clearTimeout(timer)
     placementTimers.clear()
     snapshotJobs.clear()
+    snapshotPersistenceJobs.clear()
+    void disposeSnapshotView()
     if (centerViewerReloadTimer !== undefined) {
       window.clearTimeout(centerViewerReloadTimer)
       centerViewerReloadTimer = undefined
     }
+    centerRenderPending?.waiters.forEach(waiter => waiter.reject(new Error('run reset')))
+    centerRenderPending = undefined
+    centerCoalescedRenderCount = 0
     draftRenderChains.clear()
+    pendingAgentWorkRequests.forEach(request => {
+      request.waiters.forEach(waiter => waiter.reject(new Error('run reset')))
+    })
+    pendingAgentWorkRequests.clear()
+    activeAgentWorkIds.clear()
+    agentWorkRevisions.clear()
     bomPlanningAgentIds.clear()
     workWaiters.forEach(waiter => waiter.reject(new Error('run reset')))
     workWaiters.clear()
+    reviewWaiters.forEach(waiter => waiter.reject(new Error('run reset')))
+    reviewWaiters.clear()
     workEventAbort?.abort()
     workEventAbort = undefined
     workEventSessionId = ''
@@ -3346,6 +4399,7 @@ document.addEventListener('DOMContentLoaded', () => {
     clearCameraTimers()
     agents.forEach((agent) => {
       clearAgentViewerTimers(agent)
+      releaseAgentSnapshotDisplay(agent)
       void agent.view?.deconstructor()
       agent.element?.remove()
     })
@@ -3368,7 +4422,8 @@ document.addEventListener('DOMContentLoaded', () => {
     centerView.start()
   }
 
-  attachCenterViewHandlers(centerView)
+  if (isControllerWindow) attachCenterViewHandlers(centerView)
+  else void centerView.deconstructor()
 
   const demoAgents = (): AgentSeed[] => {
     const topLevelRoles = [
@@ -3508,7 +4563,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const requestOrchestration = async (prompt: string): Promise<OrchestrationResponse> => {
     try {
-      const response = await fetch('/api/orchestrate-stream', {
+      const response = await runFetch('/api/orchestrate-stream', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ prompt, maxAgents: maxWallAgents }),
@@ -3564,12 +4619,57 @@ document.addEventListener('DOMContentLoaded', () => {
     if (event === undefined || event.type === 'ping') return
     const workId = event.workId
     if (workId === undefined) return
+    if (
+      event.type === 'review-queued' ||
+      event.type === 'review-started' ||
+      event.type === 'review-dialog' ||
+      event.type === 'review-final' ||
+      event.type === 'review-error'
+    ) {
+      const waiter = reviewWaiters.get(workId)
+      if (waiter === undefined) return
+      const { parent, currentRun } = waiter
+      if (!agentStillActive(parent, currentRun)) {
+        reviewWaiters.delete(workId)
+        return
+      }
+      if (event.type === 'review-queued') {
+        reviewLogLine(parent, '< visual review queued behind active Zoo reviews', 'in')
+        return
+      }
+      if (event.type === 'review-started') {
+        reviewLogLine(parent, '< hosted Zookeeper visual review started', 'in')
+        return
+      }
+      if (event.type === 'review-dialog') {
+        reviewLogLine(parent, `< review ws: ${event.line}`, 'in')
+        return
+      }
+      reviewWaiters.delete(workId)
+      if (event.type === 'review-final') waiter.resolve(event.review)
+      else waiter.reject(new Error(event.summary))
+      return
+    }
     const waiter = workWaiters.get(workId)
     if (waiter === undefined) return
 
     const { agent, currentRun } = waiter
     if (!agentStillActive(agent, currentRun)) {
       workWaiters.delete(workId)
+      return
+    }
+    const superseded = (
+      waiter.workRevision !== undefined &&
+      agentWorkRevisions.get(agent.id) !== waiter.workRevision
+    )
+    if (superseded) {
+      if (event.type === 'final') {
+        workWaiters.delete(workId)
+        waiter.resolve(event.update)
+      } else if (event.type === 'error') {
+        workWaiters.delete(workId)
+        waiter.reject(new Error(event.summary))
+      }
       return
     }
 
@@ -3582,7 +4682,7 @@ document.addEventListener('DOMContentLoaded', () => {
       return
     }
     if (event.type === 'draft') {
-      queueDraftRender(agent, currentRun, event.kcl, event.draftIndex)
+      queueDraftRender(agent, currentRun, event.kcl, event.draftIndex, waiter.workRevision)
       return
     }
     if (event.type === 'final') {
@@ -3619,16 +4719,51 @@ document.addEventListener('DOMContentLoaded', () => {
         if (done) break
       }
       handleAgentWorkEvent(parseAgentWorkStreamEvent(buffer))
+      if (!signal.aborted) throw new Error('zookeeper event stream ended')
     }
 
     void readEvents().catch((error: unknown) => {
       if (signal.aborted) return
+      if (workEventAbort?.signal === signal) {
+        workEventAbort = undefined
+        workEventSessionId = ''
+      }
       rootLogLine(`system: zookeeper event stream failed (${errorToMessage(error)})`)
       Array.from(workWaiters.entries()).forEach(([workId, waiter]) => {
         workWaiters.delete(workId)
         waiter.reject(new Error(errorToMessage(error)))
       })
+      Array.from(reviewWaiters.entries()).forEach(([workId, waiter]) => {
+        reviewWaiters.delete(workId)
+        waiter.reject(new Error(errorToMessage(error)))
+      })
     })
+  }
+
+  const requestReviewStream = async (
+    parent: Agent,
+    currentRun: number,
+    payload: Record<string, unknown>,
+  ): Promise<AgentReviewResponse> => {
+    ensureWorkEventStream(activeSessionId)
+    const workId = randomId()
+    const finalReview = new Promise<AgentReviewResponse>((resolve, reject) => {
+      reviewWaiters.set(workId, { parent, currentRun, resolve, reject })
+    })
+
+    try {
+      const response = await runFetch('/api/zookeeper/review-start', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ...payload, workId }),
+      })
+      if (!response.ok) throw await httpErrorFromResponse(response, 'review start')
+    } catch (error: unknown) {
+      reviewWaiters.delete(workId)
+      throw error
+    }
+
+    return finalReview
   }
 
   const requestAgentWorkStream = async (
@@ -3636,16 +4771,17 @@ document.addEventListener('DOMContentLoaded', () => {
     currentRun: number,
     payload: Record<string, unknown>,
     endpoint = '/api/zookeeper/work-start',
+    workRevision?: number,
   ): Promise<AgentStreamResponse> => {
     ensureWorkEventStream(activeSessionId)
     const workId = randomId()
     const body = { ...payload, workId }
 
     const finalUpdate = new Promise<AgentStreamResponse>((resolve, reject) => {
-      workWaiters.set(workId, { agent, currentRun, resolve, reject })
+      workWaiters.set(workId, { agent, currentRun, workRevision, resolve, reject })
     })
 
-    const response = await fetch(endpoint, {
+    const response = await runFetch(endpoint, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
@@ -3658,9 +4794,10 @@ document.addEventListener('DOMContentLoaded', () => {
     return finalUpdate
   }
 
-  const requestAgentWork = async (
+  const performAgentWork = async (
     agent: Agent,
     currentRun: number,
+    workRevision: number,
     renderError = '',
     repairAttempt = 0,
     reviewInstruction = '',
@@ -3686,6 +4823,8 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     try {
+      const entryFilePath = agent.id === rootAgentId ? rootFilePath : agent.filePath
+      const context = requestContextFor(entryFilePath, false)
       const update = await requestAgentWorkStream(agent, currentRun, {
         sessionId: activeSessionId,
         prompt: promptInput.value.trim() || defaultPrompt,
@@ -3701,14 +4840,18 @@ document.addEventListener('DOMContentLoaded', () => {
           imports: agent.imports ?? [],
         },
         rootInstruction,
-        files: objectFromMap(kclFiles),
-        interfaces: objectFromMap(interfaceManifests),
+        files: context.files,
+        interfaces: context.interfaces,
         currentKcl: kclFiles.get(agent.filePath) ?? '',
         renderError,
         reviewInstruction,
         attempt: repairAttempt,
-      })
+      }, '/api/zookeeper/work-start', workRevision)
       if (!agentStillActive(agent, currentRun)) return
+      if (agentWorkRevisions.get(agent.id) !== workRevision) {
+        appendWorkAgentLog(agent, '< discarded superseded Zookeeper result', 'in')
+        return
+      }
       if (!('kcl' in update)) throw new Error('Zookeeper worker stream returned a BOM instead of KCL')
 
       if (isRetryableZooFallback(update)) {
@@ -3719,7 +4862,7 @@ document.addEventListener('DOMContentLoaded', () => {
           appendWorkAgentLog(agent, `-> retrying hosted Zookeeper after websocket fallback (${nextRetry}/${maxZooFallbackRetries})`, 'out')
           await wait(zooFallbackRetryBackoffMs * nextRetry)
           if (!agentStillActive(agent, currentRun)) return
-          await requestAgentWork(agent, currentRun, renderError, repairAttempt, reviewInstruction, nextRetry)
+          await performAgentWork(agent, currentRun, workRevision, renderError, repairAttempt, reviewInstruction, nextRetry)
           return
         }
         appendWorkAgentLog(agent, `< fallback refused after ${maxZooFallbackRetries} retries; no KCL accepted`)
@@ -3732,13 +4875,18 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!agentStillActive(agent, currentRun)) return
 
       kclFiles.set(agent.filePath, update.kcl)
-      updateInterfaceManifest(agent, update.kcl)
-      broadcastWall({
-        type: 'agent:final',
-        agentId: agent.id,
-        kcl: update.kcl,
-        manifest: interfaceManifests.get(agent.filePath),
-      })
+      if (agent.kind === 'orchestrator') syncAssemblyFileImports(agent)
+      const acceptedKcl = kclFiles.get(agent.filePath) ?? update.kcl
+      completionCandidateAtMs = undefined
+      updateInterfaceManifest(agent, acceptedKcl)
+      if (!useAgentCadSnapshots) {
+        broadcastWall({
+          type: 'agent:final',
+          agentId: agent.id,
+          kcl: acceptedKcl,
+          manifest: interfaceManifests.get(agent.filePath),
+        })
+      }
       if (!update.streamed && update.dialog !== undefined && update.dialog.length > 0) {
         update.dialog.slice(-3).forEach(line => appendWorkAgentLog(agent, `< ws: ${line}`, 'in'))
       }
@@ -3756,7 +4904,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         if (repairAttempt < maxAgentRepairAttempts) {
           appendWorkAgentLog(agent, `-> renderer rejected KCL; requesting repair ${repairAttempt + 1}`, 'out')
-          await requestAgentWork(agent, currentRun, message, repairAttempt + 1, reviewInstruction)
+          await performAgentWork(agent, currentRun, workRevision, message, repairAttempt + 1, reviewInstruction)
         } else {
           appendWorkAgentLog(agent, `< renderer rejected KCL after ${maxAgentRepairAttempts} repair attempts: ${message}`)
           setWorkAgentStatus(agent, 'error')
@@ -3775,14 +4923,94 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     } catch (error: unknown) {
       if (!agentStillActive(agent, currentRun)) return
-      appendWorkAgentLog(agent, `< agent update failed: ${errorToMessage(error)}`)
+      if (agentWorkRevisions.get(agent.id) !== workRevision) return
+      const message = errorToMessage(error)
+      if (isTransientControlPlaneError(message) && zooRetryAttempt < maxZooFallbackRetries) {
+        const nextRetry = zooRetryAttempt + 1
+        appendWorkAgentLog(agent, `< control-plane interruption: ${message}`, 'in')
+        appendWorkAgentLog(agent, `-> retrying agent dispatch ${nextRetry}/${maxZooFallbackRetries}`, 'out')
+        await wait(zooFallbackRetryBackoffMs * nextRetry)
+        if (!agentStillActive(agent, currentRun)) return
+        await performAgentWork(agent, currentRun, workRevision, renderError, repairAttempt, reviewInstruction, nextRetry)
+        return
+      }
+      appendWorkAgentLog(agent, `< agent update failed: ${message}`)
       setWorkAgentStatus(agent, 'error')
-      markAgentFailedAndRefreshAncestors(agent, currentRun, errorToMessage(error))
+      markAgentFailedAndRefreshAncestors(agent, currentRun, message)
     }
   }
 
+  const drainAgentWorkQueue = (agentId: string) => {
+    if (activeAgentWorkIds.has(agentId)) return
+    const request = pendingAgentWorkRequests.get(agentId)
+    if (request === undefined) return
+    pendingAgentWorkRequests.delete(agentId)
+
+    if (!agentStillActive(request.agent, request.currentRun)) {
+      request.waiters.forEach(waiter => waiter.resolve())
+      drainAgentWorkQueue(agentId)
+      return
+    }
+
+    activeAgentWorkIds.add(agentId)
+    void performAgentWork(
+      request.agent,
+      request.currentRun,
+      request.workRevision,
+      request.renderError,
+      request.repairAttempt,
+      request.reviewInstruction,
+      request.zooRetryAttempt,
+    )
+      .then(() => request.waiters.forEach(waiter => waiter.resolve()))
+      .catch((error: unknown) => {
+        const workError = error instanceof Error ? error : new Error(errorToMessage(error))
+        request.waiters.forEach(waiter => waiter.reject(workError))
+      })
+      .finally(() => {
+        activeAgentWorkIds.delete(agentId)
+        drainAgentWorkQueue(agentId)
+        scheduleRunCompletionCheck()
+      })
+  }
+
+  const requestAgentWork = (
+    agent: Agent,
+    currentRun: number,
+    renderError = '',
+    repairAttempt = 0,
+    reviewInstruction = '',
+    zooRetryAttempt = 0,
+  ) => new Promise<void>((resolve, reject) => {
+    if (!agentStillActive(agent, currentRun)) {
+      resolve()
+      return
+    }
+
+    const workRevision = (agentWorkRevisions.get(agent.id) ?? 0) + 1
+    agentWorkRevisions.set(agent.id, workRevision)
+    const previous = pendingAgentWorkRequests.get(agent.id)
+    const waiters = [...(previous?.waiters ?? []), { resolve, reject }]
+    pendingAgentWorkRequests.set(agent.id, {
+      agent,
+      currentRun,
+      renderError,
+      repairAttempt,
+      reviewInstruction,
+      zooRetryAttempt,
+      workRevision,
+      waiters,
+    })
+    if (previous !== undefined) {
+      appendWorkAgentLog(agent, '< coalesced superseded placement request', 'in')
+    }
+    drainAgentWorkQueue(agent.id)
+    scheduleRunCompletionCheck()
+  })
+
   const runZookeeper = async () => {
     if (startInProgress) return
+    const centerNeedsRebuild = !assemblyRenderer.contains(centerView.el) || centerView.rtc === undefined
     startInProgress = true
     active = true
     runId += 1
@@ -3793,13 +5021,16 @@ document.addEventListener('DOMContentLoaded', () => {
     startButton.textContent = 'Architecting BOM...'
     stopButton.disabled = false
     clearTimers()
+    runRequestAbort = new AbortController()
     resetAgents()
+    setRunPhase('architecting', 'running')
     startAggregateTimeTicker()
     rootReviewRounds = 0
     centerViewerReloadAttempts = 0
     capacityWarningRun = -1
     rootLog.replaceChildren()
     broadcastWall({ type: 'reset' })
+    if (centerNeedsRebuild) await rebuildCenterViewer('new run after static completion')
     const prompt = promptInput.value.trim() || defaultPrompt
     rootLogLine('system: zookeeper orchestration opened')
     rootLogLine('architect: beginning assembly and bill-of-materials design feed')
@@ -3825,11 +5056,12 @@ document.addEventListener('DOMContentLoaded', () => {
       source: plan.source,
       rootInstruction,
       plannedAgentCount: seeds.length,
-      files: plan.files,
+      files: useAgentCadSnapshots ? {} : plan.files,
     })
     rootLogLine(`< ${plan.source} plan accepted: ${seeds.length} sub-agents (hard cap ${maxWallAgents})`, 'in')
     plan.notes?.forEach(note => rootLogLine(`system: ${note}`))
     renderAllGraphs()
+    setRunPhase('running', 'running')
     startCenterView()
     startRootSupervisor()
 
@@ -3925,6 +5157,7 @@ document.addEventListener('DOMContentLoaded', () => {
       interfaceManifests = new Map()
       rootImports = new Set()
       rootLog.replaceChildren()
+      setRunPhase('idle', 'queued')
       renderAllGraphs()
       return
     }
@@ -3932,6 +5165,9 @@ document.addEventListener('DOMContentLoaded', () => {
     if (message.type === 'plan') {
       runId += 1
       active = true
+      runRequestAbort?.abort()
+      runRequestAbort = new AbortController()
+      setRunPhase('running', 'running')
       activeSessionId = message.sessionId
       activeSource = message.source
       rootInstruction = message.rootInstruction
@@ -3941,6 +5177,15 @@ document.addEventListener('DOMContentLoaded', () => {
       rootImports = new Set()
       layoutAgents()
       renderAllGraphs()
+      return
+    }
+
+    if (message.type === 'run:complete') {
+      active = false
+      startInProgress = false
+      runRequestAbort = undefined
+      clearCameraTimers()
+      setRunPhase('complete', 'complete')
       return
     }
 
@@ -4000,7 +5245,15 @@ document.addEventListener('DOMContentLoaded', () => {
       return
     }
 
+    if (message.type === 'agent:snapshot-status') {
+      agent.snapshotState = message.state
+      agent.snapshotMessage = message.message
+      updateViewerPlaceholderText(agent)
+      return
+    }
+
     if (message.type === 'agent:snapshot') {
+      agent.snapshotState = 'ready'
       setAgentSnapshot(agent, message.snapshotUrl)
     }
   }
@@ -4026,6 +5279,10 @@ document.addEventListener('DOMContentLoaded', () => {
     interfaceManifests = new Map()
     rootImports = new Set()
     centerViewerReloadAttempts = 0
+    if (centerViewerHealthTimer !== undefined) {
+      window.clearInterval(centerViewerHealthTimer)
+      centerViewerHealthTimer = undefined
+    }
     snapshotJobs.clear()
     void disposeSnapshotView()
     void centerView.deconstructor()
@@ -4035,6 +5292,7 @@ document.addEventListener('DOMContentLoaded', () => {
     startButton.textContent = 'Start Zookeeper'
     stopButton.disabled = true
     centerStatus.textContent = 'Zookeeper ready'
+    setRunPhase('idle', 'queued')
     renderAllGraphs()
   })
 
@@ -4079,4 +5337,20 @@ document.addEventListener('DOMContentLoaded', () => {
       agent.view?.el.style.setProperty('height', '100%', 'important')
     }
   })
+
+  let pageDisposed = false
+  window.addEventListener('pagehide', () => {
+    if (pageDisposed) return
+    pageDisposed = true
+    if (isControllerWindow) clearTimers()
+    else {
+      runRequestAbort?.abort()
+      workEventAbort?.abort()
+      clearCameraTimers()
+    }
+    resetAgents()
+    void disposeSnapshotView()
+    void centerView.deconstructor()
+    wallChannel?.close()
+  }, { once: true })
 })

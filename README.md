@@ -36,6 +36,10 @@ mock agent IDs, so `Zookeeper Worker 0001` loads
 `/sample-kcl/worker-0001.kcl` and `Zookeeper Sub-Orchestrator 0001` loads
 `/sample-kcl/sub-orchestrator-0001.kcl`.
 
+For Puget deployment, nine-monitor capture, DevTools inspection, resource
+monitoring, and crash diagnosis, see
+[Puget Wall Debugging Runbook](docs/puget-wall-debugging.md).
+
 ## Building
 
 ```sh
