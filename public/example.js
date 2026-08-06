@@ -3260,7 +3260,8 @@
   var centerIndex = 4;
   var rootAgentId = "zookeeper-orchestrator-root";
   var perimeterOrder = [0, 1, 2, 5, 8, 7, 6, 3];
-  var maxWallAgents = 48;
+  var wallAgentLimit = void 0;
+  var maxNestedOrchestratorDepth = 3;
   var maxLiveAgentViews = 24;
   var maxAgentRepairAttempts = 2;
   var maxZooFallbackRetries = 3;
@@ -3278,27 +3279,75 @@
   var viewerHealthPollMs = 1e4;
   var viewerStalledReloadMs = 45e3;
   var useAgentCadSnapshots = true;
+  var useStaticCenterCad = true;
+  var useIsolatedSnapshotRenderer = true;
   var snapshotViewerSize = { width: 1280, height: 720 };
   var maxQueuedDraftSnapshots = 4;
+  var maxConcurrentAgentSnapshots = 2;
   var snapshotFrameWaitMs = 900;
-  var snapshotSubmitTimeoutMs = 35e3;
+  var snapshotSubmitTimeoutMs = 85e3;
   var snapshotCaptureTimeoutMs = 12e3;
   var snapshotPersistTimeoutMs = 12e4;
   var snapshotImageFetchTimeoutMs = 3e4;
   var snapshotDisposeTimeoutMs = 5e3;
+  var wallCheckpointTimeoutMs = 3e4;
+  var wallCheckpointIntervalMs = 1e4;
+  var pendingReworkSeparator = "\n\nAdditional pending rework:\n";
+  var maxPendingWorkInstructionChars = 256e3;
   var maxSnapshotSubmissionsPerRenderer = 4;
+  var isolatedSnapshotTimeoutMs = 78e4;
+  var snapshotStaleThresholdMs = isolatedSnapshotTimeoutMs + 3e4;
+  var workStatusMissingThreshold = 3;
+  var workEventPollTimeoutMs = 3e4;
+  var localAgentWorkStallMs = isolatedSnapshotTimeoutMs + 12e4;
+  var orphanedAgentStatusGraceMs = 12e4;
   var centerRendererSubmitTimeoutMs = 9e4;
+  var compactPendingWorkInstruction = (...values) => {
+    const segments = values.flatMap((value) => value?.split(pendingReworkSeparator) ?? []).map((value) => value.trim()).filter((value) => value.length > 0);
+    const seenSegments = /* @__PURE__ */ new Set();
+    const uniqueSegments = [];
+    for (let index = segments.length - 1; index >= 0; index -= 1) {
+      const segment = segments[index];
+      const placementTarget = segment.match(
+        /^Update (.+?)'s assembly placement layer after /
+      )?.[1];
+      const key = placementTarget === void 0 ? segment : `placement:${placementTarget}`;
+      if (seenSegments.has(key)) continue;
+      seenSegments.add(key);
+      uniqueSegments.unshift(segment);
+    }
+    const kept = [];
+    let length = 0;
+    for (let index = uniqueSegments.length - 1; index >= 0; index -= 1) {
+      const segment = uniqueSegments[index];
+      const separatorLength = kept.length === 0 ? 0 : pendingReworkSeparator.length;
+      if (length + separatorLength + segment.length <= maxPendingWorkInstructionChars) {
+        kept.unshift(segment);
+        length += separatorLength + segment.length;
+        continue;
+      }
+      if (kept.length === 0) {
+        kept.unshift(segment.slice(0, maxPendingWorkInstructionChars));
+      }
+      break;
+    }
+    return kept.join(pendingReworkSeparator);
+  };
   var maxCenterSubmissionsPerRenderer = 6;
   var maxRootDraftVisualizations = 1;
+  var maxLiveCenterProjectCharacters = 9e5;
   var defaultPrompt = "A terminator robot endoskeleton display assembly. Build a metallic humanoid inspection robot with roughly 28-40 concrete parts organized through nested sub-orchestrators: skull/head, neck/spine, ribcage/torso, pelvis/hips, left arm, right arm, left leg, right leg, hands/feet, exposed actuator links, and cable routing. Workers should each own one physical part file, not a set: individual skull plate, eye lens, jaw link, vertebra, rib hoop, shoulder yoke, upper-arm bone, forearm piston, finger segment, hip bracket, thigh strut, shin strut, foot plate, etc. Use shared reusable components for repeated hardware such as bolts, pins, bushings, bearings, washers, spacers, cable clips, and small actuator clevises; model each reusable component once and have orchestrators clone/place the required counts. For mirrored limbs, paired brackets, repeated ribs, bolt circles, and other arrays, create one canonical part when possible and have orchestrators apply the mirrored, radial, or linear placement transforms with BOM comments. Every sub-orchestrator should place only direct child/subassembly imports and explicit shared reusable imports, add BOM comments for reused parts, align by named mate points/local axes/dimensions, and return one renderable aggregate so parent assemblies can place it. Avoid weapons; focus on the mechanical robot body, exposed structure, and assembled presentation.";
   var rootFilePath = "main.kcl";
   var interfaceBlockStart = "ZOOKEEPER_INTERFACE";
   var interfaceBlockEnd = "/ZOOKEEPER_INTERFACE";
   var wallParams = new URLSearchParams(window.location.search);
-  var requestedWallTile = Number(wallParams.get("wallTile"));
+  var isolatedSnapshotJobId = wallParams.get("snapshotJob")?.trim() ?? "";
+  var isHeadlessController = wallParams.get("wallController") === "1";
+  var requestedWallTileValue = wallParams.get("wallTile");
+  var requestedWallTile = requestedWallTileValue === null ? Number.NaN : Number(requestedWallTileValue);
   var wallTileIndex = Number.isInteger(requestedWallTile) && requestedWallTile >= 0 && requestedWallTile < rows * cols ? requestedWallTile : void 0;
   var isWallTileMode = wallTileIndex !== void 0;
-  var isControllerWindow = !isWallTileMode || wallTileIndex === centerIndex;
+  var isControllerWindow = isHeadlessController || !isWallTileMode;
   var shouldRenderAgentViews = !isWallTileMode || !isControllerWindow;
   var wallBroadcastChannelName = "zookeeper-wall-v1";
   var agentColors = [
@@ -3418,7 +3467,7 @@
     return new Error(`${label} ${response.status}${errorId}${detail ? `: ${detail.slice(0, 700)}` : ""}`);
   };
   var wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  var isRetryableZooFallback = (update) => update.source === "fallback" && /\b(websocket closed|closed while reading frame|timed out|timeout|without an EditKclCode output|socket|connection reset|connection closed)\b/i.test(update.summary);
+  var isRetryableZooFallback = (update) => update.source === "fallback" && /\b(websocket closed|closed while reading frame|timed out|timeout|without an EditKclCode output|socket|connection reset|connection closed|connection interrupted)\b/i.test(update.summary);
   var escapeHtml = (value) => value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
   var titleCase = (value) => value.replace(/\w\S*/g, (word) => word[0].toUpperCase() + word.slice(1));
   var slugLabel = (value) => value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "component";
@@ -3533,8 +3582,321 @@
 `;
   var objectFromMap = (files) => Object.fromEntries(files.entries());
   var stripImportLines = (source) => source.split("\n").filter((line) => !line.trim().startsWith("import ")).join("\n");
+  var kclExecutableFingerprint = (source) => stripImportLines(source).split("\n").map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith("//")).join("").replace(/\s+/g, "");
+  var routeGeometryBlockPattern = /\b[A-Za-z_][A-Za-z0-9_]*(?:route|path|centerline|trunk|entry|exit|outlet|tip|jacketEnd|bend(?:Start|End|Center)|waypoint|fanout|endpoint)[A-Za-z0-9_]*(?:Plane|Datum)\b/i;
+  var routeGeometryFingerprint = (source) => {
+    let routeBlockDepth = 0;
+    return stripImportLines(source).split("\n").map((line) => line.trim()).filter((line) => {
+      if (line.length === 0 || line.startsWith("//")) return false;
+      const startsRouteBlock = routeGeometryBlockPattern.test(line) && line.includes("{");
+      const inRouteBlock = routeBlockDepth > 0;
+      const include = inRouteBlock || startsRouteBlock || /\b(?:line|arc|bezier|tangentialArc)\s*\(/i.test(line) || /\b(?:route|path|centerline|trunk|entry|exit|outlet|tip|jacketEnd|runLength|bendRadius|arcLength)\b/i.test(line) || /\b[A-Za-z_][A-Za-z0-9_]*(?:Length|Offset|Trim|Endpoint|Outlet|Fanout|BendEnd)\b/i.test(line);
+      const braceDepthChange = (line.match(/{/g)?.length ?? 0) - (line.match(/}/g)?.length ?? 0);
+      if (inRouteBlock) routeBlockDepth = Math.max(0, routeBlockDepth + braceDepthChange);
+      else if (startsRouteBlock) routeBlockDepth = Math.max(0, braceDepthChange);
+      return include;
+    }).join("").replace(/\s+/g, "");
+  };
+  var interfaceFieldValue = (source, field) => {
+    const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return source.match(new RegExp(`^\\s*//\\s*${escapedField}:\\s*(.*)$`, "mi"))?.[1]?.replace(/\s+/g, " ").trim();
+  };
+  var coordinateVectors = (source) => Array.from(source.matchAll(
+    /\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]/g
+  )).map((match) => `[${match[1]},${match[2]},${match[3]}]`);
+  var numericCoordinateVectors = (source) => Array.from(source.matchAll(
+    /\[\s*(?:var\s+)?(-?\d+(?:\.\d+)?)(?:mm)?\s*,\s*(?:var\s+)?(-?\d+(?:\.\d+)?)(?:mm)?\s*,\s*(?:var\s+)?(-?\d+(?:\.\d+)?)(?:mm)?\s*\]/g
+  )).map((match) => [Number(match[1]), Number(match[2]), Number(match[3])]);
+  var numericCoordinatePairs = (source) => Array.from(source.matchAll(
+    /\[\s*(?:var\s+)?(-?\d+(?:\.\d+)?)(?:mm)?\s*,\s*(?:var\s+)?(-?\d+(?:\.\d+)?)(?:mm)?\s*\]/g
+  )).map((match) => [Number(match[1]), Number(match[2])]);
+  var formatNumericVector = (vector) => `[${vector.map((value) => Number(value.toFixed(6))).join(", ")}]`;
+  var vectorsNear = (left, right, tolerance = 0.05) => left.every((value, index) => Math.abs(value - right[index]) <= tolerance);
+  var interfaceNamedPoint = (source, name) => {
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = source.match(new RegExp(
+      `\\b${escapedName}\\s*=?\\s*\\[\\s*(-?\\d+(?:\\.\\d+)?)\\s*,\\s*(-?\\d+(?:\\.\\d+)?)\\s*,\\s*(-?\\d+(?:\\.\\d+)?)\\s*\\]`,
+      "i"
+    ));
+    if (match === null) return void 0;
+    return [Number(match[1]), Number(match[2]), Number(match[3])];
+  };
+  var routeEndpointSpanContract = (instruction, source = "") => {
+    const spanMatch = instruction.match(
+      /\broute\s+from[\s\S]{0,260}?\b(?:a|approximately)\s+(\d+(?:\.\d+)?)\s*mm\s+(?:endpoint\s+)?span\b/i
+    ) || instruction.match(
+      /\bstraight-line\s+distance\s+from[\s\S]{0,220}?\bis\s+(?:only\s+)?(?:about|approximately)\s+(\d+(?:\.\d+)?)\s*mm\b/i
+    ) || instruction.match(
+      /\bassembled\b[\s\S]{0,140}?\brun\s+is\s+(?:only\s+)?(?:about|approximately)\s+(\d+(?:\.\d+)?)\s*mm\b/i
+    ) || instruction.match(
+      /\bparent\s+KCL\s+calculates\s+(\d+(?:\.\d+)?)\s*mm\s+from\b[\s\S]{0,180}?\bto\b/i
+    );
+    if (spanMatch === null) return void 0;
+    const explicitPointNames = Array.from(instruction.matchAll(/\b([A-Za-z][A-Za-z0-9_]*)\s+can mate\b/gi)).map((match) => match[1]);
+    const localOriginName = interfaceFieldValue(source, "local_origin")?.match(/^([A-Za-z][A-Za-z0-9_]*)\b/)?.[1];
+    const manifestPointNames = Array.from(
+      (interfaceFieldValue(source, "mate_points") ?? "").matchAll(/\b([A-Za-z][A-Za-z0-9_]*)\s*=?\s*\[/g)
+    ).map((match) => match[1]);
+    const inferredEndName = manifestPointNames.at(-1) === localOriginName ? [...manifestPointNames].reverse().find((name) => name !== localOriginName) : manifestPointNames.at(-1);
+    const pointNames = explicitPointNames.length >= 2 ? explicitPointNames : [localOriginName, inferredEndName].filter((name) => name !== void 0);
+    if (pointNames.length < 2) return void 0;
+    return {
+      startName: pointNames[0],
+      endName: pointNames[1],
+      span: Number(spanMatch[1]),
+      centerlineMustExceedSpan: /\bbefore\s+allowing\s+for\s+a\s+bend\b/i.test(instruction),
+      centerlineMaximum: /\bshorten\b/i.test(instruction) ? Number(spanMatch[1]) * 1.25 : void 0
+    };
+  };
+  var routeCenterlineLength = (source) => {
+    const keyDimensions = interfaceFieldValue(source, "key_dimensions") ?? "";
+    const interfaceMatch = keyDimensions.match(
+      /\b(?:routed)?centerline(?:Length|\s+length)?\s*=?\s*(\d+(?:\.\d+)?)\b/i
+    );
+    if (interfaceMatch !== null) return Number(interfaceMatch[1]);
+    const sourceMatch = source.match(/^\s*centerlineLength\s*=\s*(\d+(?:\.\d+)?)mm\b/m);
+    return sourceMatch === null ? void 0 : Number(sourceMatch[1]);
+  };
+  var controllerMateContract = (instruction) => {
+    const fullMatch = instruction.match(
+      /\bcontroller\s+tips?\s+are\s+at\s+Y\s*=\s*(-?\d+(?:\.\d+)?)\s*,\s*Z\s*=\s*(-?\d+(?:\.\d+)?)[\s\S]{0,220}?\b(?:NTC\s+)?tips?\s+around\s+Y\s*=\s*(-?\d+(?:\.\d+)?)\s*,\s*Z\s*=\s*(-?\d+(?:\.\d+)?)\s*[-–]\s*(-?\d+(?:\.\d+)?)/i
+    );
+    if (fullMatch !== null) {
+      return {
+        currentY: Number(fullMatch[1]),
+        currentZ: Number(fullMatch[2]),
+        targetY: Number(fullMatch[3]),
+        targetZMin: Math.min(Number(fullMatch[4]), Number(fullMatch[5])),
+        targetZMax: Math.max(Number(fullMatch[4]), Number(fullMatch[5]))
+      };
+    }
+    const zOnlyMatch = instruction.match(
+      /\bcontroller\s+tips?\s+are\s+near\s+Z\s*=\s*(-?\d+(?:\.\d+)?)[\s\S]{0,420}?\bterminat(?:e|ing)\s+near\s+Z\s*=\s*(-?\d+(?:\.\d+)?)/i
+    );
+    if (zOnlyMatch === null) return void 0;
+    return {
+      currentY: void 0,
+      currentZ: Number(zOnlyMatch[1]),
+      targetY: void 0,
+      targetZMin: Number(zOnlyMatch[2]),
+      targetZMax: Number(zOnlyMatch[2])
+    };
+  };
+  var parentInterfaceTranslation = (source) => {
+    const parentInterface = interfaceFieldValue(source, "parent_interface") ?? "";
+    const match = parentInterface.match(
+      /\btranslation\s*(\[\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\])/i
+    );
+    if (match !== null) return numericCoordinateVectors(match[1] ?? "")[0];
+    return /\b(?:identity\s+placement|zero\s+translation)\b/i.test(parentInterface) ? [0, 0, 0] : void 0;
+  };
+  var routeThroughWaypointContract = (instruction, source) => {
+    const explicitRouteClauses = Array.from(instruction.matchAll(
+      /\b(?:curved\s+)?route\s+through\s+([^.;]+)/gi
+    ));
+    const conductorRunClauses = Array.from(instruction.matchAll(
+      /\bconductors?\s+(?:currently\s+)?run\s+from\s+([^.;]+)/gi
+    ));
+    const waypointClauses = [...explicitRouteClauses, ...conductorRunClauses];
+    const globalWaypoints = waypointClauses.flatMap((match) => numericCoordinateVectors(match[1] ?? ""));
+    if (globalWaypoints.length === 0) return void 0;
+    const parentInterface = interfaceFieldValue(source, "parent_interface") ?? "";
+    const translationMatch = parentInterface.match(
+      /\btranslation\s*(\[\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\])/i
+    );
+    const rotationMatch = parentInterface.match(
+      /\brotation\s*(\[\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\])/i
+    );
+    const documentedTranslation = translationMatch === null ? void 0 : numericCoordinateVectors(translationMatch[1] ?? "")[0];
+    const rotation = rotationMatch === null ? void 0 : numericCoordinateVectors(rotationMatch[1] ?? "")[0];
+    if (rotation !== void 0 && !vectorsNear(rotation, [0, 0, 0], 1e-3)) {
+      return void 0;
+    }
+    const translation = documentedTranslation ?? (conductorRunClauses.length > 0 && globalWaypoints.length >= 2 ? globalWaypoints[0] : void 0);
+    if (translation === void 0) return void 0;
+    return {
+      globalWaypoints,
+      localWaypoints: globalWaypoints.map((point) => point.map((value, index) => value - translation[index]))
+    };
+  };
+  var explicitRouteAcceptanceRequirements = (instruction, source) => {
+    const requirements = [];
+    const spanContract = routeEndpointSpanContract(instruction, source);
+    if (spanContract !== void 0) {
+      requirements.push(
+        `MANDATORY ENDPOINT-SPAN ACCEPTANCE: ${spanContract.startName} to ${spanContract.endName} must measure ${spanContract.span} mm within 0.5 mm. The older endpoint span is rejected even if the sleeve remains hollow and executable.${spanContract.centerlineMustExceedSpan ? ` Because this is the straight-line distance before bending, the routed centerline must also exceed ${spanContract.span} mm.` : ""}${spanContract.centerlineMaximum === void 0 ? "" : ` Because the review explicitly requires shortening the route, its routed centerline must not exceed ${spanContract.centerlineMaximum.toFixed(2)} mm.`}`
+      );
+    }
+    const waypointContract = routeThroughWaypointContract(instruction, source);
+    if (waypointContract !== void 0) {
+      requirements.push([
+        `MANDATORY ROUTE-WAYPOINT ACCEPTANCE: the executable route and mate_points must traverse assembly-frame waypoints ${waypointContract.globalWaypoints.map(formatNumericVector).join(" and ")}.`,
+        `With the current zero-rotation parent transform, their required worker-local coordinates are ${waypointContract.localWaypoints.map(formatNumericVector).join(" and ")}.`,
+        "Changing bend radius, appearance, total length, or unrelated endpoints without traversing these waypoints is rejected."
+      ].join(" "));
+    }
+    const controllerContract = controllerMateContract(instruction);
+    if (controllerContract !== void 0) {
+      requirements.push([
+        `MANDATORY CONTROLLER-MATE ACCEPTANCE: update controllerCopperTip and its documented parent transform (identity is allowed) so the assembled tip lands ${controllerContract.targetY === void 0 ? "" : `near Y=${controllerContract.targetY} mm and `}near Z=${controllerContract.targetZMin}..${controllerContract.targetZMax} mm, beside the NTC controller tips.`,
+        "The mainSleeveExit route mate must have a substantial local Z offset that carries the conductor from that controller datum down through the common main-sleeve trunk; retaining a flat local Z=0 trunk is rejected."
+      ].join(" "));
+    }
+    return requirements;
+  };
+  var genericGeometryContractParagraphPrefixes = [
+    "MANDATORY IMPORT-FRAME CONTRACT:",
+    "PRECEDENCE CLARIFICATION:",
+    "Before finishing, inspect the exported aggregate type and parent_interface.",
+    "MANDATORY TRANSFORMABLE-REPEAT CONTRACT:"
+  ];
+  var geometryReviewDirectiveForValidation = (instruction) => (instruction.split(assemblyContextMarker, 1)[0] ?? instruction).split(/\n\s*\n/).map((paragraph) => paragraph.trim()).filter((paragraph) => paragraph.length > 0).filter((paragraph) => !genericGeometryContractParagraphPrefixes.some((prefix) => paragraph.startsWith(prefix))).join("\n\n");
+  var explicitRouteReworkViolation = (instruction, previousSource, updatedSource) => {
+    const reviewDirective = geometryReviewDirectiveForValidation(instruction);
+    if (!/\b(?:rerout(?:e|ed|ing)|route|routed centerline|centerline|common trunk)\b/i.test(reviewDirective)) {
+      return void 0;
+    }
+    if (routeGeometryFingerprint(previousSource) === routeGeometryFingerprint(updatedSource)) {
+      return "route rework did not change any route-defining executable geometry; formatting, comments, appearance, and unrelated profile edits do not satisfy this review";
+    }
+    const compactPrevious = previousSource.replace(/\s+/g, "");
+    const compactUpdated = updatedSource.replace(/\s+/g, "");
+    const positiveRouteTargetVectors = Array.from(reviewDirective.matchAll(
+      /\b(?:passing\s+through|terminating\s+at|toward|preserv(?:e|es|ed|ing)|retain(?:s|ed|ing)?|maintain(?:s|ed|ing)?|keep(?:s|ing)?)\b[^;\n]*?(?=(?:\.(?:\s|$))|;|\n|$)/gi
+    )).flatMap((match) => numericCoordinateVectors(match[0] ?? ""));
+    const requiredWaypointVectors = new Set(
+      [
+        ...routeThroughWaypointContract(reviewDirective, previousSource)?.globalWaypoints ?? [],
+        ...positiveRouteTargetVectors
+      ].map(formatNumericVector).map((vector) => vector.replace(/\s+/g, ""))
+    );
+    const explicitlyRejectedVectors = Array.from(reviewDirective.matchAll(
+      /\b(?:stale|old|previous|wrong|incorrect|rejected?|replace(?:d|ment)?|remov(?:e|ed|ing)|delet(?:e|ed|ing)|discard(?:ed|ing)?|must\s+not|do\s+not\s+(?:keep|preserve|retain)|(?:change|move|reroute|relocate|shift)[^;\n]*?\bfrom)\b[^;\n]*?(?=(?:\.(?:\s|$))|;|\n|$)/gi
+    )).flatMap((match) => coordinateVectors(match[0] ?? ""));
+    const citedExistingVectors = Array.from(new Set(explicitlyRejectedVectors)).filter((vector) => compactPrevious.includes(vector)).filter((vector) => !requiredWaypointVectors.has(vector));
+    if (citedExistingVectors.length > 0 && citedExistingVectors.some((vector) => compactUpdated.includes(vector))) {
+      return `route rework preserved an explicitly rejected stale coordinate vector (${citedExistingVectors.join(", ")}); recompute the named route instead of retaining it`;
+    }
+    const requiredInterfaceFields = [
+      /\b(?:update|revise|correct)\b[\s\S]{0,220}\b(?:mate points?|route mates?)\b/i.test(reviewDirective) ? "mate_points" : void 0,
+      /\b(?:update|revise|correct)\b[\s\S]{0,220}\b(?:bounding box|bounds|bbox)\b/i.test(reviewDirective) ? "bbox_mm" : void 0
+    ].filter((field) => field !== void 0);
+    for (const field of requiredInterfaceFields) {
+      const previousValue = interfaceFieldValue(previousSource, field);
+      const updatedValue = interfaceFieldValue(updatedSource, field);
+      if (updatedValue === void 0) {
+        return `route rework removed the required ${field} interface field`;
+      }
+      if (previousValue !== void 0 && previousValue === updatedValue) {
+        return `route rework left the required ${field} interface field unchanged`;
+      }
+    }
+    const spanContract = routeEndpointSpanContract(reviewDirective, previousSource);
+    if (spanContract !== void 0) {
+      const startPoint = interfaceNamedPoint(updatedSource, spanContract.startName);
+      const endPoint = interfaceNamedPoint(updatedSource, spanContract.endName);
+      if (startPoint === void 0 || endPoint === void 0) {
+        return `route rework must preserve named interface points ${spanContract.startName} and ${spanContract.endName} for endpoint-span validation`;
+      }
+      const actualSpan = Math.hypot(
+        endPoint[0] - startPoint[0],
+        endPoint[1] - startPoint[1],
+        endPoint[2] - startPoint[2]
+      );
+      if (Math.abs(actualSpan - spanContract.span) > 0.5) {
+        return `route endpoint span is ${actualSpan.toFixed(2)} mm; ${spanContract.startName} to ${spanContract.endName} must be ${spanContract.span.toFixed(2)} mm within 0.5 mm`;
+      }
+      const centerlineLength = routeCenterlineLength(updatedSource);
+      if (spanContract.centerlineMustExceedSpan && (centerlineLength === void 0 || centerlineLength <= spanContract.span)) {
+        return `routed centerline must exceed the ${spanContract.span.toFixed(2)} mm straight-line endpoint distance before allowing for its bend`;
+      }
+      if (spanContract.centerlineMaximum !== void 0 && (centerlineLength === void 0 || centerlineLength > spanContract.centerlineMaximum)) {
+        return `routed centerline is ${centerlineLength?.toFixed(2) ?? "undocumented"} mm; the shortened ${spanContract.span.toFixed(2)} mm endpoint run must not exceed ${spanContract.centerlineMaximum.toFixed(2)} mm`;
+      }
+    }
+    const waypointContract = routeThroughWaypointContract(reviewDirective, previousSource);
+    if (waypointContract !== void 0) {
+      const interfaceVectors = numericCoordinateVectors(interfaceFieldValue(updatedSource, "mate_points") ?? "");
+      const executableVectors = numericCoordinateVectors(stripImportLines(updatedSource).split("\n").filter((line) => !line.trim().startsWith("//")).join("\n"));
+      const executablePairs = numericCoordinatePairs(stripImportLines(updatedSource).split("\n").filter((line) => !line.trim().startsWith("//")).join("\n"));
+      for (const waypoint of waypointContract.localWaypoints) {
+        if (!interfaceVectors.some((candidate) => vectorsNear(candidate, waypoint))) {
+          return `route mate_points do not include required worker-local main-sleeve waypoint ${formatNumericVector(waypoint)}`;
+        }
+        const appearsInExecutableRoute = executableVectors.some((candidate) => vectorsNear(candidate, waypoint)) || Math.abs(waypoint[0]) <= 0.05 && executablePairs.some((candidate) => Math.abs(candidate[0] - waypoint[1]) <= 0.05 && Math.abs(candidate[1] - waypoint[2]) <= 0.05);
+        if (!appearsInExecutableRoute) {
+          return `executable route does not traverse required worker-local main-sleeve waypoint ${formatNumericVector(waypoint)}`;
+        }
+      }
+    }
+    const controllerContract = controllerMateContract(reviewDirective);
+    if (controllerContract !== void 0) {
+      const translation = parentInterfaceTranslation(updatedSource);
+      const controllerTip = interfaceNamedPoint(updatedSource, "controllerCopperTip");
+      if (translation === void 0 || controllerTip === void 0) {
+        return "controller-mate rework must document controllerCopperTip and a numeric or identity parent_interface transform";
+      }
+      const assembledControllerTip = controllerTip.map((value, index) => value + translation[index]);
+      if (controllerContract.targetY !== void 0 && Math.abs(assembledControllerTip[1] - controllerContract.targetY) > 2 || assembledControllerTip[2] < controllerContract.targetZMin - 2 || assembledControllerTip[2] > controllerContract.targetZMax + 2) {
+        return `assembled controllerCopperTip remains ${formatNumericVector(assembledControllerTip)}; it must land ${controllerContract.targetY === void 0 ? "" : `near Y=${controllerContract.targetY.toFixed(3)} mm and `}near Z=${controllerContract.targetZMin.toFixed(3)}..${controllerContract.targetZMax.toFixed(3)} mm`;
+      }
+      const mainSleeveExit = interfaceNamedPoint(updatedSource, "mainSleeveExit");
+      const requiredLocalZSpan = Math.abs(
+        (controllerContract.targetZMin + controllerContract.targetZMax) / 2 - controllerContract.currentZ
+      ) * 0.5;
+      if (mainSleeveExit === void 0 || Math.abs(mainSleeveExit[2] - controllerTip[2]) < requiredLocalZSpan) {
+        return `mainSleeveExit must leave the controller datum by at least ${requiredLocalZSpan.toFixed(2)} mm in local Z to enter the common elevated trunk; a near-Z=0 route is rejected`;
+      }
+    }
+    return void 0;
+  };
+  var explicitPlacementReviewStart = "MANDATORY EXPLICIT PLACEMENT REVIEW START";
+  var explicitPlacementReviewEnd = "MANDATORY EXPLICIT PLACEMENT REVIEW END";
+  var acceptanceDirectiveFor = (instruction) => {
+    const startIndex = instruction.indexOf(explicitPlacementReviewStart);
+    const endIndex = instruction.indexOf(explicitPlacementReviewEnd);
+    if (startIndex >= 0 && endIndex > startIndex) {
+      return instruction.slice(startIndex + explicitPlacementReviewStart.length, endIndex).trim();
+    }
+    return instruction.split(assemblyContextMarker, 1)[0] ?? instruction;
+  };
+  var reworkRequiresExecutableChange = (instruction) => /\b(remove|delete|reroute|re-?place|rebuild|revise|repair|move|rotate|translate|align|seat|connect|resize|reshape|replace)\b/i.test(acceptanceDirectiveFor(instruction));
+  var importFrameContractMarker = "MANDATORY IMPORT-FRAME CONTRACT";
+  var assemblyContextMarker = "Assembly context for this geometry rework follows.";
+  var requiresTransformableRepeatContract = (instruction) => /\b(?:transformable|clone[- ]safe|reusable)\b/i.test(instruction) && /\b(?:clon(?:e|ed|able|ing)|mirror|mirrored|pattern|instances?|opposite conductor)\b/i.test(instruction) || /\bsingle\s+canonical\s+(?:part|component|conductor)\b/i.test(instruction) && /\b(?:two|multiple)\b[\s\S]{0,80}\b(?:positions?|instances?|conductors?)\b/i.test(instruction);
+  var importFrameContractViolation = (instruction, source) => {
+    if (!instruction.includes(importFrameContractMarker)) return void 0;
+    const finalExpression = source.split("\n").map((line) => line.trim()).filter((line) => line.length > 0 && !line.startsWith("//")).at(-1) ?? "";
+    const manifestName = source.match(/^\s*\/\/\s*exported_aggregate:\s*([A-Za-z_][A-Za-z0-9_]*)/m)?.[1];
+    if (manifestName === void 0) return void 0;
+    const escapedManifestName = manifestName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const manifestNameIsBound = new RegExp(
+      `\\b${escapedManifestName}\\s*(?::\\s*[^\\n=]+)?\\s*=`
+    ).test(source);
+    const exportedName = manifestNameIsBound || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(finalExpression) ? manifestName : finalExpression;
+    const escapedName = exportedName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const exportedAggregateIsArray = new RegExp(`\\b${escapedName}\\s*(?::\\s*\\[[^\\n=]+\\])?\\s*=\\s*(?:flatten\\s*\\(\\s*)?\\[`).test(source) || /^\s*\/\/\s*(?:exported_aggregate_type|parent_interface):.*(?:\[any(?:;|\])|flattened\s+(?:array|aggregate)|multi-body\s+aggregate)/im.test(source);
+    const reviewDirective = instruction.split(assemblyContextMarker, 1)[0] ?? instruction;
+    if (requiresTransformableRepeatContract(reviewDirective)) {
+      if (exportedAggregateIsArray) {
+        return `flattened export ${exportedName} cannot satisfy the mandatory transformable-repeat contract: return one default exported Solid that the parent can clone, mirror, rotate, and translate; do not return an array or an identity-fixed multi-body aggregate`;
+      }
+      if (finalExpression !== exportedName) {
+        return `export ${exportedName} is not the file's final executable expression: after all hide and helper calls, end the KCL with a standalone ${exportedName} line so imports receive the cloneable Solid`;
+      }
+      return void 0;
+    }
+    if (!exportedAggregateIsArray) return void 0;
+    const parentInterface = source.match(/^\s*\/\/\s*parent_interface:\s*(.*)$/m)?.[1] ?? "";
+    const zeroTransformVector = String.raw`\[\s*0(?:\.0+)?(?:mm|deg)?\s*,\s*0(?:\.0+)?(?:mm|deg)?\s*,\s*0(?:\.0+)?(?:mm|deg)?\s*\]`;
+    const declaresZeroTranslation = /\b(?:zero|no)\s+translation\b/i.test(parentInterface) || new RegExp(`\btranslations*(?:=|:)?s*${zeroTransformVector}`, "i").test(parentInterface);
+    const declaresZeroRotation = /\b(?:zero|no)\s+rotation\b/i.test(parentInterface) || /\b(?:zero|no)\s+translation\s+and\s+rotation\b/i.test(parentInterface) || new RegExp(`\brotations*(?:=|:)?s*${zeroTransformVector}`, "i").test(parentInterface);
+    if (/identity/i.test(parentInterface) && declaresZeroTranslation && declaresZeroRotation) return void 0;
+    return `flattened export ${exportedName} violates the mandatory import-frame contract: its parent_interface must declare identity placement, zero translation, and zero rotation, and its KCL coordinates must already be in the owning parent frame`;
+  };
   var directAssemblyBlockStart = "// ZOOKEEPER_WALL_DIRECT_CHILDREN_START";
   var directAssemblyBlockEnd = "// ZOOKEEPER_WALL_DIRECT_CHILDREN_END";
+  var authoredAssemblyPlacementMarker = "// ZOOKEEPER_WALL_PLACEMENT_AUTHORED";
   var stripDirectAssemblyBlock = (source) => {
     const start = source.indexOf(directAssemblyBlockStart);
     if (start < 0) return source;
@@ -3577,9 +3939,119 @@
     }
     return zooClient;
   };
+  var postIsolatedSnapshotResult = async (jobId, result) => {
+    const response = await fetch("/api/render-job-complete", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jobId, ...result })
+    });
+    if (!response.ok) throw await httpErrorFromResponse(response, "isolated snapshot completion");
+  };
+  var runIsolatedSnapshotJob = async (zooClient, jobId) => {
+    document.title = `Zoo Snapshot ${jobId.slice(0, 8)}`;
+    document.body.replaceChildren();
+    document.body.style.width = `${snapshotViewerSize.width}px`;
+    document.body.style.height = `${snapshotViewerSize.height}px`;
+    document.body.style.margin = "0";
+    document.body.style.overflow = "hidden";
+    try {
+      const response = await fetch(`/api/render-job?id=${encodeURIComponent(jobId)}`, {
+        cache: "no-store"
+      });
+      if (!response.ok) throw await httpErrorFromResponse(response, "isolated snapshot job");
+      const payload = await response.json();
+      if (payload.files === void 0 || typeof payload.mainFilePath !== "string") {
+        throw new Error("isolated snapshot job returned an invalid project");
+      }
+      const view = new ZooWebView({
+        zooClient,
+        size: snapshotViewerSize,
+        allowConcurrentViews: true,
+        showStartLogo: false
+      });
+      view.el.style.width = `${snapshotViewerSize.width}px`;
+      view.el.style.height = `${snapshotViewerSize.height}px`;
+      document.body.append(view.el);
+      let transportReady = false;
+      view.addEventListener("ready", () => {
+        transportReady = true;
+      }, { once: true });
+      view.start();
+      const video = view.el.querySelector("video");
+      const readyDeadline = Date.now() + 3e4;
+      while ((!transportReady || view.rtc === void 0 || video?.srcObject === null || (video?.readyState ?? 0) < HTMLMediaElement.HAVE_CURRENT_DATA) && Date.now() < readyDeadline) await wait(80);
+      if (!transportReady || view.rtc === void 0 || video?.srcObject === null || (video?.readyState ?? 0) < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        throw new Error("isolated snapshot transport did not become ready within 30 seconds");
+      }
+      const project = {
+        files: new Map(Object.entries(payload.files)),
+        mainFilePath: payload.mainFilePath
+      };
+      const submitTimeoutMs = typeof payload.submitTimeoutMs === "number" ? Math.max(snapshotSubmitTimeoutMs, Math.min(payload.submitTimeoutMs, 6e5)) : snapshotSubmitTimeoutMs;
+      await withTimeout(
+        view.rtc.executor().submit(
+          project.files,
+          { mainKclPathName: project.mainFilePath }
+        ),
+        submitTimeoutMs,
+        "isolated snapshot KCL submit"
+      );
+      sendInitialCameraCommands(view);
+      const canvas = document.createElement("canvas");
+      const validationCanvas = document.createElement("canvas");
+      validationCanvas.width = 192;
+      validationCanvas.height = 108;
+      let dataUrl = "";
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await wait(attempt === 0 ? snapshotFrameWaitMs : 1200);
+        if (video.videoWidth === 0 || video.videoHeight === 0) continue;
+        const scale = Math.min(
+          1,
+          snapshotViewerSize.width / video.videoWidth,
+          snapshotViewerSize.height / video.videoHeight
+        );
+        canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+        canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        const validation = validationCanvas.getContext("2d", { willReadFrequently: true });
+        if (context === null || validation === null) throw new Error("isolated snapshot canvas is unavailable");
+        context.fillStyle = "#05070b";
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        validation.drawImage(canvas, 0, 0, validationCanvas.width, validationCanvas.height);
+        const pixels = validation.getImageData(
+          0,
+          0,
+          validationCanvas.width,
+          validationCanvas.height
+        ).data;
+        let minimumLuminance = 255;
+        let maximumLuminance = 0;
+        for (let index = 0; index < pixels.length; index += 4) {
+          const luminance = pixels[index] * 0.2126 + pixels[index + 1] * 0.7152 + pixels[index + 2] * 0.0722;
+          minimumLuminance = Math.min(minimumLuminance, luminance);
+          maximumLuminance = Math.max(maximumLuminance, luminance);
+        }
+        validation.clearRect(0, 0, validationCanvas.width, validationCanvas.height);
+        if (maximumLuminance - minimumLuminance < 8) continue;
+        dataUrl = canvas.toDataURL("image/webp", 0.86);
+        break;
+      }
+      if (dataUrl.length === 0) throw new Error("isolated snapshot renderer returned a blank frame");
+      await postIsolatedSnapshotResult(jobId, { dataUrl });
+      await view.deconstructor();
+    } catch (error) {
+      await postIsolatedSnapshotResult(jobId, { error: errorToMessage(error) }).catch(() => {
+      });
+    }
+  };
   document.addEventListener("DOMContentLoaded", () => {
     installWorkerWebSocketSendQueuePatch();
     const zooClient = createZooClient();
+    if (isolatedSnapshotJobId.length > 0) {
+      void runIsolatedSnapshotJob(zooClient, isolatedSnapshotJobId);
+      return;
+    }
     const wallChannel = typeof BroadcastChannel === "undefined" ? void 0 : new BroadcastChannel(wallBroadcastChannelName);
     const root = document.createElement("main");
     root.classList.add("wall-root");
@@ -3592,19 +4064,28 @@
     if (!isControllerWindow) {
       document.body.classList.add("wall-display-only");
     }
+    if (isHeadlessController) {
+      document.title = "Zoo Wall Controller";
+      document.body.classList.add("wall-headless-controller");
+    }
     document.body.append(root);
     const snapshotCaptureHost = document.createElement("div");
     snapshotCaptureHost.classList.add("snapshot-capture-host");
-    if (isControllerWindow && useAgentCadSnapshots) document.body.append(snapshotCaptureHost);
+    if (isControllerWindow && useAgentCadSnapshots && !useIsolatedSnapshotRenderer) document.body.append(snapshotCaptureHost);
     const monitorElements = /* @__PURE__ */ new Map();
     const agents = /* @__PURE__ */ new Map();
+    const agentChildren = /* @__PURE__ */ new Map();
     const timers = /* @__PURE__ */ new Set();
     const cameraTimers = /* @__PURE__ */ new Set();
     const reviewTimers = /* @__PURE__ */ new Map();
     const placementTimers = /* @__PURE__ */ new Map();
     const draftRenderChains = /* @__PURE__ */ new Map();
     const agentWorkRevisions = /* @__PURE__ */ new Map();
-    const activeAgentWorkIds = /* @__PURE__ */ new Set();
+    const activeAgentWorkIds = /* @__PURE__ */ new Map();
+    const activeAgentWorkRequests = /* @__PURE__ */ new Map();
+    const activeAgentWorkPhaseStartedAtMs = /* @__PURE__ */ new Map();
+    const untrackedAgentStatusStartedAtMs = /* @__PURE__ */ new Map();
+    const workStatusMissingPollsById = /* @__PURE__ */ new Map();
     const pendingAgentWorkRequests = /* @__PURE__ */ new Map();
     const snapshotJobs = /* @__PURE__ */ new Map();
     const workWaiters = /* @__PURE__ */ new Map();
@@ -3612,9 +4093,11 @@
     const reviewQueue = /* @__PURE__ */ new Map();
     const activeReviewRevisions = /* @__PURE__ */ new Map();
     const completedReviewRevisions = /* @__PURE__ */ new Map();
+    const upstreamReviewDirectives = /* @__PURE__ */ new Map();
     const bomPlanningAgentIds = /* @__PURE__ */ new Set();
     const activeReviewRequests = /* @__PURE__ */ new Set();
     const supervisorReviewAtMs = /* @__PURE__ */ new Map();
+    let upstreamReviewDirectiveId = 0;
     let workEventAbort;
     let runRequestAbort;
     let rootRenderTimer;
@@ -3622,8 +4105,15 @@
     let layoutTimer;
     let aggregateTimeTimer;
     let supervisorTimer;
+    let reviewQueueDrainTimer;
     let supervisorLastSummaryAtMs = 0;
+    let rootSupervisorRecoveryCount = 0;
+    let rootLastSupervisorRecoveryAtMs = 0;
     let workEventSessionId = "";
+    let workEventReconnectTimer;
+    let workEventReconnectAttempt = 0;
+    let workEventLastMessageAtMs = 0;
+    let workEventRecycleCount = 0;
     let runId = 0;
     let startInProgress = false;
     let active = false;
@@ -3636,9 +4126,11 @@
     let activeSessionId = "";
     let rootActiveStartedAtMs;
     let rootElapsedMs = 0;
+    let aggregateElapsedFloorMs = 0;
     let activeSource = "fallback";
     let rootReviewRounds = 0;
     let rootInstruction = "Coordinate the complete assembly and merge child KCL into the root view.";
+    let rootLogEntries = [];
     let kclFiles = /* @__PURE__ */ new Map();
     let interfaceManifests = /* @__PURE__ */ new Map();
     let rootImports = /* @__PURE__ */ new Set();
@@ -3646,17 +4138,22 @@
     let snapshotViewStarting;
     let snapshotViewDisposing;
     let snapshotViewSubmissionCount = 0;
+    let agentSnapshotRenderTail = Promise.resolve();
+    let centerSnapshotRenderTail = Promise.resolve();
     let snapshotDrainPromise;
     const snapshotPersistenceJobs = /* @__PURE__ */ new Map();
     let snapshotPersistenceDrainPromise;
     const snapshotCanvas = document.createElement("canvas");
     const snapshotValidationCanvas = document.createElement("canvas");
-    snapshotValidationCanvas.width = 64;
-    snapshotValidationCanvas.height = 36;
+    snapshotValidationCanvas.width = 192;
+    snapshotValidationCanvas.height = 108;
     let capacityWarningRun = -1;
+    let requestWallCheckpoint = () => {
+    };
     const broadcastWall = (message) => {
       if (!isControllerWindow) return;
       wallChannel?.postMessage(message);
+      requestWallCheckpoint();
     };
     const centerTile = document.createElement("section");
     centerTile.classList.add("wall-tile", "orchestrator-tile");
@@ -3680,6 +4177,7 @@
     let centerCoalescedRenderCount = 0;
     let centerViewSubmissionCount = 0;
     let lastGoodCenterProject;
+    let lastGoodCenterSnapshotDataUrl;
     const centerStatus = document.createElement("div");
     centerStatus.classList.add("center-status");
     centerStatus.textContent = "Zookeeper ready";
@@ -3709,6 +4207,38 @@
       }).catch(() => {
       });
     };
+    window.__zooWallDebug = () => ({
+      runId,
+      phase: runPhase,
+      sessionId: activeSessionId,
+      activeAgentWork: Array.from(activeAgentWorkIds.entries()),
+      activeAgentWorkPhaseStartedAtMs: Object.fromEntries(activeAgentWorkPhaseStartedAtMs),
+      untrackedAgentStatusStartedAtMs: Object.fromEntries(untrackedAgentStatusStartedAtMs),
+      workStatusMissingPollsById: Object.fromEntries(workStatusMissingPollsById),
+      workEventLastMessageAtMs,
+      workEventLastMessageAgeMs: workEventLastMessageAtMs === 0 ? void 0 : Date.now() - workEventLastMessageAtMs,
+      workEventRecycleCount,
+      pendingAgentWork: Array.from(pendingAgentWorkRequests.keys()),
+      workWaiters: Array.from(workWaiters.entries()).map(([workId, waiter]) => ({
+        workId,
+        agentId: waiter.agent.id,
+        workRevision: waiter.workRevision
+      })),
+      bomPlanningAgents: Array.from(bomPlanningAgentIds),
+      activeReviews: Array.from(activeReviewRequests),
+      queuedReviews: Array.from(reviewQueue.keys()),
+      reviewTimers: Array.from(reviewTimers.keys()),
+      placementTimers: Array.from(placementTimers.keys()),
+      draftRenderChains: Array.from(draftRenderChains.keys()),
+      snapshotJobs: Array.from(snapshotJobs.keys()),
+      snapshotPersistenceJobs: Array.from(snapshotPersistenceJobs.keys()),
+      unsettledAgents: Array.from(agents.values()).filter((agent) => agent.status !== "complete").map((agent) => ({
+        id: agent.id,
+        status: agent.status,
+        activeStartedAtMs: agent.activeStartedAtMs,
+        lastActivityAtMs: agent.lastActivityAtMs
+      }))
+    });
     const closeActiveSession = (reason) => {
       const sessionId = activeSessionId;
       if (sessionId.length === 0) return;
@@ -3754,6 +4284,14 @@
       root.dataset.rootStatus = status;
       renderAllGraphs();
       reportRuntimeEvent("phase");
+      broadcastWall({
+        type: "runtime",
+        phase,
+        rootStatus: status,
+        blockers: root.dataset.completionBlockers ?? "",
+        aggregateTime: aggregateTime?.textContent ?? void 0,
+        centerStatus: centerStatus?.textContent ?? void 0
+      });
     };
     const aggregateTime = document.createElement("div");
     aggregateTime.classList.add("aggregate-time");
@@ -3814,7 +4352,14 @@
   `;
     const assemblyRenderer = document.createElement("div");
     assemblyRenderer.classList.add("assembly-renderer");
-    assemblyRenderer.append(centerView.el);
+    if (useStaticCenterCad) {
+      const placeholder = document.createElement("div");
+      placeholder.classList.add("agent-viewer-placeholder");
+      placeholder.textContent = "Assembly snapshot pending";
+      assemblyRenderer.append(placeholder);
+    } else {
+      assemblyRenderer.append(centerView.el);
+    }
     assemblyPanel.appendChild(assemblyRenderer);
     orchestratorConsole.append(promptInput, controls, centerStatus, assemblyPanel, rootLog);
     const centerOverlay = document.createElement("div");
@@ -3830,6 +4375,8 @@
       target.scrollTop = target.scrollHeight;
     };
     const rootLogLine = (line, direction = "sys") => {
+      rootLogEntries.push({ line, direction });
+      if (rootLogEntries.length > 160) rootLogEntries = rootLogEntries.slice(-160);
       writeLog(rootLog, line, direction, 160);
       broadcastWall({ type: "root:log", line, direction });
     };
@@ -3846,14 +4393,17 @@
     const aggregateAgentTimeMs = () => {
       const now = Date.now();
       const rootActiveElapsed = rootActiveStartedAtMs === void 0 ? 0 : now - rootActiveStartedAtMs;
-      return Array.from(agents.values()).reduce((total, agent) => {
+      const calculated = Array.from(agents.values()).reduce((total, agent) => {
         const elapsed = agent.elapsedMs ?? 0;
         const activeElapsed = agent.activeStartedAtMs === void 0 ? 0 : now - agent.activeStartedAtMs;
         return total + elapsed + activeElapsed;
       }, rootElapsedMs + rootActiveElapsed);
+      aggregateElapsedFloorMs = Math.max(aggregateElapsedFloorMs, calculated);
+      return aggregateElapsedFloorMs;
     };
     const updateAggregateTime = () => {
       aggregateTime.textContent = `Aggregate Agent Time: ${formatAggregateAgentTime(aggregateAgentTimeMs())}`;
+      requestWallCheckpoint();
     };
     const startAggregateTimeTicker = () => {
       if (aggregateTimeTimer !== void 0) return;
@@ -3878,12 +4428,35 @@
       }
       return agents.get(id);
     };
-    const graphChildren = (id) => Array.from(agents.values()).filter((agent) => agent.parentId === id).sort((a, b) => a.id.localeCompare(b.id));
+    const graphChildren = (id) => Array.from(agentChildren.get(id) ?? []).map((agentId) => agents.get(agentId)).filter((agent) => agent !== void 0).sort((a, b) => a.id.localeCompare(b.id));
+    const indexAgentParent = (agentId, parentId) => {
+      const children = agentChildren.get(parentId) ?? /* @__PURE__ */ new Set();
+      children.add(agentId);
+      agentChildren.set(parentId, children);
+    };
+    const unindexAgentParent = (agentId, parentId) => {
+      const children = agentChildren.get(parentId);
+      if (children === void 0) return;
+      children.delete(agentId);
+      if (children.size === 0) agentChildren.delete(parentId);
+    };
     const isReusableLibraryAgent = (agent) => agent.kind === "orchestrator" && /\b(reusable|shared|library|catalog|standard)\b/i.test(agent.role);
     const agentTileIndex = (agent) => {
+      if (agent.assignedTileIndex !== void 0) return agent.assignedTileIndex;
       const agentIndex = Array.from(agents.keys()).indexOf(agent.id);
       if (agentIndex < 0) return void 0;
       return perimeterOrder[agentIndex % perimeterOrder.length];
+    };
+    const agentGraphDepth = (agent) => {
+      let depth = 1;
+      let parentId = agent.parentId;
+      const visited = /* @__PURE__ */ new Set([agent.id]);
+      while (parentId !== "" && parentId !== rootAgentId && !visited.has(parentId)) {
+        visited.add(parentId);
+        depth += 1;
+        parentId = agents.get(parentId)?.parentId ?? rootAgentId;
+      }
+      return depth;
     };
     const shouldRenderAgentLocally = (agent) => {
       if (isReusableLibraryAgent(agent)) return false;
@@ -3891,7 +4464,44 @@
       if (!isWallTileMode) return true;
       return agentTileIndex(agent) === wallTileIndex;
     };
+    const graphRenderSignatures = /* @__PURE__ */ new WeakMap();
+    const graphStatusClasses = ["queued", "starting", "running", "reviewing", "complete", "error"];
+    const graphSignatureFor = (startId) => {
+      const visited = /* @__PURE__ */ new Set();
+      const signature = [];
+      const visit = (id) => {
+        if (visited.has(id)) return;
+        visited.add(id);
+        const agent = graphNode(id);
+        if (agent === void 0) return;
+        signature.push([
+          agent.id,
+          agent.parentId,
+          agent.kind,
+          agent.scope ?? "",
+          agent.name,
+          agent.role,
+          ...agent.imports ?? []
+        ].join(""));
+        graphChildren(id).forEach((child) => visit(child.id));
+      };
+      visit(startId);
+      return signature.join("");
+    };
+    const updateGraphStatuses = (container) => {
+      container.querySelectorAll(".graph-node[data-agent-id]").forEach((element) => {
+        const agent = graphNode(element.dataset.agentId ?? "");
+        if (agent === void 0) return;
+        graphStatusClasses.forEach((status) => element.classList.remove(`graph-status-${status}`));
+        element.classList.add(`graph-status-${agent.status}`);
+      });
+    };
     const renderGraphFor = (container, startId, compact) => {
+      const signature = graphSignatureFor(startId);
+      if (graphRenderSignatures.get(container) === signature) {
+        updateGraphStatuses(container);
+        return;
+      }
       const edges = [];
       const points = /* @__PURE__ */ new Map();
       const visited = /* @__PURE__ */ new Set();
@@ -4019,7 +4629,7 @@
         const secondarySvg = secondaryLabel === "" ? "" : `<text class="graph-role" x="14" y="${Math.round(metrics.height * 0.57)}" style="font-size: ${detailSize}px">${escapeHtml(secondaryLabel)}</text>`;
         const bomSvg = bomLabel === "" ? "" : `<text class="graph-bom" x="14" y="${Math.round(metrics.height * 0.8)}" style="font-size: ${detailSize}px">${escapeHtml(bomLabel)}</text>`;
         return `
-        <g class="graph-node graph-${agent.kind} graph-status-${agent.status}" data-depth="${point.depth}" transform="translate(${point.x} ${point.y})">
+        <g class="graph-node graph-${agent.kind} graph-status-${agent.status}" data-agent-id="${escapeHtml(agent.id)}" data-depth="${point.depth}" transform="translate(${point.x} ${point.y})">
           <rect width="${metrics.width}" height="${metrics.height}" rx="6" style="--node-color: ${agent.color}" />
           <circle class="graph-state-dot" cx="${metrics.width - 16}" cy="16" r="${Math.max(3, Math.round((compact ? 5 : 6) * metrics.scale))}" />
           <text class="graph-name" x="14" y="${primaryY}" style="font-size: ${nameSize}px">${escapeHtml(primaryLabel)}</text>
@@ -4034,28 +4644,36 @@
         ${nodeSvg}
       </svg>
     `;
+      graphRenderSignatures.set(container, signature);
     };
     const renderAllGraphsNow = () => {
-      if (!isWallTileMode || isControllerWindow) {
+      if (isHeadlessController) return;
+      if (!isWallTileMode || isControllerWindow || wallTileIndex === centerIndex) {
         renderGraphFor(rootGraph, rootAgentId, false);
         graphPanel.querySelector(".graph-count").textContent = `${agents.size} agents`;
       }
       for (const agent of agents.values()) {
         if (agent.kind !== "orchestrator" || agent.graphElement === void 0) continue;
+        if (isWallTileMode && !shouldRenderAgentLocally(agent)) continue;
         renderGraphFor(agent.graphElement, agent.id, true);
       }
     };
     const renderAllGraphs = () => {
+      if (isHeadlessController) return;
       if (graphRenderTimer !== void 0) return;
+      const delay = agents.size >= 250 ? 3e3 : agents.size >= 80 ? 1500 : 400;
       graphRenderTimer = window.setTimeout(() => {
         graphRenderTimer = void 0;
         renderAllGraphsNow();
-      }, 120);
+      }, delay);
     };
     const layoutAgentsNow = () => {
+      if (isHeadlessController) return;
       const buckets = perimeterOrder.map(() => []);
       Array.from(agents.values()).forEach((agent, index) => {
-        buckets[index % perimeterOrder.length].push(agent);
+        const monitorIndex = agentTileIndex(agent) ?? perimeterOrder[index % perimeterOrder.length];
+        const bucketIndex = perimeterOrder.indexOf(monitorIndex);
+        buckets[bucketIndex < 0 ? index % perimeterOrder.length : bucketIndex].push(agent);
       });
       buckets.forEach((bucket, bucketIndex) => {
         const monitorIndex = perimeterOrder[bucketIndex];
@@ -4091,6 +4709,7 @@
       });
     };
     const layoutAgents = () => {
+      if (isHeadlessController) return;
       if (layoutTimer !== void 0) return;
       layoutTimer = window.setTimeout(() => {
         layoutTimer = void 0;
@@ -4213,7 +4832,68 @@
         reader.readAsDataURL(image);
       }), snapshotCaptureTimeoutMs, "snapshot data URL conversion");
     };
+    const withSnapshotRenderer = async (operation, lane = "agent") => {
+      const previous = lane === "center" ? centerSnapshotRenderTail : agentSnapshotRenderTail;
+      let release = () => {
+      };
+      const next = new Promise((resolve) => {
+        release = resolve;
+      });
+      if (lane === "center") centerSnapshotRenderTail = next;
+      else agentSnapshotRenderTail = next;
+      await previous.catch(() => {
+      });
+      try {
+        return await operation();
+      } finally {
+        release();
+      }
+    };
+    const renderProjectSnapshot = (project, label, snapshotId) => {
+      const operation = async () => {
+        if (useIsolatedSnapshotRenderer) {
+          const response = await runFetchWithTimeout("/api/render-snapshot", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              files: objectFromMap(project.files),
+              mainFilePath: project.mainFilePath,
+              label,
+              snapshotId
+            })
+          }, isolatedSnapshotTimeoutMs, `${label} isolated snapshot`);
+          if (!response.ok) throw await httpErrorFromResponse(response, `${label} isolated snapshot`);
+          const payload = await response.json();
+          const snapshotUrl = typeof payload.url === "string" ? payload.url : payload.dataUrl;
+          if (typeof snapshotUrl !== "string" || snapshotUrl.length === 0) {
+            throw new Error(`${label} isolated snapshot returned no image`);
+          }
+          return snapshotUrl;
+        }
+        try {
+          const view = await waitForSnapshotView();
+          snapshotViewSubmissionCount += 1;
+          await withTimeout(submitProject(view, project, (message) => {
+            throw new Error(message);
+          }), snapshotSubmitTimeoutMs, `${label} submit`);
+          return await captureSnapshotDataUrl(view);
+        } catch (error) {
+          await disposeSnapshotView();
+          throw error;
+        } finally {
+          if (snapshotViewSubmissionCount >= maxSnapshotSubmissionsPerRenderer) {
+            await disposeSnapshotView();
+          }
+        }
+      };
+      if (useIsolatedSnapshotRenderer) return operation();
+      return withSnapshotRenderer(
+        operation,
+        label.startsWith("center ") ? "center" : "agent"
+      );
+    };
     const persistSnapshot = async (agentId, dataUrl) => {
+      if (dataUrl.startsWith("/snapshots/")) return dataUrl;
       const response = await runFetchWithTimeout("/api/snapshot", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -4326,6 +5006,7 @@
     const setAgentSnapshotState = (agent, state, message = "") => {
       agent.snapshotState = state;
       agent.snapshotMessage = message;
+      agent.snapshotStateChangedAtMs = Date.now();
       if (state === "ready") {
         agent.snapshotRecoveryCount = 0;
         agent.lastSnapshotRecoveryAtMs = void 0;
@@ -4339,67 +5020,77 @@
       });
       scheduleRunCompletionCheck();
     };
-    const drainAgentSnapshots = async () => {
-      while (snapshotJobs.size > 0) {
-        const next = Array.from(snapshotJobs.entries()).sort((left, right) => {
-          const leftAgent = agents.get(left[0]);
-          const rightAgent = agents.get(right[0]);
-          const priority = (agent2, job2) => {
-            const missingVisual = agent2?.snapshotUrl === void 0;
-            if (missingVisual && job2.kind === "final") return 0;
-            if (missingVisual) return 1;
-            if (job2.kind === "final") return 2;
-            return 3;
-          };
-          return priority(leftAgent, left[1]) - priority(rightAgent, right[1]);
-        })[0];
-        if (next === void 0) break;
-        const [agentId, job] = next;
-        snapshotJobs.delete(agentId);
-        const agent = agents.get(agentId);
-        if (agent === void 0 || !agentStillActive(agent, job.currentRun)) continue;
-        try {
-          setAgentSnapshotState(agent, "rendering", job.label);
-          appendAgentLog(agent, `< rendering CAD snapshot: ${job.label}`, "in");
-          const view = await waitForSnapshotView();
-          snapshotViewSubmissionCount += 1;
-          await withTimeout(submitProject(view, job.project, (message) => {
-            throw new Error(message);
-          }), snapshotSubmitTimeoutMs, "snapshot renderer submit");
-          const snapshotDataUrl = await captureSnapshotDataUrl(view);
-          if (!agentStillActive(agent, job.currentRun)) continue;
-          setAgentSnapshotState(agent, "persisting", job.label);
-          if (job.kind === "final" && job.sourceKcl.trim().length > 0) agent.lastGoodKcl = job.sourceKcl;
-          queueSnapshotPersistence(agent, job.currentRun, snapshotDataUrl, job.sourceKcl);
-          appendAgentLog(agent, `< CAD snapshot captured; persisting: ${job.label}`, "in");
-        } catch (error) {
-          const message = errorToMessage(error);
-          appendAgentLog(agent, `< CAD snapshot failed: ${message}`);
-          if (message.includes("blank frame")) {
-            if (job.kind === "final" && job.attempt < 1 && agentStillActive(agent, job.currentRun)) {
-              snapshotJobs.set(agent.id, { ...job, attempt: job.attempt + 1 });
-              setAgentSnapshotState(agent, "queued", "retry after blank frame");
-              appendAgentLog(agent, "< CAD snapshot retrying after blank frame", "in");
-            } else if (agentStillActive(agent, job.currentRun)) {
-              setAgentSnapshotState(agent, "error", "rendered frame contained no visible geometry");
-            }
-            continue;
-          }
-          await disposeSnapshotView();
-          if (job.attempt < 1 && agentStillActive(agent, job.currentRun)) {
+    const takeNextSnapshotJob = () => {
+      const next = Array.from(snapshotJobs.entries()).sort((left, right) => {
+        const leftAgent = agents.get(left[0]);
+        const rightAgent = agents.get(right[0]);
+        const priority = (agent, job) => {
+          const missingVisual = agent?.snapshotUrl === void 0;
+          if (missingVisual && job.kind === "final") return 0;
+          if (missingVisual) return 1;
+          if (job.kind === "final") return 2;
+          return 3;
+        };
+        return priority(leftAgent, left[1]) - priority(rightAgent, right[1]);
+      })[0];
+      if (next !== void 0) snapshotJobs.delete(next[0]);
+      return next;
+    };
+    const processAgentSnapshot = async (next) => {
+      const [agentId, job] = next;
+      const agent = agents.get(agentId);
+      if (agent === void 0 || !agentStillActive(agent, job.currentRun)) return;
+      try {
+        setAgentSnapshotState(agent, "rendering", job.label);
+        appendAgentLog(agent, `< rendering CAD snapshot: ${job.label}`, "in");
+        const snapshotDataUrl = await renderProjectSnapshot(
+          job.project,
+          `agent ${agent.id} snapshot`,
+          agent.id
+        );
+        if (!agentStillActive(agent, job.currentRun)) return;
+        setAgentSnapshotState(agent, "persisting", job.label);
+        if (job.kind === "final" && job.sourceKcl.trim().length > 0) agent.lastGoodKcl = job.sourceKcl;
+        queueSnapshotPersistence(agent, job.currentRun, snapshotDataUrl, job.sourceKcl);
+        appendAgentLog(agent, `< CAD snapshot captured; persisting: ${job.label}`, "in");
+      } catch (error) {
+        const message = errorToMessage(error);
+        appendAgentLog(agent, `< CAD snapshot failed: ${message}`);
+        if (message.includes("blank frame")) {
+          if (job.kind === "final" && job.attempt < 1 && agentStillActive(agent, job.currentRun)) {
             snapshotJobs.set(agent.id, { ...job, attempt: job.attempt + 1 });
-            setAgentSnapshotState(agent, "queued", "retry after renderer recovery");
-            appendAgentLog(agent, `< CAD snapshot retrying after renderer recovery`, "in");
+            setAgentSnapshotState(agent, "queued", "retry after blank frame");
+            appendAgentLog(agent, "< CAD snapshot retrying after blank frame", "in");
           } else if (agentStillActive(agent, job.currentRun)) {
-            setAgentSnapshotState(agent, "error", message);
+            setAgentSnapshotState(agent, "error", "rendered frame contained no visible geometry");
           }
-        } finally {
-          if (snapshotViewSubmissionCount >= maxSnapshotSubmissionsPerRenderer) {
-            await disposeSnapshotView();
-          }
+          return;
+        }
+        if (job.attempt < 1 && agentStillActive(agent, job.currentRun)) {
+          snapshotJobs.set(agent.id, { ...job, attempt: job.attempt + 1 });
+          setAgentSnapshotState(agent, "queued", "retry after renderer recovery");
+          appendAgentLog(agent, `< CAD snapshot retrying after renderer recovery`, "in");
+        } else if (agentStillActive(agent, job.currentRun)) {
+          setAgentSnapshotState(agent, "error", message);
         }
       }
-      if (snapshotJobs.size === 0) await disposeSnapshotView();
+    };
+    const drainAgentSnapshots = async () => {
+      const activeRenders = /* @__PURE__ */ new Set();
+      while (snapshotJobs.size > 0 || activeRenders.size > 0) {
+        while (snapshotJobs.size > 0 && activeRenders.size < maxConcurrentAgentSnapshots) {
+          const next = takeNextSnapshotJob();
+          if (next === void 0) break;
+          const rendering = processAgentSnapshot(next).finally(() => {
+            activeRenders.delete(rendering);
+          });
+          activeRenders.add(rendering);
+        }
+        if (activeRenders.size > 0) await Promise.race(activeRenders);
+      }
+      if (snapshotJobs.size === 0) {
+        await withSnapshotRenderer(disposeSnapshotView);
+      }
     };
     const ensureSnapshotDrain = () => {
       if (snapshotDrainPromise !== void 0) return;
@@ -4503,7 +5194,7 @@
         /\b(peerconnection|ice|dtls|srtp).*\b(closed|failed|disconnect|error)\b/
       ].some((pattern) => pattern.test(text));
     };
-    const isTransientControlPlaneError = (message) => /\b(failed to fetch|networkerror|load failed|event stream|agent work start|review start|aborterror|connection reset|connection aborted|broken pipe|socket|timed out|timeout|http 50[0234])\b/i.test(message);
+    const isTransientControlPlaneError = (message) => /\b(failed to fetch|networkerror|load failed|event stream|final event|agent work start|review start|aborterror|connection reset|connection aborted|connection interrupted|broken pipe|socket|timed out|timeout|http 50[0234]|worker stream returned empty KCL|worker stream returned a BOM instead of KCL)\b/i.test(message);
     const installViewHealthWatchdog = (view, onFailure) => {
       const video = view.el.querySelector("video");
       let lastFrameCount = -1;
@@ -4657,21 +5348,50 @@
     }
     const drainCenterRenders = async () => {
       while (centerRenderPending !== void 0) {
-        if (centerRebuildPromise !== void 0) await centerRebuildPromise;
-        if (centerView.rtc === void 0) return;
-        if (centerViewSubmissionCount >= maxCenterSubmissionsPerRenderer) {
-          await rebuildCenterViewer("bounded renderer lifecycle");
-          return;
+        if (!useStaticCenterCad) {
+          if (centerRebuildPromise !== void 0) await centerRebuildPromise;
+          if (centerView.rtc === void 0) return;
+          if (centerViewSubmissionCount >= maxCenterSubmissionsPerRenderer) {
+            await rebuildCenterViewer("bounded renderer lifecycle");
+            return;
+          }
         }
         const request = centerRenderPending;
         centerRenderPending = void 0;
+        const projectCharacters = Array.from(request.project.files.values()).reduce((total, source) => total + source.length, 0);
+        if (useStaticCenterCad && runPhase === "running" && lastGoodCenterSnapshotDataUrl !== void 0 && projectCharacters > maxLiveCenterProjectCharacters) {
+          const status = "Assembly view retained; oversized final render deferred";
+          if (centerStatus.textContent !== status) {
+            rootLogLine(
+              `< center renderer deferred ${projectCharacters} character live project; retaining last successful assembly frame`,
+              "in"
+            );
+            reportRuntimeEvent("center.render.deferred");
+          }
+          centerStatus.textContent = status;
+          request.waiters.forEach((waiter) => waiter.resolve());
+          continue;
+        }
         const renderStartedAt = Date.now();
         try {
-          centerViewSubmissionCount += 1;
-          await withTimeout(submitProject(centerView, request.project, () => {
-          }, () => {
-            sendRootCameraCommand(centerView);
-          }), centerRendererSubmitTimeoutMs, `center render ${request.label}`);
+          if (useStaticCenterCad) {
+            centerStatus.textContent = `Rendering assembly snapshot: ${request.label}`;
+            const snapshotDataUrl = await renderProjectSnapshot(
+              request.project,
+              `center ${request.label}`,
+              rootAgentId
+            );
+            lastGoodCenterSnapshotDataUrl = snapshotDataUrl;
+            await replaceCenterWithStaticSnapshot(snapshotDataUrl);
+            broadcastWall({ type: "center:snapshot", snapshotUrl: snapshotDataUrl });
+            centerStatus.textContent = "Center assembly snapshot updated";
+          } else {
+            centerViewSubmissionCount += 1;
+            await withTimeout(submitProject(centerView, request.project, () => {
+            }, () => {
+              sendRootCameraCommand(centerView);
+            }), centerRendererSubmitTimeoutMs, `center render ${request.label}`);
+          }
           lastGoodCenterProject = {
             files: new Map(request.project.files),
             mainFilePath: request.project.mainFilePath
@@ -4684,12 +5404,20 @@
           }
         } catch (error) {
           const renderError = error instanceof Error ? error : new Error(errorToMessage(error));
-          request.waiters.forEach((waiter) => waiter.reject(renderError));
           const message = errorToMessage(error);
           rootLogLine(`< center render failed after ${Math.round((Date.now() - renderStartedAt) / 1e3)}s: ${message}`);
           reportRuntimeEvent("center.render.error");
           centerStatus.textContent = `Center KCL failed: ${message}`;
-          if (isViewerFailureMessage(message) || message.includes("timed out")) {
+          if (useStaticCenterCad && request.attempt < 1 && !request.label.startsWith("final ")) {
+            centerRenderPending = centerRenderPending === void 0 ? { ...request, attempt: request.attempt + 1 } : {
+              ...centerRenderPending,
+              waiters: [...request.waiters, ...centerRenderPending.waiters]
+            };
+            rootLogLine("< center snapshot renderer retrying after recovery", "in");
+            continue;
+          }
+          request.waiters.forEach((waiter) => waiter.reject(renderError));
+          if (!useStaticCenterCad && (isViewerFailureMessage(message) || message.includes("timed out"))) {
             scheduleCenterViewerReload(message);
             return;
           }
@@ -4700,14 +5428,14 @@
       if (centerRenderDrainPromise !== void 0) return;
       centerRenderDrainPromise = drainCenterRenders().finally(() => {
         centerRenderDrainPromise = void 0;
-        if (centerRenderPending !== void 0 && centerView.rtc !== void 0 && centerRebuildPromise === void 0) ensureCenterRenderDrain();
+        if (centerRenderPending !== void 0 && (useStaticCenterCad || centerView.rtc !== void 0) && centerRebuildPromise === void 0) ensureCenterRenderDrain();
         else scheduleRunCompletionCheck();
       });
     }
     const queueCenterProject = (project, label) => new Promise((resolve, reject) => {
       const waiter = { resolve, reject };
       if (centerRenderPending === void 0) {
-        centerRenderPending = { project, label, waiters: [waiter] };
+        centerRenderPending = { project, label, waiters: [waiter], attempt: 0 };
       } else {
         centerRenderPending.project = project;
         centerRenderPending.label = label;
@@ -5182,15 +5910,15 @@
       return requestContextFor(entryFilePath).interfaces;
     };
     const agentKclReady = (agent) => stripImportLines(kclFiles.get(agent.filePath) ?? "").split("\n").map((line) => line.replace(/\/\/.*$/, "").trim()).some(Boolean);
-    const placementComponentReady = (agent) => agent.status !== "error" && agentKclReady(agent);
+    const placementComponentReady = (agent) => agentKclReady(agent);
     const workerBodyReady = (agent) => agent.status === "error" || agentKclReady(agent);
     const pendingWorkerTargets = (agent) => reviewWorkerTargets(agent).filter((child) => !workerBodyReady(child));
     const failedWorkerTargets = (agent) => reviewWorkerTargets(agent).filter((child) => child.status === "error");
     const placementReady = (agent) => placementComponentsFor(agent).length > 0;
-    const rankAgentTarget = (candidates, request) => {
+    const rankAgentTarget = (candidates, request, includeTarget = true) => {
       if (candidates.length === 0) return void 0;
-      const targetText = request.target.toLowerCase();
-      const fullText = `${request.target} ${request.instruction} ${request.reason}`.toLowerCase();
+      const targetText = includeTarget ? request.target.toLowerCase() : "";
+      const fullText = `${includeTarget ? request.target : ""} ${request.instruction} ${request.reason}`.toLowerCase();
       const score = (candidate) => {
         const fields = [
           candidate.id,
@@ -5215,6 +5943,67 @@
     };
     const rankWorkerReworkTarget = (parent, request) => rankAgentTarget(reviewWorkerTargets(parent), request);
     const rankOrchestratorReworkTarget = (parent, request) => rankAgentTarget(reviewOrchestratorTargets(parent), request);
+    const explicitReworkTarget = (request) => {
+      const target = request.target.trim().toLowerCase();
+      if (target.length === 0) return void 0;
+      const rootAgent = graphNode(rootAgentId);
+      const candidates = [
+        ...rootAgent === void 0 ? [] : [rootAgent],
+        ...Array.from(agents.values())
+      ];
+      const strongMatch = candidates.flatMap((candidate) => [
+        candidate.id,
+        candidate.name,
+        candidate.filePath,
+        renderPathForFilePath(candidate.filePath)
+      ].map((value) => ({ candidate, value: value.toLowerCase() }))).filter(({ value }) => value.length > 0 && target.includes(value)).sort((left, right) => right.value.length - left.value.length)[0];
+      if (strongMatch !== void 0) return strongMatch.candidate;
+      return candidates.find((candidate) => {
+        const role = candidate.role.trim().toLowerCase();
+        return target === role || target.startsWith(`${role} /`) || target.startsWith(`${role} |`);
+      });
+    };
+    const directChildOrchestratorForDescendant = (reviewParent, target) => {
+      let candidate = target;
+      const visited = /* @__PURE__ */ new Set();
+      while (candidate.parentId !== "" && candidate.parentId !== reviewParent.id) {
+        if (visited.has(candidate.id)) return void 0;
+        visited.add(candidate.id);
+        const next = graphNode(candidate.parentId);
+        if (next === void 0) return void 0;
+        candidate = next;
+      }
+      if (candidate.parentId !== reviewParent.id || candidate.kind !== "orchestrator") return void 0;
+      return candidate;
+    };
+    const delegateDescendantGeometryRework = (reviewParent, target, instruction) => {
+      const delegate = directChildOrchestratorForDescendant(reviewParent, target);
+      if (delegate === void 0) return false;
+      const line = [
+        `Upstream review from ${reviewParent.name} found a possible defect in descendant ${target.name}`,
+        `(${target.role}, ${target.filePath}): ${instruction}`,
+        "Evaluate this finding in your local assembly coordinate frame and dispatch the smallest local correction only if the defect is still present."
+      ].join(" ");
+      const state = upstreamReviewDirectives.get(delegate.id) ?? {
+        revision: 0,
+        directives: []
+      };
+      const alreadyPending = state.directives.some((item) => item.line === line);
+      if (!alreadyPending) {
+        upstreamReviewDirectiveId += 1;
+        state.revision += 1;
+        state.directives.push({ id: upstreamReviewDirectiveId, line });
+        upstreamReviewDirectives.set(delegate.id, state);
+      }
+      reviewLogLine(
+        reviewParent,
+        `< delegate descendant rework through ${delegate.name}: ${target.name}`,
+        "in"
+      );
+      appendAgentLog(delegate, `< upstream review directive: ${line}`, "in");
+      scheduleOrchestratorReview(delegate, target);
+      return true;
+    };
     const findReworkTarget = (parent, request, fallbackChild) => {
       const ranked = rankWorkerReworkTarget(parent, request);
       return ranked?.score ? ranked.candidate : fallbackChild;
@@ -5238,6 +6027,56 @@
     const placementTargetFor = (parent) => {
       return parent;
     };
+    const geometryReworkInstructionFor = (reviewParent, target, instruction) => {
+      const requiresTransformableRepeat = requiresTransformableRepeatContract(instruction);
+      const importFrameContract = [
+        "MANDATORY IMPORT-FRAME CONTRACT: if this worker exports a heterogeneous or flattened [any; N] aggregate, the owning parent cannot clone, translate, or rotate that imported value. Author every constituent body directly in the owning parent assembly coordinate frame instead. Every named worker mate point must numerically equal its parent target at identity placement. A nonzero transform proposed in parent_interface, or local-coordinate geometry that still requires such a transform, is a failed result and must not be returned.",
+        "PRECEDENCE CLARIFICATION: this contract overrides any later request to preserve an existing nonzero translation/rotation interface or stale local coordinates for the named route and mate points. Preserve the semantic identity of those mates and every unrelated interface, but replace the named numeric coordinates with their parent-frame targets so the import is correct at identity.",
+        "Before finishing, inspect the exported aggregate type and parent_interface. For an [any; N] export, parent_interface must explicitly say identity placement with zero translation and zero rotation; the KCL coordinates themselves must implement that placement.",
+        ...requiresTransformableRepeat ? ["MANDATORY TRANSFORMABLE-REPEAT CONTRACT: this review requires cloning, mirroring, or patterning the imported component. Return one default exported Solid, not an array or flattened multi-body aggregate. Fuse overlapping material regions if necessary and preserve material/strip details in interface metadata; parent transformability takes precedence over separate appearance bodies for this canonical repeated part."] : []
+      ];
+      const targetSource = kclFiles.get(target.filePath) ?? "";
+      const explicitRouteRequirements = explicitRouteAcceptanceRequirements(instruction, targetSource);
+      const targetOwner = graphNode(target.parentId);
+      const contextOwners = [reviewParent, targetOwner].filter((candidate) => candidate?.kind === "orchestrator").filter((candidate, index, candidates) => candidates.findIndex((other) => other.id === candidate.id) === index);
+      const fileContext = contextOwners.flatMap((owner) => {
+        const filePath = owner.id === rootAgentId ? rootFilePath : owner.filePath;
+        const source = kclFiles.get(filePath)?.trim();
+        if (!source) return [];
+        const clipped = source.slice(0, 6e4);
+        return [
+          `Parent assembly KCL (${filePath}):
+${clipped}${source.length > clipped.length ? "\n// [parent KCL clipped]" : ""}`
+        ];
+      });
+      const interfaceAgents = contextOwners.flatMap((owner) => [owner, ...graphChildren(owner)]).filter((candidate, index, candidates) => candidates.findIndex((other) => other.id === candidate.id) === index);
+      const interfaceContext = interfaceAgents.flatMap((candidate) => {
+        const manifest = interfaceManifests.get(candidate.filePath)?.trim();
+        if (!manifest) return [];
+        const clipped = manifest.slice(0, 12e3);
+        return [
+          `${candidate.role} interface (${candidate.filePath}):
+${clipped}${manifest.length > clipped.length ? "\n// [interface clipped]" : ""}`
+        ];
+      });
+      if (fileContext.length === 0 && interfaceContext.length === 0) {
+        return [...importFrameContract, "", instruction].join("\n\n");
+      }
+      return [
+        ...importFrameContract,
+        ...explicitRouteRequirements,
+        "",
+        instruction,
+        "",
+        `${assemblyContextMarker} Use the parent transforms and child mate points to derive exact geometry; do not guess coordinates from the prose request alone.`,
+        "Measurements and coordinates in the review reason are the latest observed facts for the named defect and override stale values in the current target interface. Recompute the named route or mate points from those measurements instead of preserving the stale named datums.",
+        "Modify only the geometry and interfaces explicitly named in the request. Preserve every unrelated body, dimension, opening, mate point, axis, and interface coordinate from this worker's current KCL.",
+        "The worker's current KCL is authoritative for unrelated geometry. Parent KCL and manifests are placement context only; do not copy stale or conflicting parent coordinates into unrelated worker interfaces.",
+        ...fileContext,
+        ...interfaceContext.length === 0 ? [] : [`Relevant interface manifests:
+${interfaceContext.join("\n\n")}`]
+      ].join("\n\n");
+    };
     const placementInstructionFor = (parent, changedChild, extra = "") => {
       const childImports = placementComponentsFor(parent).map((child) => `- ${aliasForFilePath(child.filePath)} from ${child.filePath}: ${child.role}`).join("\n");
       const interfaces = childInterfaceContext(parent);
@@ -5245,6 +6084,11 @@
       return [
         `Update ${parent.name}'s assembly placement layer after ${changedChild.role} changed.`,
         "This is an incremental assembly update. Place every currently available import now; do not wait for pending children and do not invent stand-ins for them.",
+        "An explicit review instruction below overrides the generic place-every-import rule. If the review identifies a redundant or unsupported direct child, remove it from the final aggregate and leave its required import unused or hidden rather than placing it again.",
+        `${explicitPlacementReviewStart}
+${extra.trim()}
+${explicitPlacementReviewEnd}`,
+        "If the explicit review block is empty and the current transforms remain correct, validate and return the current placement KCL unchanged. The imported child update is already present dynamically; do not invent screw rotations, cosmetic transforms, or unrelated executable edits merely to make the file differ.",
         "Use imported child aliases, clone(), hide(), translate(), rotate(), scale(), and appearance() only.",
         "You own mirrored, symmetric, radial-pattern, and linear-pattern placement. Express those by cloning imported aliases and applying explicit translate/rotate/scale transforms in this assembly file.",
         "Do not push repeated placement down into worker part files. Workers model one canonical part; this orchestrator creates left/right instances, bolt circles, rib arrays, repeated rollers/pins/washers, and other patterns.",
@@ -5252,8 +6096,11 @@
         "Do not create or modify part geometry. Do not use sketches, profiles, lines, circles, extrude, subtract, or boolean modeling tools.",
         "Place only direct child/sub-assembly imports and explicit shared reusable imports listed below. Do not place non-direct worker descendants or grandchild part files in this parent assembly.",
         "If a direct child/sub-assembly import has no usable return value, leave this parent partial and record that child in placement_warnings instead of reaching through to import/place its children.",
+        "KCL flatten() returns [any], so never pass an alias whose exported aggregate was built with flatten() into translate(), rotate(), scale(), clone(), or appearance(). If KCL reports that an alias is [any; N], do not retry the invalid transform: keep that child at identity when its manifest is already in this parent's frame, or request a child-local frame correction and record a placement warning.",
+        "Transforms remain allowed for a single Solid, ImportedGeometry, or a statically typed [Solid; 1+] aggregate. Do not replace flatten() with another std::array helper merely to transform it; concat(), map(), reduce(), and flatten() all erase the solid type to [any].",
         "Return one renderable aggregate as the final expression so this assembly can itself be imported and placed by its parent.",
         "Before choosing transforms, inspect the child KCL and the interface manifests below for local origins, axes, bounding boxes, mate points, and dimensions.",
+        "Measured coordinates and transforms in an explicit review reason are newer than stale named values in the current assembly manifest. For the interfaces named by the review, recompute placement from the measured values and update the manifest to match.",
         "Place children by aligning named mate points and axes. If a child is missing an interface manifest, infer only from its KCL and leave a concise interface warning in the assembly manifest.",
         "For every shared/reusable component import you place, add a concise comment near the placement in the form `// BOM: <quantity>x <alias> (<role>)` so the graph can display the bill of materials.",
         "If a child is listed as failed, do not import or place it. Continue the partial assembly and record the omission in placement_warnings.",
@@ -5263,11 +6110,10 @@ ${childImports}` : "",
         failedChildren ? `Failed children to omit from this placement update:
 ${failedChildren}` : "",
         interfaces ? `Child interface manifests:
-${interfaces}` : "",
-        extra
+${interfaces}` : ""
       ].filter(Boolean).join("\n");
     };
-    const scheduleOrchestratorPlacement = (parent, changedChild, extraInstruction = "") => {
+    const scheduleOrchestratorPlacement = (parent, changedChild, extraInstruction = "", zooRetryAttempt = 0) => {
       if (!active || runPhase !== "running" || parent.kind !== "orchestrator") return;
       if (!placementReady(parent)) {
         appendWorkAgentLog(parent, `< placement waiting for first renderable direct child`, "in");
@@ -5280,7 +6126,14 @@ ${interfaces}` : "",
         placementTimers.delete(parent.id);
         if (!agentStillActive(parent, currentRun)) return;
         appendWorkAgentLog(parent, `-> placement update after ${changedChild.role}`, "out");
-        void requestAgentWork(parent, currentRun, "", 0, placementInstructionFor(parent, changedChild, extraInstruction));
+        void requestAgentWork(
+          parent,
+          currentRun,
+          "",
+          0,
+          placementInstructionFor(parent, changedChild, extraInstruction),
+          zooRetryAttempt
+        );
       }, 1400);
       placementTimers.set(parent.id, timer);
     };
@@ -5300,6 +6153,14 @@ ${interfaces}` : "",
       if (parent.id === rootAgentId) rootReviewRounds += 1;
       else parent.reviewRounds = reviewCount + 1;
       reviewLogLine(parent, `-> visual review ${reviewCount + 1} after ${changedChild.role} update`, "out");
+      const priorReviewSummaries = (parent.id === rootAgentId ? rootLogEntries : parent.logs ?? []).map((entry) => entry.line).filter((line) => line.startsWith("< visual review: ") && !line.includes("no child rework")).slice(-6);
+      const pendingUpstreamDirectives = [
+        ...upstreamReviewDirectives.get(parent.id)?.directives ?? []
+      ];
+      const reviewContext = [
+        ...priorReviewSummaries,
+        ...pendingUpstreamDirectives.map((item) => `< visual review: ${item.line}`)
+      ].slice(-14);
       try {
         const review = await requestReviewStream(parent, currentRun, {
           sessionId: activeSessionId,
@@ -5341,9 +6202,16 @@ ${interfaces}` : "",
             imports: agent.imports ?? []
           })),
           files: reviewFilesFor(parent),
-          interfaces: reviewInterfacesFor(parent)
+          interfaces: reviewInterfacesFor(parent),
+          reviewRound: reviewCount + 1,
+          priorReviewSummaries: reviewContext
         });
         if (currentRun !== runId || !active) return false;
+        const currentUpstreamState = upstreamReviewDirectives.get(parent.id);
+        if (currentUpstreamState !== void 0 && pendingUpstreamDirectives.length > 0) {
+          const consumedIds = new Set(pendingUpstreamDirectives.map((item) => item.id));
+          currentUpstreamState.directives = currentUpstreamState.directives.filter((item) => !consumedIds.has(item.id));
+        }
         review.dialog?.slice(-2).forEach((line) => reviewLogLine(parent, `< review ws: ${line}`, "in"));
         reviewLogLine(parent, `< visual review: ${review.summary}`, "in");
         const bomUpdates = applyBomReview(parent, review.bom, currentRun);
@@ -5356,6 +6224,25 @@ ${interfaces}` : "",
         }
         review.rework.forEach((item) => {
           const instruction = `${item.reason ? `${item.reason}: ` : ""}${item.instruction}`;
+          const explicitTarget = explicitReworkTarget(item);
+          if (explicitTarget?.kind === "worker") {
+            if (delegateDescendantGeometryRework(parent, explicitTarget, instruction)) return;
+            reviewLogLine(parent, `< dispatch geometry rework to ${explicitTarget.name}: ${instruction}`, "in");
+            appendAgentLog(explicitTarget, `-> orchestrator rework: ${instruction}`, "out");
+            void requestAgentWork(
+              explicitTarget,
+              currentRun,
+              "",
+              0,
+              geometryReworkInstructionFor(parent, explicitTarget, instruction)
+            );
+            return;
+          }
+          if (explicitTarget?.kind === "orchestrator") {
+            reviewLogLine(parent, `< dispatch placement rework to ${explicitTarget.name}: ${instruction}`, "in");
+            scheduleOrchestratorPlacement(explicitTarget, changedChild, instruction);
+            return;
+          }
           const rankedTarget = rankWorkerReworkTarget(parent, item);
           const hasWorkerTarget = rankedTarget !== void 0 && rankedTarget.score > 0;
           if (isOrchestratorOwnedRework(item) && (!isGeometryRework(item) || isPlacementRework(item))) {
@@ -5374,8 +6261,15 @@ ${interfaces}` : "",
             reviewLogLine(parent, `< geometry rework skipped for non-worker target ${target.name}`);
             return;
           }
+          if (delegateDescendantGeometryRework(parent, target, instruction)) return;
           appendAgentLog(target, `-> orchestrator rework: ${instruction}`, "out");
-          void requestAgentWork(target, currentRun, "", 0, instruction);
+          void requestAgentWork(
+            target,
+            currentRun,
+            "",
+            0,
+            geometryReworkInstructionFor(parent, target, instruction)
+          );
         });
         return true;
       } catch (error) {
@@ -5403,21 +6297,53 @@ ${interfaces}` : "",
         append(interfaces[filePath] ?? "");
       });
       reviewWorkerTargets(parent).forEach((agent) => append(`${agent.id}:${agent.status}:${agent.filePath}`));
+      const upstreamState = upstreamReviewDirectives.get(parent.id);
+      if (upstreamState !== void 0) append(`upstream:${upstreamState.revision}`);
       return `${Object.keys(files).length}:${(hash >>> 0).toString(16)}`;
     };
+    const agentUpdatePendingForReview = (agent) => activeAgentWorkIds.has(agent.id) || activeAgentWorkRequests.has(agent.id) || pendingAgentWorkRequests.has(agent.id) || Array.from(workWaiters.values()).some((waiter) => waiter.agent.id === agent.id) || placementTimers.has(agent.id) || draftRenderChains.has(agent.id) || (agent.pendingWorkInstruction?.trim().length ?? 0) > 0;
+    const parentUpdatePendingForReview = (parent) => {
+      if (agentUpdatePendingForReview(parent)) return true;
+      const descendants = [
+        ...reviewOrchestratorTargets(parent).filter((agent) => agent.id !== parent.id),
+        ...reviewWorkerTargets(parent)
+      ];
+      return descendants.some((agent) => agentUpdatePendingForReview(agent) || bomPlanningAgentIds.has(agent.id) || activeReviewRequests.has(agent.id) || reviewQueue.has(agent.id) || reviewTimers.has(agent.id));
+    };
+    const scheduleReviewQueueDrain = () => {
+      if (reviewQueueDrainTimer !== void 0) return;
+      reviewQueueDrainTimer = window.setTimeout(() => {
+        reviewQueueDrainTimer = void 0;
+        drainReviewQueue();
+      }, 1e3);
+    };
     function drainReviewQueue() {
-      while (activeReviewRequests.size < maxConcurrentReviews && reviewQueue.size > 0) {
+      const queuedAtStart = reviewQueue.size;
+      let inspected = 0;
+      let deferred = false;
+      while (activeReviewRequests.size < maxConcurrentReviews && reviewQueue.size > 0 && inspected < queuedAtStart) {
         const next = reviewQueue.entries().next().value;
         if (next === void 0) return;
         const [parentId, request] = next;
         reviewQueue.delete(parentId);
+        inspected += 1;
         if (!agentStillActive(request.parent, request.currentRun) || runPhase !== "running") continue;
+        if (activeReviewRequests.has(parentId)) {
+          reviewQueue.set(parentId, request);
+          deferred = true;
+          continue;
+        }
         if (completedReviewRevisions.get(parentId) === request.revision) continue;
+        if (parentUpdatePendingForReview(request.parent)) {
+          reviewQueue.set(parentId, request);
+          deferred = true;
+          continue;
+        }
         activeReviewRequests.add(parentId);
         activeReviewRevisions.set(parentId, request.revision);
         void requestOrchestratorReview(request.parent, request.changedChild, request.currentRun).then((completed) => {
           if (completed && request.currentRun === runId) {
-            completedReviewRevisions.set(parentId, request.revision);
+            completedReviewRevisions.set(parentId, reviewRevisionFor(request.parent));
           }
         }).finally(() => {
           activeReviewRequests.delete(parentId);
@@ -5426,6 +6352,7 @@ ${interfaces}` : "",
           drainReviewQueue();
         });
       }
+      if (deferred) scheduleReviewQueueDrain();
     }
     const enqueueOrchestratorReview = (parent, changedChild, currentRun) => {
       if (!agentStillActive(parent, currentRun) || runPhase !== "running") return;
@@ -5433,6 +6360,23 @@ ${interfaces}` : "",
       if (completedReviewRevisions.get(parent.id) === revision || activeReviewRevisions.get(parent.id) === revision || reviewQueue.get(parent.id)?.revision === revision) return;
       reviewQueue.set(parent.id, { parent, changedChild, currentRun, revision });
       drainReviewQueue();
+    };
+    window.__zooWallForceReview = (agentId) => {
+      if (!isControllerWindow || !active || runPhase !== "running") {
+        return { ok: false, error: "wall controller is not running" };
+      }
+      const parent = graphNode(agentId);
+      if (parent === void 0 || parent.kind !== "orchestrator") {
+        return { ok: false, error: `orchestrator not found: ${agentId}` };
+      }
+      const changedChild = placementComponentsFor(parent)[0];
+      if (changedChild === void 0) {
+        return { ok: false, error: `no renderable direct child: ${agentId}` };
+      }
+      completedReviewRevisions.delete(parent.id);
+      reviewQueue.delete(parent.id);
+      enqueueOrchestratorReview(parent, changedChild, runId);
+      return { ok: true, agentId: parent.id, changedChildId: changedChild.id };
     };
     const scheduleOrchestratorReview = (parent, changedChild) => {
       if (!active || runPhase !== "running") return;
@@ -5560,6 +6504,7 @@ ${interfaces}` : "",
     const createAgentPanel = (agent) => {
       const panel = document.createElement("section");
       panel.classList.add("agent-card", `agent-${agent.kind}`);
+      panel.dataset.agentId = agent.id;
       panel.style.setProperty("--agent-color", agent.color);
       panel.dataset.status = agent.status;
       const header = document.createElement("header");
@@ -5589,6 +6534,7 @@ ${interfaces}` : "",
       const log = document.createElement("div");
       log.classList.add("agent-log", "websocket-log");
       agent.logElement = log;
+      (agent.logs ?? []).forEach((entry) => writeLog(log, entry.line, entry.direction));
       if (agent.kind === "worker") {
         const body = document.createElement("div");
         body.classList.add("agent-body", "worker-body");
@@ -5653,6 +6599,9 @@ ${interfaces}` : "",
     };
     const appendAgentLog = (agent, line, direction = "sys") => {
       agent.lastActivityAtMs = Date.now();
+      agent.logs ??= [];
+      agent.logs.push({ line, direction });
+      if (agent.logs.length > 56) agent.logs = agent.logs.slice(-56);
       if (agent.logElement !== void 0) writeLog(agent.logElement, line, direction);
       broadcastWall({ type: "agent:log", agentId: agent.id, line, direction });
     };
@@ -5664,20 +6613,28 @@ ${interfaces}` : "",
     const startCameraInspection = (agent) => {
       void agent;
     };
-    const remainingWallAgentSlots = () => Math.max(0, maxWallAgents - agents.size);
+    const remainingWallAgentSlots = () => wallAgentLimit === void 0 ? void 0 : Math.max(0, wallAgentLimit - agents.size);
+    const hasWallAgentCapacity = (requiredSlots = 1) => {
+      const remaining = remainingWallAgentSlots();
+      return remaining === void 0 || remaining >= requiredSlots;
+    };
     const logWallAgentCap = () => {
+      if (wallAgentLimit === void 0) return;
       if (capacityWarningRun === runId) return;
       capacityWarningRun = runId;
-      rootLogLine(`< wall hard cap reached: ${maxWallAgents} total agents; further BOM children will not be created`, "in");
+      rootLogLine(`< wall hard cap reached: ${wallAgentLimit} total agents; further BOM children will not be created`, "in");
     };
     const addAgent = (agent) => {
       if (agents.has(agent.id)) return true;
-      if (agents.size >= maxWallAgents) {
+      if (wallAgentLimit !== void 0 && agents.size >= wallAgentLimit) {
         logWallAgentCap();
         return false;
       }
+      agent.assignedTileIndex ??= perimeterOrder[agents.size % perimeterOrder.length];
+      agent.logs ??= [];
       agents.set(agent.id, agent);
-      if (!isWallTileMode || !isControllerWindow && agentTileIndex(agent) === wallTileIndex) {
+      indexAgentParent(agent.id, agent.parentId);
+      if (!isHeadlessController && (!isWallTileMode || !isControllerWindow && agentTileIndex(agent) === wallTileIndex)) {
         createAgentPanel(agent);
       }
       layoutAgents();
@@ -5697,7 +6654,8 @@ ${interfaces}` : "",
           source: agent.source,
           color: agent.color,
           status: agent.status
-        }
+        },
+        tileIndex: agent.assignedTileIndex
       });
       rootLogLine(`< zookeeper.spawn ${agent.name}`, "in");
       appendAgentLog(agent, `assigned parent: ${graphNode(agent.parentId)?.name ?? "unknown"}`);
@@ -5710,7 +6668,11 @@ ${interfaces}` : "",
       return true;
     };
     const updateAgent = (agent, update) => {
-      if (update.parentId !== void 0) agent.parentId = update.parentId;
+      if (update.parentId !== void 0 && update.parentId !== agent.parentId) {
+        unindexAgentParent(agent.id, agent.parentId);
+        agent.parentId = update.parentId;
+        indexAgentParent(agent.id, agent.parentId);
+      }
       if (update.imports !== void 0) agent.imports = [...new Set(update.imports)];
       if (update.instruction !== void 0) agent.instruction = update.instruction;
       if (update.role !== void 0) {
@@ -5733,7 +6695,110 @@ ${interfaces}` : "",
       kclFiles.set(filePath, kcl);
       completionCandidateAtMs = void 0;
       if (!useAgentCadSnapshots) broadcastWall({ type: "project:file", filePath, kcl });
+      requestWallCheckpoint();
       scheduleRunCompletionCheck();
+    };
+    let wallCheckpointTimer;
+    let wallCheckpointInFlight;
+    let wallCheckpointDirty = false;
+    const durableAgent = (agent) => ({
+      id: agent.id,
+      parentId: agent.parentId,
+      kind: agent.kind,
+      scope: agent.scope,
+      name: agent.name,
+      role: agent.role,
+      instruction: agent.instruction,
+      filePath: agent.filePath,
+      imports: agent.imports ?? [],
+      source: agent.source,
+      color: agent.color,
+      status: agent.status,
+      assignedTileIndex: agentTileIndex(agent) ?? perimeterOrder[0],
+      snapshotUrl: agent.snapshotUrl,
+      snapshotState: agent.snapshotState,
+      snapshotMessage: agent.snapshotMessage,
+      snapshotStateChangedAtMs: agent.snapshotStateChangedAtMs,
+      lastGoodKcl: agent.lastGoodKcl === kclFiles.get(agent.filePath) ? void 0 : agent.lastGoodKcl,
+      lastGoodSnapshotUrl: agent.lastGoodSnapshotUrl,
+      elapsedMs: agent.elapsedMs,
+      activeStartedAtMs: agent.activeStartedAtMs,
+      lastActivityAtMs: agent.lastActivityAtMs,
+      reviewRounds: agent.reviewRounds,
+      supervisorRecoveryCount: agent.supervisorRecoveryCount,
+      pendingWorkInstruction: compactPendingWorkInstruction(agent.pendingWorkInstruction) || void 0,
+      logs: (agent.logs ?? []).slice(-24)
+    });
+    const serializeWallState = () => ({
+      version: 1,
+      controllerHeartbeatAt: Date.now() / 1e3,
+      run: {
+        phase: runPhase,
+        rootStatus,
+        prompt: promptInput.value,
+        sessionId: activeSessionId,
+        source: activeSource,
+        rootInstruction,
+        plannedAgentCount,
+        rootElapsedMs,
+        rootActiveStartedAtMs,
+        aggregateTime: aggregateTime.textContent ?? "Aggregate Agent Time: 0s",
+        aggregateElapsedMs: aggregateAgentTimeMs(),
+        centerStatus: centerStatus.textContent ?? "",
+        centerSnapshotUrl: lastGoodCenterSnapshotDataUrl ?? "",
+        completionBlockers: root.dataset.completionBlockers ?? ""
+      },
+      agents: Array.from(agents.values()).map(durableAgent),
+      files: objectFromMap(kclFiles),
+      interfaces: objectFromMap(interfaceManifests),
+      rootImports: Array.from(rootImports),
+      rootLogs: rootLogEntries.slice(-120)
+    });
+    const flushWallCheckpoint = async () => {
+      if (!isControllerWindow) return;
+      if (wallCheckpointInFlight !== void 0) {
+        wallCheckpointDirty = true;
+        return;
+      }
+      wallCheckpointDirty = false;
+      const checkpoint = (async () => {
+        const json = JSON.stringify({ state: serializeWallState() });
+        let body = json;
+        const headers = {
+          "content-type": "application/json"
+        };
+        if (typeof CompressionStream !== "undefined") {
+          body = await new Response(
+            new Blob([json]).stream().pipeThrough(new CompressionStream("gzip"))
+          ).arrayBuffer();
+          headers["content-encoding"] = "gzip";
+        }
+        const response = await runFetchWithTimeout("/api/wall-state", {
+          method: "POST",
+          headers,
+          body
+        }, wallCheckpointTimeoutMs, "wall state checkpoint");
+        if (!response.ok) throw await httpErrorFromResponse(response, "wall state checkpoint");
+      })();
+      wallCheckpointInFlight = checkpoint;
+      try {
+        await checkpoint;
+      } catch (error) {
+        console.error("wall state checkpoint failed", error);
+        wallCheckpointDirty = true;
+      } finally {
+        if (wallCheckpointInFlight === checkpoint) wallCheckpointInFlight = void 0;
+        if (wallCheckpointDirty) requestWallCheckpoint();
+      }
+    };
+    requestWallCheckpoint = () => {
+      if (!isControllerWindow) return;
+      wallCheckpointDirty = true;
+      if (wallCheckpointTimer !== void 0) return;
+      wallCheckpointTimer = window.setTimeout(() => {
+        wallCheckpointTimer = void 0;
+        void flushWallCheckpoint();
+      }, wallCheckpointIntervalMs);
     };
     const syncReusableLibraryMetadata = (library) => {
       const sharedChildren = graphChildren(library.id);
@@ -5760,21 +6825,23 @@ ${interfaces}` : "",
     const hasVisibleChildPlacement = (body, filePath) => {
       const alias = escapeRegExp(aliasForFilePath(filePath));
       const code = body.split("\n").filter((line) => !line.trim().startsWith("//")).join("\n");
-      return new RegExp(
-        `\\bclone\\s*\\(\\s*${alias}\\s*\\)|\\b${alias}\\b\\s*\\|>|=\\s*${alias}\\b`
-      ).test(code);
+      return new RegExp(`\\b${alias}\\b`).test(code);
     };
     const directChildComposition = (filePaths, body) => {
       const missingFiles = [...new Set(filePaths)].filter((filePath) => !hasVisibleChildPlacement(body, filePath));
       if (missingFiles.length === 0) return "";
-      const clonedChildren = missingFiles.map((filePath) => `  clone(${aliasForFilePath(filePath)}),`).join("\n");
+      const finalAggregate = body.split("\n").map((line) => line.trim()).reverse().find((line) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(line));
+      const aggregateEntries = [
+        ...finalAggregate === void 0 ? [] : [`  ${finalAggregate},`],
+        ...missingFiles.map((filePath) => `  ${aliasForFilePath(filePath)},`)
+      ].join("\n");
       return [
         directAssemblyBlockStart,
-        "// Temporary identity composition for ready direct children.",
+        "// Temporary completion for ready direct children not yet placed by the parent.",
         "// The parent Zookeeper placement pass replaces each entry with its own transform.",
-        "wallDirectChildren = [",
-        clonedChildren,
-        "]",
+        "wallDirectChildren = flatten([",
+        aggregateEntries,
+        "])",
         "wallDirectChildren",
         directAssemblyBlockEnd
       ].join("\n");
@@ -5782,7 +6849,7 @@ ${interfaces}` : "",
     const assemblyFileWithCurrentChildren = (currentFile, directChildFiles, additionalImports = []) => {
       const body = stripDirectAssemblyBlock(stripImportLines(currentFile)).trim();
       const importFiles = [.../* @__PURE__ */ new Set([...directChildFiles, ...additionalImports])];
-      const composition = directChildComposition(directChildFiles, body);
+      const composition = body.includes(authoredAssemblyPlacementMarker) ? "" : directChildComposition(directChildFiles, body);
       return [
         mainFileFor(importFiles).trimEnd(),
         body,
@@ -5822,7 +6889,7 @@ ${interfaces}` : "",
     const ensureReusableLibraryAgent = () => {
       const existing = findReusableLibraryAgent();
       if (existing !== void 0) return existing;
-      if (remainingWallAgentSlots() < 1) {
+      if (remainingWallAgentSlots() === 0) {
         logWallAgentCap();
         return void 0;
       }
@@ -5851,16 +6918,50 @@ ${interfaces}` : "",
       rootLogLine("< BOM graph update: added metadata-only reusable component library", "in");
       return agent;
     };
-    const findSharedAgentFor = (component) => {
-      const normalized = component.toLowerCase();
-      return Array.from(agents.values()).find((agent) => agent.scope === "shared_part" && (agent.role.toLowerCase() === normalized || agent.filePath.toLowerCase().includes(slugLabel(component)) || normalized.includes(agent.role.toLowerCase()) || agent.role.toLowerCase().includes(normalized)));
+    const sharedReferenceTokens = (value) => {
+      const stopWords = /* @__PURE__ */ new Set([
+        "a",
+        "an",
+        "and",
+        "canonical",
+        "component",
+        "for",
+        "nominal",
+        "part",
+        "reusable",
+        "shared",
+        "the"
+      ]);
+      const normalized = value.toLowerCase().replace(/([a-z])[-_\s]+(?=\d)/g, "$1");
+      return new Set(
+        (normalized.match(/[a-z]+\d+(?:\.\d+)?|[a-z]+|\d+(?:\.\d+)?/g) ?? []).filter((token) => !stopWords.has(token) && !/^\d{4}$/.test(token))
+      );
     };
+    const sharedReferenceScore = (component, agent) => {
+      const normalized = component.trim().toLowerCase();
+      const role = agent.role.trim().toLowerCase();
+      const fileName = agent.filePath.split("/").at(-1)?.toLowerCase() ?? "";
+      if (normalized === role) return 1e3;
+      if (normalized.includes(agent.id.toLowerCase())) return 950;
+      if (fileName.length > 0 && normalized.includes(fileName)) return 900;
+      if (normalized.includes(role) || role.includes(normalized)) return 850;
+      const requestedTokens = sharedReferenceTokens(component);
+      const candidateTokens = sharedReferenceTokens(agent.role);
+      if (requestedTokens.size === 0 || candidateTokens.size === 0) return 0;
+      const requestedSizes = new Set([...requestedTokens].filter((token) => /\d/.test(token)));
+      const candidateSizes = new Set([...candidateTokens].filter((token) => /\d/.test(token)));
+      if (requestedSizes.size > 0 && candidateSizes.size > 0 && ![...requestedSizes].some((token) => candidateSizes.has(token))) return 0;
+      const intersection = [...requestedTokens].filter((token) => candidateTokens.has(token)).length;
+      const similarity = intersection / Math.max(requestedTokens.size, candidateTokens.size);
+      return intersection >= 2 && similarity >= 0.7 ? similarity * 100 : 0;
+    };
+    const findSharedAgentFor = (component) => Array.from(agents.values()).filter((agent) => agent.scope === "shared_part").map((agent) => ({ agent, score: sharedReferenceScore(component, agent) })).filter((match) => match.score > 0).sort((left, right) => right.score - left.score)[0]?.agent;
     const createSharedComponentAgent = (request, currentRun) => {
       const existing = findSharedAgentFor(request.role);
       if (existing !== void 0) return existing;
       const library = findReusableLibraryAgent();
       const requiredSlots = library === void 0 ? 2 : 1;
-      if (remainingWallAgentSlots() < requiredSlots) {
+      if (!hasWallAgentCapacity(requiredSlots)) {
         logWallAgentCap();
         return void 0;
       }
@@ -5911,6 +7012,14 @@ ${interfaces}` : "",
     };
     const addImportToConsumer = (consumer, shared, reason = "") => {
       if (consumer.kind !== "orchestrator") return;
+      if (shared.scope !== "shared_part") {
+        appendAgentLog(
+          consumer,
+          `< interface dependency noted without import: ${shared.role}${reason ? ` (${reason})` : ""}`,
+          "in"
+        );
+        return;
+      }
       if (consumer.id === rootAgentId) {
         if (rootImports.has(shared.filePath)) return;
         rootImports.add(shared.filePath);
@@ -5935,6 +7044,38 @@ ${interfaces}` : "",
     const applyBomReview = (parent, bom, currentRun) => {
       if (bom === void 0) return 0;
       let applied = 0;
+      (bom.uniqueComponents ?? []).forEach((request) => {
+        const role = request.role.trim();
+        if (role.length === 0) return;
+        const consumer = findConsumerAgent(request.parent, parent);
+        const existing = graphChildren(consumer.id).find((child2) => child2.role.trim().toLowerCase() === role.toLowerCase() || slugLabel(child2.role) === slugLabel(role));
+        if (existing !== void 0) {
+          reviewLogLine(parent, `< BOM review: retained existing unique ${existing.role}`, "in");
+          return;
+        }
+        const kind = request.kind === "orchestrator" ? "orchestrator" : "worker";
+        const child = createSubassemblyBomChild(consumer, {
+          key: slugLabel(role),
+          kind,
+          scope: kind === "orchestrator" ? "assembly" : "part",
+          role,
+          instruction: [
+            request.instruction || `Generate one unique ${role} for ${consumer.role}.`,
+            `This is a unique direct child of ${consumer.role}, not shared catalog hardware.`,
+            request.reason ? `Reason: ${request.reason}` : ""
+          ].filter(Boolean).join(" "),
+          imports: []
+        }, currentRun);
+        if (child === void 0) {
+          reviewLogLine(parent, `< BOM review deferred unique ${role}: wall agent cap reached`, "in");
+          return;
+        }
+        syncAssemblyFileImports(consumer);
+        setWorkAgentStatus(consumer, "reviewing");
+        startSubassemblyBomChild(child, currentRun);
+        reviewLogLine(parent, `< BOM review: added unique ${role} under ${consumer.role}`, "in");
+        applied += 1;
+      });
       (bom.sharedComponents ?? []).forEach((request) => {
         const role = request.role.trim();
         if (role.length === 0) return;
@@ -5993,7 +7134,7 @@ ${interfaces}` : "",
           consumers: [parent.role]
         }, currentRun);
       }
-      if (remainingWallAgentSlots() < 1) {
+      if (!hasWallAgentCapacity()) {
         logWallAgentCap();
         return void 0;
       }
@@ -6042,7 +7183,7 @@ ${interfaces}` : "",
     const requestSubassemblyBom = async (agent, currentRun, retryAttempt = 0) => {
       if (!agentStillActive(agent, currentRun) || agent.kind !== "orchestrator" || isReusableLibraryAgent(agent)) return;
       if (bomPlanningAgentIds.has(agent.id)) return;
-      if (remainingWallAgentSlots() <= 0) {
+      if (remainingWallAgentSlots() === 0) {
         logWallAgentCap();
         appendWorkAgentLog(agent, "< direct BOM capacity exhausted; generating this scope as one terminal sub-assembly", "in");
         void requestAgentWork(
@@ -6060,7 +7201,13 @@ ${interfaces}` : "",
       }
       bomPlanningAgentIds.add(agent.id);
       setWorkAgentStatus(agent, "running");
-      appendWorkAgentLog(agent, "-> hosted Zookeeper: plan direct BOM", "out");
+      const bomDepth = agentGraphDepth(agent);
+      const terminalChildrenOnly = bomDepth >= maxNestedOrchestratorDepth;
+      appendWorkAgentLog(
+        agent,
+        terminalChildrenOnly ? `-> hosted Zookeeper: plan terminal physical-part BOM at hierarchy depth ${bomDepth}` : `-> hosted Zookeeper: plan direct BOM at hierarchy depth ${bomDepth}`,
+        "out"
+      );
       try {
         const context = requestContextFor(agent.filePath);
         const update = await requestAgentWorkStream(agent, currentRun, {
@@ -6080,7 +7227,10 @@ ${interfaces}` : "",
           },
           files: context.files,
           remainingAgentSlots: remainingWallAgentSlots(),
-          wallMaxAgents: maxWallAgents,
+          wallMaxAgents: wallAgentLimit,
+          bomDepth,
+          maxBomDepth: maxNestedOrchestratorDepth,
+          terminalChildrenOnly,
           knownAgents: Array.from(agents.values()).map((candidate) => ({
             id: candidate.id,
             key: candidate.id,
@@ -6103,6 +7253,14 @@ ${interfaces}` : "",
           (childSeed.imports ?? []).forEach((reference) => {
             const imported = resolveBomImport(reference, spawned);
             if (imported === void 0 || imported.parentId === agent.id) return;
+            if (imported.scope !== "shared_part") {
+              appendWorkAgentLog(
+                agent,
+                `< interface dependency retained as context, not imported geometry: ${imported.role}`,
+                "in"
+              );
+              return;
+            }
             addImportToConsumer(agent, imported, `direct BOM reference: ${reference}`);
           });
         });
@@ -6190,7 +7348,19 @@ ${interfaces}` : "",
     const runHasPendingWork = () => timers.size > 0 || reviewTimers.size > 0 || placementTimers.size > 0 || draftRenderChains.size > 0 || activeAgentWorkIds.size > 0 || pendingAgentWorkRequests.size > 0 || snapshotJobs.size > 0 || snapshotPersistenceJobs.size > 0 || workWaiters.size > 0 || bomPlanningAgentIds.size > 0 || activeReviewRequests.size > 0 || reviewQueue.size > 0 || reviewWaiters.size > 0 || snapshotDrainPromise !== void 0 || snapshotPersistenceDrainPromise !== void 0 || snapshotViewStarting !== void 0 || snapshotViewDisposing !== void 0 || centerRenderPending !== void 0 || centerRenderDrainPromise !== void 0 || centerRebuildPromise !== void 0 || rootRenderTimer !== void 0 || graphRenderTimer !== void 0 || layoutTimer !== void 0 || centerViewerReloadTimer !== void 0;
     const runHasCompleteVisuals = () => Array.from(agents.values()).every((agent) => isReusableLibraryAgent(agent) || agent.snapshotState === "ready" && typeof agent.snapshotUrl === "string" && agent.snapshotUrl.length > 0);
     const recoverAgentVisual = (agent, currentRun, now) => {
-      if (!useAgentCadSnapshots || isReusableLibraryAgent(agent) || agent.status !== "complete" || agent.snapshotState === "ready" && agent.snapshotUrl !== void 0 || agent.snapshotState === "queued" || agent.snapshotState === "rendering" || agent.snapshotState === "persisting") return false;
+      if (!useAgentCadSnapshots || isReusableLibraryAgent(agent)) return false;
+      if (agent.snapshotState === "queued" || agent.snapshotState === "rendering" || agent.snapshotState === "persisting") {
+        const stateAge = now - (agent.snapshotStateChangedAtMs ?? now);
+        if (stateAge < snapshotStaleThresholdMs) return false;
+        const staleState = agent.snapshotState;
+        appendWorkAgentLog(
+          agent,
+          `< visual supervisor cleared stale ${staleState} state after ${Math.round(stateAge / 1e3)}s`,
+          "in"
+        );
+        setAgentSnapshotState(agent, "error", `stale ${staleState} state recovered`);
+      }
+      if (agent.status !== "complete" || agent.snapshotState === "ready" && agent.snapshotUrl !== void 0) return false;
       const lastRecovery = agent.lastSnapshotRecoveryAtMs ?? 0;
       if (now - lastRecovery < snapshotRecoveryCooldownMs) return false;
       agent.lastSnapshotRecoveryAtMs = now;
@@ -6198,6 +7368,16 @@ ${interfaces}` : "",
       const recovery = agent.snapshotRecoveryCount;
       if (agent.snapshotState === "error" && recovery % snapshotRetriesBeforeKclRepair === 0) {
         const reason = agent.snapshotMessage || "snapshot contained no visible geometry";
+        if (agent.lastGoodSnapshotUrl !== void 0) {
+          setAgentSnapshot(agent, agent.lastGoodSnapshotUrl);
+          setAgentSnapshotState(agent, "ready", "retained last good CAD snapshot after render failure");
+          appendWorkAgentLog(
+            agent,
+            `< visual supervisor retained last good snapshot after ${recovery} failed render attempts: ${reason}`,
+            "in"
+          );
+          return true;
+        }
         appendWorkAgentLog(agent, `< visual supervisor requesting KCL repair after ${recovery} failed snapshot attempts: ${reason}`, "in");
         void requestAgentWork(
           agent,
@@ -6226,6 +7406,10 @@ ${interfaces}` : "",
         window.clearInterval(supervisorTimer);
         supervisorTimer = void 0;
       }
+      if (reviewQueueDrainTimer !== void 0) {
+        window.clearTimeout(reviewQueueDrainTimer);
+        reviewQueueDrainTimer = void 0;
+      }
       if (aggregateTimeTimer !== void 0) {
         window.clearInterval(aggregateTimeTimer);
         aggregateTimeTimer = void 0;
@@ -6249,6 +7433,13 @@ ${interfaces}` : "",
       workEventAbort?.abort();
       workEventAbort = void 0;
       workEventSessionId = "";
+      if (workEventReconnectTimer !== void 0) {
+        window.clearTimeout(workEventReconnectTimer);
+        workEventReconnectTimer = void 0;
+      }
+      workEventReconnectAttempt = 0;
+      workEventLastMessageAtMs = 0;
+      workEventRecycleCount = 0;
       await disposeSnapshotView();
       await centerView.deconstructor();
       snapshotCanvas.width = 1;
@@ -6262,9 +7453,19 @@ ${interfaces}` : "",
         rootLogLine("< completion gate passed; rendering final root assembly", "in");
         synchronizeCompletedAssemblies();
         const finalProject = renderProjectFor(rootFilePath);
-        await queueCenterProject(finalProject, "final complete root assembly");
-        sendRootCameraCommand(centerView);
-        const snapshotDataUrl = await captureSnapshotDataUrl(centerView);
+        try {
+          await queueCenterProject(finalProject, "final complete root assembly");
+        } catch (error) {
+          if (lastGoodCenterSnapshotDataUrl === void 0) throw error;
+          rootLogLine(
+            `< final root renderer unavailable; retaining last successful assembly frame while persisting complete KCL: ${errorToMessage(error)}`,
+            "in"
+          );
+        }
+        const snapshotDataUrl = useStaticCenterCad ? lastGoodCenterSnapshotDataUrl : await captureSnapshotDataUrl(centerView);
+        if (snapshotDataUrl === void 0) {
+          throw new Error("final root snapshot renderer returned no image");
+        }
         let snapshotUrl = snapshotDataUrl;
         try {
           snapshotUrl = await persistSnapshot(rootAgentId, snapshotDataUrl);
@@ -6357,12 +7558,19 @@ ${interfaces}` : "",
     }
     const wakeFailedAgent = (agent, currentRun) => {
       const now = Date.now();
-      const recoveries = agent.supervisorRecoveryCount ?? 0;
-      const lastRecovery = agent.lastSupervisorRecoveryAtMs ?? 0;
+      const isRoot = agent.id === rootAgentId;
+      const recoveries = isRoot ? rootSupervisorRecoveryCount : agent.supervisorRecoveryCount ?? 0;
+      const lastRecovery = isRoot ? rootLastSupervisorRecoveryAtMs : agent.lastSupervisorRecoveryAtMs ?? 0;
       if (now - lastRecovery < supervisorRecoveryCooldownMs) return false;
-      agent.supervisorRecoveryCount = recoveries + 1;
-      agent.lastSupervisorRecoveryAtMs = now;
-      const reason = `Root supervisor recovery ${agent.supervisorRecoveryCount}`;
+      const recoveryCount = recoveries + 1;
+      if (isRoot) {
+        rootSupervisorRecoveryCount = recoveryCount;
+        rootLastSupervisorRecoveryAtMs = now;
+      } else {
+        agent.supervisorRecoveryCount = recoveryCount;
+        agent.lastSupervisorRecoveryAtMs = now;
+      }
+      const reason = `Root supervisor recovery ${recoveryCount}`;
       rootLogLine(`< supervisor waking ${agent.name}: ${reason}`, "in");
       appendWorkAgentLog(agent, `< ${reason}; retaining current KCL and interface context`, "in");
       if (agent.kind === "orchestrator" && !graphChildren(agent.id).some((child) => !isReusableLibraryAgent(child))) {
@@ -6371,15 +7579,20 @@ ${interfaces}` : "",
         return true;
       }
       setWorkAgentStatus(agent, "reviewing");
+      const pendingInstruction = agent.pendingWorkInstruction?.trim();
       void requestAgentWork(
         agent,
         currentRun,
         "",
         0,
-        "Root supervisor: resume this child using the current KCL, interfaces, and direct imports. Repair the failed operation and return a renderable result for the parent assembly."
+        pendingInstruction || "Root supervisor: resume this child using the current KCL, interfaces, and direct imports. Repair the failed operation and return a renderable result for the parent assembly.",
+        isRoot ? 1 : 0
       );
       return true;
     };
+    const hasAgentWorkWaiter = (agentId, workRevision) => Array.from(workWaiters.values()).some((waiter) => waiter.agent.id === agentId && (workRevision === void 0 || waiter.workRevision === workRevision));
+    const rootHasAgentDispatchWork = () => activeAgentWorkIds.has(rootAgentId) || activeAgentWorkRequests.has(rootAgentId) || pendingAgentWorkRequests.has(rootAgentId) || hasAgentWorkWaiter(rootAgentId);
+    const rootHasTrackedRuntimeWork = () => rootHasAgentDispatchWork() || activeReviewRequests.has(rootAgentId) || reviewTimers.has(rootAgentId) || placementTimers.has(rootAgentId) || draftRenderChains.has(rootAgentId);
     const runRootSupervisorSweep = () => {
       if (!isControllerWindow || !active || runPhase !== "running") return;
       const currentRun = runId;
@@ -6389,6 +7602,74 @@ ${interfaces}` : "",
       for (const agent of agents.values()) {
         statusCounts.set(agent.status, (statusCounts.get(agent.status) ?? 0) + 1);
         if (!agentStillActive(agent, currentRun) || isReusableLibraryAgent(agent)) continue;
+        const activeWorkRevision = activeAgentWorkIds.get(agent.id);
+        const activeWorkAge = now - (activeAgentWorkPhaseStartedAtMs.get(agent.id) ?? now);
+        if (activeWorkRevision !== void 0 && !hasAgentWorkWaiter(agent.id, activeWorkRevision) && activeWorkAge >= localAgentWorkStallMs) {
+          const stalledRequest = activeAgentWorkRequests.get(agent.id);
+          const retainedKcl = agent.lastGoodKcl?.trim() ?? "";
+          const previousKcl = kclFiles.get(agent.filePath) ?? "";
+          const reviewInstruction = stalledRequest?.reviewInstruction ?? agent.pendingWorkInstruction ?? "";
+          const retainedRouteViolation = agent.kind === "worker" && retainedKcl.length > 0 ? explicitRouteReworkViolation(reviewInstruction, previousKcl, retainedKcl) : void 0;
+          const retainedFrameViolation = retainedKcl.length > 0 ? importFrameContractViolation(reviewInstruction, retainedKcl) : void 0;
+          const canReconcileRetainedResult = retainedKcl.length > 0 && agent.snapshotState === "ready" && agent.lastGoodSnapshotUrl !== void 0 && retainedRouteViolation === void 0 && retainedFrameViolation === void 0 && (!reworkRequiresExecutableChange(reviewInstruction) || kclExecutableFingerprint(retainedKcl) !== kclExecutableFingerprint(previousKcl));
+          activeAgentWorkIds.delete(agent.id);
+          activeAgentWorkRequests.delete(agent.id);
+          activeAgentWorkPhaseStartedAtMs.delete(agent.id);
+          draftRenderChains.delete(agent.id);
+          if (canReconcileRetainedResult) {
+            kclFiles.set(agent.filePath, retainedKcl);
+            updateInterfaceManifest(agent, retainedKcl);
+            if (reviewInstruction.trim().length > 0 && agent.pendingWorkInstruction?.trim() === reviewInstruction.trim()) {
+              agent.pendingWorkInstruction = void 0;
+            }
+            stalledRequest?.waiters.forEach((waiter) => waiter.resolve());
+            appendWorkAgentLog(
+              agent,
+              `< supervisor accepted validated retained KCL and visual after final event stalled for ${Math.round(activeWorkAge / 1e3)}s`,
+              "in"
+            );
+            setWorkAgentStatus(agent, "complete");
+            refreshAncestorProjects(agent);
+            continue;
+          }
+          appendWorkAgentLog(
+            agent,
+            `< supervisor cleared stalled local post-processing after ${Math.round(activeWorkAge / 1e3)}s`,
+            "in"
+          );
+          setWorkAgentStatus(agent, "error");
+          wakeFailedAgent(agent, currentRun);
+          continue;
+        }
+        const hasTrackedWork = activeWorkRevision !== void 0 || pendingAgentWorkRequests.has(agent.id) || hasAgentWorkWaiter(agent.id) || bomPlanningAgentIds.has(agent.id) || activeReviewRequests.has(agent.id) || reviewQueue.has(agent.id) || reviewTimers.has(agent.id) || placementTimers.has(agent.id) || draftRenderChains.has(agent.id) || snapshotJobs.has(agent.id) || snapshotPersistenceJobs.has(agent.id);
+        const isActiveStatus = agent.status === "running" || agent.status === "reviewing";
+        if (!isActiveStatus || hasTrackedWork) {
+          untrackedAgentStatusStartedAtMs.delete(agent.id);
+        } else if (!untrackedAgentStatusStartedAtMs.has(agent.id)) {
+          untrackedAgentStatusStartedAtMs.set(agent.id, now);
+        }
+        const untrackedStatusAge = now - (untrackedAgentStatusStartedAtMs.get(agent.id) ?? now);
+        if (isActiveStatus && !hasTrackedWork && untrackedStatusAge >= orphanedAgentStatusGraceMs) {
+          untrackedAgentStatusStartedAtMs.delete(agent.id);
+          if (agentKclReady(agent) && agent.snapshotState === "ready" && agent.snapshotUrl !== void 0) {
+            appendWorkAgentLog(
+              agent,
+              `< supervisor reconciled orphaned ${agent.status} state with retained final KCL and visual`,
+              "in"
+            );
+            setWorkAgentStatus(agent, "complete");
+            refreshAncestorProjects(agent);
+          } else {
+            appendWorkAgentLog(
+              agent,
+              `< supervisor found orphaned ${agent.status} state after ${Math.round(untrackedStatusAge / 1e3)}s`,
+              "in"
+            );
+            setWorkAgentStatus(agent, "error");
+            wakeFailedAgent(agent, currentRun);
+          }
+          continue;
+        }
         if (agent.status === "error") {
           wakeFailedAgent(agent, currentRun);
           continue;
@@ -6411,15 +7692,36 @@ ${interfaces}` : "",
         appendWorkAgentLog(agent, `< root supervisor: scheduled health review after ${readyChild.role}`, "in");
         scheduleOrchestratorReview(agent, readyChild);
       }
-      if (agents.size > 0 && Array.from(agents.values()).every((agent) => agent.status === "complete")) {
+      const rootAgent = graphNode(rootAgentId);
+      if (rootAgent !== void 0 && rootStatus === "error" && !rootHasAgentDispatchWork() && !activeReviewRequests.has(rootAgentId)) {
+        const rootReviewTimer = reviewTimers.get(rootAgentId);
+        if (rootReviewTimer !== void 0) window.clearTimeout(rootReviewTimer);
+        reviewTimers.delete(rootAgentId);
+        reviewQueue.delete(rootAgentId);
+        wakeFailedAgent(rootAgent, currentRun);
+        return;
+      }
+      const allAgentsComplete = agents.size > 0 && Array.from(agents.values()).every((agent) => agent.status === "complete");
+      if (allAgentsComplete) {
+        const readyRootChild2 = rootAgent === void 0 ? void 0 : placementComponentsFor(rootAgent)[0];
+        if (rootStatus !== "complete" && !rootHasTrackedRuntimeWork() && rootAgent !== void 0 && readyRootChild2 !== void 0) {
+          rootLogLine("< supervisor recovered orphaned root status; resuming final placement and review", "in");
+          scheduleOrchestratorPlacement(
+            rootAgent,
+            readyRootChild2,
+            "Controller recovery: validate the current completed root assembly without inventing unrelated changes.",
+            1
+          );
+          scheduleOrchestratorReview(rootAgent, readyRootChild2);
+          return;
+        }
         scheduleRunCompletionCheck();
         if (now - supervisorLastSummaryAtMs >= supervisorSummaryIntervalMs) {
           supervisorLastSummaryAtMs = now;
-          rootLogLine(`< supervisor sweep: ${agents.size}/${maxWallAgents} agents complete; validating final assembly and snapshots`, "in");
+          rootLogLine(`< supervisor sweep: ${agents.size} agents complete; validating final assembly and snapshots`, "in");
         }
         return;
       }
-      const rootAgent = graphNode(rootAgentId);
       const readyRootChild = rootAgent === void 0 ? void 0 : placementComponentsFor(rootAgent)[0];
       const lastRootReview = supervisorReviewAtMs.get(rootAgentId) ?? 0;
       if (!reviewScheduled && rootAgent !== void 0 && readyRootChild !== void 0 && now - lastRootReview >= supervisorSummaryIntervalMs) {
@@ -6431,7 +7733,7 @@ ${interfaces}` : "",
       if (now - supervisorLastSummaryAtMs >= supervisorSummaryIntervalMs) {
         supervisorLastSummaryAtMs = now;
         const summary = ["running", "reviewing", "complete", "error", "queued", "starting"].map((status) => `${status}:${statusCounts.get(status) ?? 0}`).join(", ");
-        rootLogLine(`< supervisor sweep: ${agents.size}/${maxWallAgents} agents (${summary})`, "in");
+        rootLogLine(`< supervisor sweep: ${agents.size} agents (${summary})`, "in");
       }
     };
     const startRootSupervisor = () => {
@@ -6476,6 +7778,8 @@ ${interfaces}` : "",
       activeReviewRevisions.clear();
       completedReviewRevisions.clear();
       reviewQueue.clear();
+      upstreamReviewDirectives.clear();
+      upstreamReviewDirectiveId = 0;
       supervisorReviewAtMs.clear();
       supervisorLastSummaryAtMs = 0;
       for (const timer of reviewTimers.values()) window.clearTimeout(timer);
@@ -6498,6 +7802,10 @@ ${interfaces}` : "",
       });
       pendingAgentWorkRequests.clear();
       activeAgentWorkIds.clear();
+      activeAgentWorkRequests.clear();
+      activeAgentWorkPhaseStartedAtMs.clear();
+      untrackedAgentStatusStartedAtMs.clear();
+      workStatusMissingPollsById.clear();
       agentWorkRevisions.clear();
       bomPlanningAgentIds.clear();
       workWaiters.forEach((waiter) => waiter.reject(new Error("run reset")));
@@ -6507,6 +7815,11 @@ ${interfaces}` : "",
       workEventAbort?.abort();
       workEventAbort = void 0;
       workEventSessionId = "";
+      if (workEventReconnectTimer !== void 0) {
+        window.clearTimeout(workEventReconnectTimer);
+        workEventReconnectTimer = void 0;
+      }
+      workEventReconnectAttempt = 0;
     };
     const clearCameraTimers = () => {
       for (const timer of cameraTimers) {
@@ -6524,6 +7837,7 @@ ${interfaces}` : "",
         agent.element?.remove();
       });
       agents.clear();
+      agentChildren.clear();
       plannedAgentCount = 0;
       updateAggregateTime();
       layoutAgents();
@@ -6537,9 +7851,9 @@ ${interfaces}` : "",
       timers.add(timer);
     };
     const startCenterView = () => {
-      centerView.start();
+      if (!useStaticCenterCad) centerView.start();
     };
-    if (isControllerWindow) attachCenterViewHandlers(centerView);
+    if (isControllerWindow && !useStaticCenterCad) attachCenterViewHandlers(centerView);
     else void centerView.deconstructor();
     const demoAgents = () => {
       const topLevelRoles = [
@@ -6670,7 +7984,7 @@ ${interfaces}` : "",
         const response = await runFetch("/api/orchestrate-stream", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ prompt, maxAgents: maxWallAgents })
+          body: JSON.stringify({ prompt, maxAgents: wallAgentLimit })
         });
         if (!response.ok) {
           throw new Error(`orchestrate ${response.status}`);
@@ -6711,12 +8025,13 @@ ${interfaces}` : "",
         return fallbackOrchestration(prompt);
       }
     };
-    const parseAgentWorkStreamEvent = (line) => {
-      if (line.trim().length === 0) return void 0;
-      return JSON.parse(line);
-    };
     const handleAgentWorkEvent = (event) => {
-      if (event === void 0 || event.type === "ping") return;
+      if (event === void 0) return;
+      workEventLastMessageAtMs = Date.now();
+      if (event.type === "ping" || event.type === "work-status") {
+        if (Array.isArray(event.workIds)) reconcileStartedWork(event.workIds);
+        return;
+      }
       const workId = event.workId;
       if (workId === void 0) return;
       if (event.type === "review-queued" || event.type === "review-started" || event.type === "review-dialog" || event.type === "review-final" || event.type === "review-error") {
@@ -6776,6 +8091,7 @@ ${interfaces}` : "",
       }
       if (event.type === "final") {
         workWaiters.delete(workId);
+        activeAgentWorkPhaseStartedAtMs.set(agent.id, Date.now());
         waiter.resolve(event.update);
         return;
       }
@@ -6783,49 +8099,103 @@ ${interfaces}` : "",
       waiter.reject(new Error(event.summary));
     };
     const ensureWorkEventStream = (sessionId) => {
-      if (workEventAbort !== void 0 && workEventSessionId === sessionId) return;
-      workEventAbort?.abort();
-      workEventAbort = new AbortController();
+      if (workEventSessionId === sessionId) return;
+      if (workEventReconnectTimer !== void 0) {
+        window.clearTimeout(workEventReconnectTimer);
+        workEventReconnectTimer = void 0;
+      }
       workEventSessionId = sessionId;
-      const signal = workEventAbort.signal;
-      const readEvents = async () => {
-        const response = await fetch(`/api/zookeeper/events?sessionId=${encodeURIComponent(sessionId)}`, { signal });
-        if (!response.ok || response.body === null) throw new Error(`event stream ${response.status}`);
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = "";
-        for (; ; ) {
-          const { done, value } = await reader.read();
-          buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() ?? "";
-          lines.forEach((line) => handleAgentWorkEvent(parseAgentWorkStreamEvent(line)));
-          if (done) break;
+      workEventLastMessageAtMs = Date.now();
+      const poll = async () => {
+        if (!active || activeSessionId !== sessionId || workEventSessionId !== sessionId) return;
+        const controller = new AbortController();
+        workEventAbort = controller;
+        const timeout = window.setTimeout(() => controller.abort(), workEventPollTimeoutMs);
+        let retryDelay = 0;
+        try {
+          const response = await fetch(
+            `/api/zookeeper/events-poll?sessionId=${encodeURIComponent(sessionId)}&limit=1`,
+            { cache: "no-store", signal: controller.signal }
+          );
+          if (!response.ok) throw new Error(`event poll ${response.status}`);
+          const payload = await response.json();
+          if (!Array.isArray(payload.events)) throw new Error("event poll returned invalid events");
+          payload.events.forEach((event) => handleAgentWorkEvent(event));
+          if (Array.isArray(payload.workIds)) {
+            reconcileStartedWork(payload.workIds.filter((value) => typeof value === "string"));
+          }
+          workEventLastMessageAtMs = Date.now();
+          workEventReconnectAttempt = 0;
+        } catch (error) {
+          if (!controller.signal.aborted || active && activeSessionId === sessionId && workEventSessionId === sessionId) {
+            workEventRecycleCount += 1;
+            const attempt = workEventReconnectAttempt;
+            workEventReconnectAttempt += 1;
+            retryDelay = Math.min(1e4, 500 * 2 ** attempt);
+            if (attempt === 0 || attempt % 4 === 0) {
+              rootLogLine(
+                `system: zookeeper event poll interrupted; retrying in ${Math.ceil(retryDelay / 1e3)}s (${errorToMessage(error)})`
+              );
+            }
+          }
+        } finally {
+          window.clearTimeout(timeout);
+          if (workEventAbort === controller) workEventAbort = void 0;
         }
-        handleAgentWorkEvent(parseAgentWorkStreamEvent(buffer));
-        if (!signal.aborted) throw new Error("zookeeper event stream ended");
+        if (!active || activeSessionId !== sessionId || workEventSessionId !== sessionId) return;
+        if (retryDelay === 0) {
+          void poll();
+          return;
+        }
+        workEventReconnectTimer = window.setTimeout(() => {
+          workEventReconnectTimer = void 0;
+          void poll();
+        }, retryDelay);
       };
-      void readEvents().catch((error) => {
-        if (signal.aborted) return;
-        if (workEventAbort?.signal === signal) {
-          workEventAbort = void 0;
-          workEventSessionId = "";
-        }
-        rootLogLine(`system: zookeeper event stream failed (${errorToMessage(error)})`);
-        Array.from(workWaiters.entries()).forEach(([workId, waiter]) => {
-          workWaiters.delete(workId);
-          waiter.reject(new Error(errorToMessage(error)));
-        });
-        Array.from(reviewWaiters.entries()).forEach(([workId, waiter]) => {
-          reviewWaiters.delete(workId);
-          waiter.reject(new Error(errorToMessage(error)));
-        });
-      });
+      void poll();
     };
+    const reconcileStartedWork = (activeWorkIds) => {
+      if (!active || activeSessionId.length === 0 || workWaiters.size === 0 && reviewWaiters.size === 0) {
+        workStatusMissingPollsById.clear();
+        return;
+      }
+      const serverWorkIds = new Set(
+        activeWorkIds.filter((value) => typeof value === "string")
+      );
+      const trackedWorkIds = /* @__PURE__ */ new Set([...workWaiters.keys(), ...reviewWaiters.keys()]);
+      for (const workId of trackedWorkIds) {
+        if (serverWorkIds.has(workId)) {
+          workStatusMissingPollsById.delete(workId);
+          continue;
+        }
+        const missingPolls = (workStatusMissingPollsById.get(workId) ?? 0) + 1;
+        workStatusMissingPollsById.set(workId, missingPolls);
+        if (missingPolls < workStatusMissingThreshold) continue;
+        const workWaiter = workWaiters.get(workId);
+        if (workWaiter !== void 0) {
+          workWaiters.delete(workId);
+          workWaiter.reject(new Error("Zookeeper work ended before its final event was received"));
+        }
+        const reviewWaiter = reviewWaiters.get(workId);
+        if (reviewWaiter !== void 0) {
+          reviewWaiters.delete(workId);
+          reviewWaiter.reject(new Error("Zookeeper review ended before its final event was received"));
+        }
+        workStatusMissingPollsById.delete(workId);
+      }
+      for (const workId of workStatusMissingPollsById.keys()) {
+        if (!trackedWorkIds.has(workId)) workStatusMissingPollsById.delete(workId);
+      }
+    };
+    const monitorStartedWork = (_sessionId, _workId, _isPending, _rejectPending, completion) => completion;
     const requestReviewStream = async (parent, currentRun, payload) => {
       ensureWorkEventStream(activeSessionId);
+      const sessionId = activeSessionId;
       const workId = randomId();
+      let rejectFinalReview = (_error) => {
+      };
       const finalReview = new Promise((resolve, reject) => {
+        rejectFinalReview = reject;
         reviewWaiters.set(workId, { parent, currentRun, resolve, reject });
       });
       try {
@@ -6839,13 +8209,27 @@ ${interfaces}` : "",
         reviewWaiters.delete(workId);
         throw error;
       }
-      return finalReview;
+      return monitorStartedWork(
+        sessionId,
+        workId,
+        () => reviewWaiters.has(workId),
+        (error) => {
+          if (!reviewWaiters.has(workId)) return;
+          reviewWaiters.delete(workId);
+          rejectFinalReview(error);
+        },
+        finalReview
+      );
     };
     const requestAgentWorkStream = async (agent, currentRun, payload, endpoint = "/api/zookeeper/work-start", workRevision) => {
       ensureWorkEventStream(activeSessionId);
+      const sessionId = activeSessionId;
       const workId = randomId();
       const body = { ...payload, workId };
+      let rejectFinalUpdate = (_error) => {
+      };
       const finalUpdate = new Promise((resolve, reject) => {
+        rejectFinalUpdate = reject;
         workWaiters.set(workId, { agent, currentRun, workRevision, resolve, reject });
       });
       const response = await runFetch(endpoint, {
@@ -6857,10 +8241,30 @@ ${interfaces}` : "",
         workWaiters.delete(workId);
         throw new Error(`agent work start ${response.status}`);
       }
-      return finalUpdate;
+      return monitorStartedWork(
+        sessionId,
+        workId,
+        () => workWaiters.has(workId),
+        (error) => {
+          if (!workWaiters.has(workId)) return;
+          workWaiters.delete(workId);
+          rejectFinalUpdate(error);
+        },
+        finalUpdate
+      );
     };
     const performAgentWork = async (agent, currentRun, workRevision, renderError = "", repairAttempt = 0, reviewInstruction = "", zooRetryAttempt = 0) => {
       if (!agentStillActive(agent, currentRun)) return;
+      if (agentWorkRevisions.get(agent.id) !== workRevision) return;
+      if (!agentKclReady(agent) && agent.lastGoodKcl !== void 0 && stripImportLines(agent.lastGoodKcl).trim().length > 0) {
+        kclFiles.set(agent.filePath, agent.lastGoodKcl);
+        updateInterfaceManifest(agent, agent.lastGoodKcl);
+        if (agent.lastGoodSnapshotUrl !== void 0) {
+          setAgentSnapshotState(agent, "ready", "restored last good CAD snapshot");
+          setAgentSnapshot(agent, agent.lastGoodSnapshotUrl);
+        }
+        appendWorkAgentLog(agent, "< restored last validated KCL before retry", "in");
+      }
       if (isReusableLibraryAgent(agent)) {
         syncReusableLibraryMetadata(agent);
         setWorkAgentStatus(agent, "complete");
@@ -6880,6 +8284,7 @@ ${interfaces}` : "",
       try {
         const entryFilePath = agent.id === rootAgentId ? rootFilePath : agent.filePath;
         const context = requestContextFor(entryFilePath, false);
+        const previousKcl = kclFiles.get(agent.filePath) ?? "";
         const update = await requestAgentWorkStream(agent, currentRun, {
           sessionId: activeSessionId,
           prompt: promptInput.value.trim() || defaultPrompt,
@@ -6900,7 +8305,8 @@ ${interfaces}` : "",
           currentKcl: kclFiles.get(agent.filePath) ?? "",
           renderError,
           reviewInstruction,
-          attempt: repairAttempt
+          attempt: repairAttempt,
+          transportRetryAttempt: zooRetryAttempt
         }, "/api/zookeeper/work-start", workRevision);
         if (!agentStillActive(agent, currentRun)) return;
         if (agentWorkRevisions.get(agent.id) !== workRevision) {
@@ -6927,7 +8333,60 @@ ${interfaces}` : "",
         await (draftRenderChains.get(agent.id) ?? Promise.resolve()).catch(() => {
         });
         if (!agentStillActive(agent, currentRun)) return;
-        kclFiles.set(agent.filePath, update.kcl);
+        if (stripImportLines(update.kcl).trim().length === 0) {
+          throw new Error("Zookeeper worker stream returned empty KCL");
+        }
+        if (previousKcl.trim().length > 0 && reworkRequiresExecutableChange(reviewInstruction) && kclExecutableFingerprint(update.kcl) === kclExecutableFingerprint(previousKcl)) {
+          const message = "Zookeeper returned rework KCL with no executable change";
+          if (repairAttempt < maxAgentRepairAttempts) {
+            appendWorkAgentLog(agent, `-> ${message}; requesting repair ${repairAttempt + 1}`, "out");
+            await performAgentWork(
+              agent,
+              currentRun,
+              workRevision,
+              message,
+              repairAttempt + 1,
+              reviewInstruction
+            );
+            return;
+          }
+          throw new Error(`${message} after ${maxAgentRepairAttempts} repair attempts`);
+        }
+        const routeViolation = agent.kind === "worker" ? explicitRouteReworkViolation(reviewInstruction, previousKcl, update.kcl) : void 0;
+        if (routeViolation !== void 0) {
+          if (repairAttempt < maxAgentRepairAttempts) {
+            appendWorkAgentLog(agent, `-> ${routeViolation}; requesting repair ${repairAttempt + 1}`, "out");
+            await performAgentWork(
+              agent,
+              currentRun,
+              workRevision,
+              routeViolation,
+              repairAttempt + 1,
+              reviewInstruction
+            );
+            return;
+          }
+          throw new Error(`${routeViolation} after ${maxAgentRepairAttempts} repair attempts`);
+        }
+        const frameViolation = importFrameContractViolation(reviewInstruction, update.kcl);
+        if (frameViolation !== void 0) {
+          if (repairAttempt < maxAgentRepairAttempts) {
+            appendWorkAgentLog(agent, `-> ${frameViolation}; requesting repair ${repairAttempt + 1}`, "out");
+            await performAgentWork(
+              agent,
+              currentRun,
+              workRevision,
+              frameViolation,
+              repairAttempt + 1,
+              reviewInstruction
+            );
+            return;
+          }
+          throw new Error(`${frameViolation} after ${maxAgentRepairAttempts} repair attempts`);
+        }
+        const acceptedSource = agent.kind === "orchestrator" && !update.kcl.includes(authoredAssemblyPlacementMarker) ? `${authoredAssemblyPlacementMarker}
+${update.kcl}` : update.kcl;
+        kclFiles.set(agent.filePath, acceptedSource);
         if (agent.kind === "orchestrator") syncAssemblyFileImports(agent);
         const acceptedKcl = kclFiles.get(agent.filePath) ?? update.kcl;
         completionCandidateAtMs = void 0;
@@ -6965,6 +8424,10 @@ ${interfaces}` : "",
           }
           return;
         }
+        if (reviewInstruction.trim().length > 0 && agent.pendingWorkInstruction?.trim() === reviewInstruction.trim()) {
+          agent.pendingWorkInstruction = void 0;
+          requestWallCheckpoint();
+        }
         refreshAncestorProjects(agent);
         if (agent.kind === "orchestrator") {
           after(900, () => {
@@ -7000,7 +8463,9 @@ ${interfaces}` : "",
         drainAgentWorkQueue(agentId);
         return;
       }
-      activeAgentWorkIds.add(agentId);
+      activeAgentWorkIds.set(agentId, request.workRevision);
+      activeAgentWorkRequests.set(agentId, request);
+      activeAgentWorkPhaseStartedAtMs.set(agentId, Date.now());
       void performAgentWork(
         request.agent,
         request.currentRun,
@@ -7013,8 +8478,13 @@ ${interfaces}` : "",
         const workError = error instanceof Error ? error : new Error(errorToMessage(error));
         request.waiters.forEach((waiter) => waiter.reject(workError));
       }).finally(() => {
-        activeAgentWorkIds.delete(agentId);
-        drainAgentWorkQueue(agentId);
+        if (activeAgentWorkIds.get(agentId) === request.workRevision) {
+          activeAgentWorkIds.delete(agentId);
+          activeAgentWorkRequests.delete(agentId);
+          activeAgentWorkPhaseStartedAtMs.delete(agentId);
+          drainAgentWorkQueue(agentId);
+        }
+        drainReviewQueue();
         scheduleRunCompletionCheck();
       });
     };
@@ -7023,16 +8493,43 @@ ${interfaces}` : "",
         resolve();
         return;
       }
+      const previous = pendingAgentWorkRequests.get(agent.id);
+      const activeRequest = activeAgentWorkRequests.get(agent.id);
+      const mergedReviewInstruction = compactPendingWorkInstruction(
+        activeRequest?.reviewInstruction,
+        previous?.reviewInstruction,
+        reviewInstruction
+      );
+      const matchesExistingRequest = (request) => request.reviewInstruction === mergedReviewInstruction && (renderError.length === 0 || request.renderError === renderError) && request.repairAttempt >= repairAttempt && request.zooRetryAttempt >= zooRetryAttempt;
+      const waiter = { resolve, reject };
+      if (previous !== void 0 && matchesExistingRequest(previous)) {
+        previous.waiters.push(waiter);
+        appendWorkAgentLog(agent, "< coalesced duplicate rework into pending request", "in");
+        scheduleRunCompletionCheck();
+        return;
+      }
+      if (previous === void 0 && activeRequest !== void 0 && matchesExistingRequest(activeRequest)) {
+        activeRequest.waiters.push(waiter);
+        appendWorkAgentLog(agent, "< coalesced duplicate rework into active request", "in");
+        scheduleRunCompletionCheck();
+        return;
+      }
       const workRevision = (agentWorkRevisions.get(agent.id) ?? 0) + 1;
       agentWorkRevisions.set(agent.id, workRevision);
-      const previous = pendingAgentWorkRequests.get(agent.id);
-      const waiters = [...previous?.waiters ?? [], { resolve, reject }];
+      agent.pendingWorkInstruction = mergedReviewInstruction || void 0;
+      requestWallCheckpoint();
+      previous?.waiters.forEach((waiter2) => waiter2.resolve());
+      const waiters = [waiter];
       pendingAgentWorkRequests.set(agent.id, {
         agent,
         currentRun,
-        renderError,
-        repairAttempt,
-        reviewInstruction,
+        renderError: renderError || previous?.renderError || activeRequest?.renderError || "",
+        repairAttempt: Math.max(
+          repairAttempt,
+          previous?.repairAttempt ?? 0,
+          activeRequest?.repairAttempt ?? 0
+        ),
+        reviewInstruction: mergedReviewInstruction,
         zooRetryAttempt,
         workRevision,
         waiters
@@ -7045,13 +8542,14 @@ ${interfaces}` : "",
     });
     const runZookeeper = async () => {
       if (startInProgress) return;
-      const centerNeedsRebuild = !assemblyRenderer.contains(centerView.el) || centerView.rtc === void 0;
+      const centerNeedsRebuild = !useStaticCenterCad && (!assemblyRenderer.contains(centerView.el) || centerView.rtc === void 0);
       startInProgress = true;
       active = true;
       runId += 1;
       const currentRun = runId;
       rootElapsedMs = 0;
       rootActiveStartedAtMs = Date.now();
+      aggregateElapsedFloorMs = 0;
       startButton.disabled = true;
       startButton.textContent = "Architecting BOM...";
       stopButton.disabled = false;
@@ -7064,6 +8562,7 @@ ${interfaces}` : "",
       centerViewerReloadAttempts = 0;
       capacityWarningRun = -1;
       rootLog.replaceChildren();
+      rootLogEntries = [];
       broadcastWall({ type: "reset" });
       if (centerNeedsRebuild) await rebuildCenterViewer("new run after static completion");
       const prompt = promptInput.value.trim() || defaultPrompt;
@@ -7079,7 +8578,7 @@ ${interfaces}` : "",
       kclFiles = new Map(Object.entries(plan.files));
       interfaceManifests = /* @__PURE__ */ new Map();
       rootImports = /* @__PURE__ */ new Set();
-      const seeds = plan.agents.slice(0, maxWallAgents);
+      const seeds = wallAgentLimit === void 0 ? plan.agents : plan.agents.slice(0, wallAgentLimit);
       if (plan.agents.length > seeds.length) {
         rootLogLine(`< plan capped from ${plan.agents.length} to ${seeds.length} total agents`, "in");
       }
@@ -7091,7 +8590,7 @@ ${interfaces}` : "",
         plannedAgentCount: seeds.length,
         files: useAgentCadSnapshots ? {} : plan.files
       });
-      rootLogLine(`< ${plan.source} plan accepted: ${seeds.length} sub-agents (hard cap ${maxWallAgents})`, "in");
+      rootLogLine(`< ${plan.source} plan accepted: ${seeds.length} sub-agents (no fixed wall agent cap)`, "in");
       plan.notes?.forEach((note) => rootLogLine(`system: ${note}`));
       renderAllGraphs();
       setRunPhase("running", "running");
@@ -7164,6 +8663,254 @@ ${interfaces}` : "",
         startInProgress = false;
       });
     };
+    const createHydratedAgent = (durable) => {
+      const agent = {
+        ...durable,
+        imports: [...durable.imports ?? []],
+        logs: [...durable.logs ?? []],
+        assignedTileIndex: durable.assignedTileIndex,
+        pendingWorkInstruction: compactPendingWorkInstruction(durable.pendingWorkInstruction) || void 0
+      };
+      agents.set(agent.id, agent);
+      indexAgentParent(agent.id, agent.parentId);
+      if (!isHeadlessController && isWallTileMode && wallTileIndex !== centerIndex && agentTileIndex(agent) === wallTileIndex) {
+        createAgentPanel(agent);
+      }
+      return agent;
+    };
+    const reconcileHydratedAgent = (durable) => {
+      const existing = agents.get(durable.id);
+      const previousSnapshotUrl = existing?.snapshotUrl;
+      const agent = existing ?? createHydratedAgent(durable);
+      if (agent.parentId !== durable.parentId) {
+        unindexAgentParent(agent.id, agent.parentId);
+        agent.parentId = durable.parentId;
+        indexAgentParent(agent.id, agent.parentId);
+      }
+      agent.kind = durable.kind;
+      agent.scope = durable.scope;
+      agent.name = durable.name;
+      agent.role = durable.role;
+      agent.instruction = durable.instruction;
+      agent.filePath = durable.filePath;
+      agent.imports = [...durable.imports ?? []];
+      agent.source = durable.source;
+      agent.color = durable.color;
+      agent.assignedTileIndex = durable.assignedTileIndex;
+      agent.elapsedMs = durable.elapsedMs;
+      agent.activeStartedAtMs = durable.activeStartedAtMs;
+      agent.lastActivityAtMs = durable.lastActivityAtMs;
+      agent.reviewRounds = durable.reviewRounds;
+      agent.supervisorRecoveryCount = durable.supervisorRecoveryCount;
+      agent.pendingWorkInstruction = compactPendingWorkInstruction(durable.pendingWorkInstruction) || void 0;
+      agent.snapshotState = durable.snapshotState;
+      agent.snapshotMessage = durable.snapshotMessage;
+      agent.snapshotStateChangedAtMs = durable.snapshotStateChangedAtMs;
+      agent.lastGoodKcl = durable.lastGoodKcl;
+      agent.lastGoodSnapshotUrl = durable.lastGoodSnapshotUrl;
+      agent.logs = [...durable.logs ?? []];
+      agent.element?.querySelector(".agent-title")?.replaceChildren(document.createTextNode(agent.name));
+      agent.element?.querySelector(".agent-role")?.replaceChildren(document.createTextNode(agent.role));
+      if (agent.status !== durable.status) setAgentStatus(agent, durable.status);
+      else updateViewerPlaceholderText(agent);
+      if (agent.logElement !== void 0) {
+        agent.logElement.replaceChildren();
+        agent.logs.forEach((entry) => writeLog(agent.logElement, entry.line, entry.direction));
+      }
+      if (durable.snapshotUrl !== void 0 && (durable.snapshotUrl !== previousSnapshotUrl || agent.viewerSlot !== void 0 && agent.snapshotObjectUrl === void 0)) {
+        setAgentSnapshot(agent, durable.snapshotUrl);
+      }
+      return agent;
+    };
+    let hydratedWallRevision = 0;
+    let hydratedSessionId = "";
+    const applyDurableDisplayState = (state) => {
+      if (state.unchanged || state.revision <= hydratedWallRevision) return;
+      hydratedWallRevision = state.revision;
+      const sessionChanged = hydratedSessionId !== state.run.sessionId;
+      hydratedSessionId = state.run.sessionId;
+      if (sessionChanged) {
+        resetAgents();
+        rootLogEntries = [];
+        rootLog.replaceChildren();
+      }
+      active = ["architecting", "running", "finalizing"].includes(state.run.phase);
+      runPhase = state.run.phase;
+      rootStatus = state.run.rootStatus;
+      root.dataset.runPhase = runPhase;
+      root.dataset.rootStatus = rootStatus;
+      root.dataset.completionBlockers = state.run.completionBlockers ?? "";
+      activeSessionId = state.run.sessionId;
+      activeSource = state.run.source;
+      rootInstruction = state.run.rootInstruction;
+      plannedAgentCount = state.run.plannedAgentCount;
+      promptInput.value = document.activeElement === promptInput ? promptInput.value : state.run.prompt;
+      aggregateTime.textContent = state.run.aggregateTime;
+      centerStatus.textContent = state.run.centerStatus;
+      startButton.disabled = active;
+      startButton.textContent = active ? runPhase === "architecting" ? "Architecting BOM..." : "Running Zookeeper" : runPhase === "complete" ? "Start New Run" : "Start Zookeeper";
+      stopButton.disabled = !active && runPhase !== "complete";
+      rootLogEntries = [...state.rootLogs ?? []];
+      rootLog.replaceChildren();
+      rootLogEntries.forEach((entry) => writeLog(rootLog, entry.line, entry.direction, 160));
+      const incomingIds = new Set(state.agents.map((agent) => agent.id));
+      for (const [agentId, agent] of agents) {
+        if (incomingIds.has(agentId)) continue;
+        unindexAgentParent(agent.id, agent.parentId);
+        releaseAgentSnapshotDisplay(agent);
+        agent.element?.remove();
+        agents.delete(agentId);
+      }
+      state.agents.forEach(reconcileHydratedAgent);
+      if (wallTileIndex === centerIndex && state.run.centerSnapshotUrl && state.run.centerSnapshotUrl !== lastGoodCenterSnapshotDataUrl) {
+        lastGoodCenterSnapshotDataUrl = state.run.centerSnapshotUrl;
+        void replaceCenterWithStaticSnapshot(state.run.centerSnapshotUrl).catch((error) => {
+          centerStatus.textContent = `Center snapshot reload failed: ${errorToMessage(error).slice(0, 100)}`;
+        });
+      }
+      layoutAgents();
+      renderAllGraphs();
+    };
+    const restoreControllerState = async () => {
+      if (!isControllerWindow) return;
+      const response = await fetch("/api/wall-state?controller=1");
+      if (!response.ok) throw await httpErrorFromResponse(response, "wall controller restore");
+      const state = await response.json();
+      if (state.unchanged) return;
+      const recoveredAtMs = Date.now();
+      const persistedAtMs = Date.parse(state.updatedAt ?? "");
+      const recoveryAccountingCutoffMs = Number.isFinite(persistedAtMs) ? Math.min(recoveredAtMs, persistedAtMs) : recoveredAtMs;
+      const aggregateParts = state.run.aggregateTime.match(
+        /Aggregate Agent Time:\s*(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?/
+      );
+      const aggregateFromLabelMs = aggregateParts === null ? 0 : (Number(aggregateParts[1] ?? 0) * 3600 + Number(aggregateParts[2] ?? 0) * 60 + Number(aggregateParts[3] ?? 0)) * 1e3;
+      aggregateElapsedFloorMs = Math.max(
+        0,
+        state.run.aggregateElapsedMs ?? aggregateFromLabelMs
+      );
+      promptInput.value = state.run.prompt || defaultPrompt;
+      activeSource = state.run.source;
+      rootInstruction = state.run.rootInstruction || rootInstruction;
+      rootElapsedMs = (state.run.rootElapsedMs || 0) + (typeof state.run.rootActiveStartedAtMs === "number" ? Math.max(0, recoveryAccountingCutoffMs - state.run.rootActiveStartedAtMs) : 0);
+      rootActiveStartedAtMs = void 0;
+      lastGoodCenterSnapshotDataUrl = state.run.centerSnapshotUrl || void 0;
+      rootLogEntries = [...state.rootLogs ?? []];
+      rootLog.replaceChildren();
+      rootLogEntries.forEach((entry) => writeLog(rootLog, entry.line, entry.direction, 160));
+      kclFiles = new Map(Object.entries(state.files ?? {}));
+      interfaceManifests = new Map(Object.entries(state.interfaces ?? {}));
+      rootImports = new Set(state.rootImports ?? []);
+      resetAgents();
+      plannedAgentCount = state.run.plannedAgentCount;
+      state.agents.forEach((durable) => {
+        const restored = createHydratedAgent(durable);
+        restored.snapshotStateChangedAtMs = durable.snapshotStateChangedAtMs ?? recoveredAtMs;
+        if (typeof durable.activeStartedAtMs === "number") {
+          restored.elapsedMs = (durable.elapsedMs ?? 0) + Math.max(0, recoveryAccountingCutoffMs - durable.activeStartedAtMs);
+        }
+        restored.activeStartedAtMs = void 0;
+        restored.status = durable.status === "complete" ? "complete" : "error";
+        restored.snapshotUrl = durable.snapshotUrl;
+        restored.snapshotState = durable.snapshotState;
+        if (restored.snapshotState === "queued" || restored.snapshotState === "rendering" || restored.snapshotState === "persisting") {
+          const restoredSnapshotUrl = durable.lastGoodSnapshotUrl ?? durable.snapshotUrl;
+          if (restoredSnapshotUrl !== void 0 && restoredSnapshotUrl.length > 0) {
+            restored.snapshotState = "ready";
+            restored.snapshotMessage = "restored last good CAD snapshot after interrupted render";
+            restored.snapshotUrl = restoredSnapshotUrl;
+          } else {
+            restored.snapshotState = "error";
+            restored.snapshotMessage = "controller recovery requires a fresh persisted visual";
+          }
+        }
+        if (!agentKclReady(restored) && durable.lastGoodKcl !== void 0 && stripImportLines(durable.lastGoodKcl).trim().length > 0) {
+          kclFiles.set(restored.filePath, durable.lastGoodKcl);
+          updateInterfaceManifest(restored, durable.lastGoodKcl);
+          if (durable.lastGoodSnapshotUrl !== void 0) {
+            restored.snapshotState = "ready";
+            restored.snapshotMessage = "restored last good CAD snapshot";
+            restored.snapshotUrl = durable.lastGoodSnapshotUrl;
+          }
+          appendAgentLog(restored, "< controller restored last validated KCL after an empty update", "in");
+        }
+        if (restored.status === "complete" && !isReusableLibraryAgent(restored) && (restored.snapshotState !== "ready" || typeof restored.snapshotUrl !== "string" || restored.snapshotUrl.length === 0)) {
+          restored.snapshotState = "error";
+          restored.snapshotMessage = "controller recovery requires a fresh persisted visual";
+        }
+      });
+      const restoredHistoricalElapsedMs = rootElapsedMs + Array.from(agents.values()).reduce((total, agent) => total + (agent.elapsedMs ?? 0), 0);
+      if (aggregateElapsedFloorMs > restoredHistoricalElapsedMs) {
+        rootElapsedMs += aggregateElapsedFloorMs - restoredHistoricalElapsedMs;
+      }
+      if (lastGoodCenterSnapshotDataUrl !== void 0) {
+        await replaceCenterWithStaticSnapshot(lastGoodCenterSnapshotDataUrl).catch(() => {
+        });
+      }
+      if (state.run.phase === "architecting" && state.agents.length === 0) {
+        rootLogLine("< controller recovered during architecture; restarting the persisted prompt", "in");
+        void runZookeeper();
+        return;
+      }
+      if (!["running", "finalizing"].includes(state.run.phase) || agents.size === 0) {
+        active = false;
+        runPhase = state.run.phase;
+        rootStatus = state.run.rootStatus;
+        root.dataset.runPhase = runPhase;
+        root.dataset.rootStatus = rootStatus;
+        centerStatus.textContent = state.run.centerStatus || "Zookeeper ready";
+        requestWallCheckpoint();
+        return;
+      }
+      const previousSessionId = state.run.sessionId;
+      if (previousSessionId) {
+        await fetch("/api/zookeeper/session-close", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            sessionId: previousSessionId,
+            reason: "controller recovery; cancel orphaned work before redispatch"
+          })
+        }).catch(() => {
+        });
+      }
+      runId += 1;
+      active = true;
+      startInProgress = false;
+      runPhase = "running";
+      rootStatus = "running";
+      root.dataset.runPhase = runPhase;
+      root.dataset.rootStatus = rootStatus;
+      const recoveryBaseSessionId = previousSessionId.split("-recovery-")[0].slice(0, 80) || randomId();
+      activeSessionId = `${recoveryBaseSessionId}-recovery-${Date.now()}-${randomId().slice(0, 8)}`;
+      runRequestAbort = new AbortController();
+      rootActiveStartedAtMs = Date.now();
+      centerStatus.textContent = "Controller recovered - resuming unfinished agents";
+      rootLogLine(`< controller restored ${agents.size} agents from durable state`, "in");
+      rootLogLine("< orphaned Zoo work cancelled; unfinished agents will be redispatched with persisted KCL", "in");
+      synchronizeCompletedAssemblies();
+      const supervisorResumeAtMs = Date.now();
+      supervisorReviewAtMs.set(rootAgentId, supervisorResumeAtMs);
+      Array.from(agents.values()).filter((agent) => agent.kind === "orchestrator").forEach((agent) => supervisorReviewAtMs.set(agent.id, supervisorResumeAtMs));
+      startAggregateTimeTicker();
+      startRootSupervisor();
+      scheduleRootProjectSubmit();
+      requestWallCheckpoint();
+    };
+    const pollDurableDisplayState = async () => {
+      if (isControllerWindow || wallTileIndex === void 0) return;
+      try {
+        const response = await fetch(
+          `/api/wall-state?tile=${wallTileIndex}&after=${hydratedWallRevision}`,
+          { cache: "no-store" }
+        );
+        if (!response.ok) throw await httpErrorFromResponse(response, "wall display state");
+        applyDurableDisplayState(await response.json());
+      } catch (error) {
+        centerStatus.textContent = `Display reconnecting: ${errorToMessage(error).slice(0, 100)}`;
+      } finally {
+        window.setTimeout(() => void pollDurableDisplayState(), 1e3);
+      }
+    };
     const handleWallBroadcast = (message) => {
       if (isControllerWindow) return;
       if (message.type === "reset") {
@@ -7178,6 +8925,7 @@ ${interfaces}` : "",
         interfaceManifests = /* @__PURE__ */ new Map();
         rootImports = /* @__PURE__ */ new Set();
         rootLog.replaceChildren();
+        rootLogEntries = [];
         setRunPhase("idle", "queued");
         renderAllGraphs();
         return;
@@ -7207,17 +8955,42 @@ ${interfaces}` : "",
         setRunPhase("complete", "complete");
         return;
       }
+      if (message.type === "runtime") {
+        runPhase = message.phase;
+        rootStatus = message.rootStatus;
+        root.dataset.runPhase = runPhase;
+        root.dataset.rootStatus = rootStatus;
+        root.dataset.completionBlockers = message.blockers ?? "";
+        if (message.aggregateTime !== void 0) aggregateTime.textContent = message.aggregateTime;
+        if (message.centerStatus !== void 0) centerStatus.textContent = message.centerStatus;
+        renderAllGraphs();
+        return;
+      }
+      if (message.type === "center:snapshot") {
+        if (wallTileIndex !== centerIndex) return;
+        lastGoodCenterSnapshotDataUrl = message.snapshotUrl;
+        void replaceCenterWithStaticSnapshot(message.snapshotUrl).catch(() => {
+        });
+        return;
+      }
       if (message.type === "root:log") {
-        rootLogLine(message.line, message.direction);
+        if (wallTileIndex === centerIndex) {
+          rootLogEntries.push({ line: message.line, direction: message.direction });
+          if (rootLogEntries.length > 160) rootLogEntries = rootLogEntries.slice(-160);
+          writeLog(rootLog, message.line, message.direction, 160);
+        }
         return;
       }
       if (message.type === "agent:add") {
+        if (wallTileIndex !== centerIndex && message.tileIndex !== wallTileIndex) return;
         if (agents.has(message.agent.id)) return;
-        addAgent({
+        createHydratedAgent({
           ...message.agent,
-          color: message.agent.color,
-          status: message.agent.status
+          assignedTileIndex: message.tileIndex,
+          logs: []
         });
+        layoutAgents();
+        renderAllGraphs();
         return;
       }
       if (message.type === "project:file") {
@@ -7268,7 +9041,7 @@ ${interfaces}` : "",
     wallChannel?.addEventListener("message", (event) => {
       handleWallBroadcast(event.data);
     });
-    stopButton.addEventListener("click", () => {
+    const stopZookeeper = () => {
       if (!isControllerWindow) return;
       runId += 1;
       if (rootActiveStartedAtMs !== void 0) {
@@ -7284,6 +9057,8 @@ ${interfaces}` : "",
       kclFiles = /* @__PURE__ */ new Map();
       interfaceManifests = /* @__PURE__ */ new Map();
       rootImports = /* @__PURE__ */ new Set();
+      rootLogEntries = [];
+      aggregateElapsedFloorMs = 0;
       centerViewerReloadAttempts = 0;
       if (centerViewerHealthTimer !== void 0) {
         window.clearInterval(centerViewerHealthTimer);
@@ -7300,10 +9075,41 @@ ${interfaces}` : "",
       centerStatus.textContent = "Zookeeper ready";
       setRunPhase("idle", "queued");
       renderAllGraphs();
+      requestWallCheckpoint();
+    };
+    const sendWallCommand = async (type, prompt = "") => {
+      const response = await fetch("/api/wall-command", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ type, prompt })
+      });
+      if (!response.ok) throw await httpErrorFromResponse(response, `wall ${type} command`);
+    };
+    stopButton.addEventListener("click", () => {
+      if (isControllerWindow) {
+        stopZookeeper();
+        return;
+      }
+      stopButton.disabled = true;
+      centerStatus.textContent = "Stop requested";
+      void sendWallCommand("stop").catch((error) => {
+        centerStatus.textContent = `Stop request failed: ${errorToMessage(error).slice(0, 100)}`;
+        stopButton.disabled = false;
+      });
     });
     startButton.addEventListener("click", () => {
-      if (!isControllerWindow) return;
-      void runZookeeper();
+      if (isControllerWindow) {
+        void runZookeeper();
+        return;
+      }
+      startButton.disabled = true;
+      startButton.textContent = "Start requested...";
+      centerStatus.textContent = "Waiting for wall controller";
+      void sendWallCommand("start", promptInput.value.trim() || defaultPrompt).catch((error) => {
+        centerStatus.textContent = `Start request failed: ${errorToMessage(error).slice(0, 100)}`;
+        startButton.disabled = false;
+        startButton.textContent = "Start Zookeeper";
+      });
     });
     stopButton.disabled = true;
     for (let index = 0; index < rows * cols; index += 1) {
@@ -7326,6 +9132,70 @@ ${interfaces}` : "",
     }
     renderAllGraphs();
     layoutAgents();
+    const wallClientId = `${isControllerWindow ? "controller" : `tile-${wallTileIndex}`}-${randomId()}`;
+    const sendWallHeartbeat = () => {
+      void fetch("/api/wall-heartbeat", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          clientId: wallClientId,
+          kind: isControllerWindow ? "controller" : "display",
+          tile: wallTileIndex
+        })
+      }).catch(() => {
+      });
+      if (isControllerWindow) requestWallCheckpoint();
+    };
+    sendWallHeartbeat();
+    const wallHeartbeatTimer = window.setInterval(sendWallHeartbeat, 5e3);
+    let wallCommandTimer;
+    let wallCommandSequence = 0;
+    let wallCommandInitialized = false;
+    const controllerStartedAt = Date.now() / 1e3;
+    const pollWallCommands = async () => {
+      if (!isControllerWindow) return;
+      try {
+        const response = await fetch(`/api/wall-command?after=${wallCommandSequence}`, {
+          cache: "no-store"
+        });
+        if (!response.ok) throw await httpErrorFromResponse(response, "wall command poll");
+        const payload = await response.json();
+        for (const command of payload.commands) {
+          wallCommandSequence = Math.max(wallCommandSequence, command.sequence);
+          const freshAtStartup = command.createdAt >= controllerStartedAt - 10;
+          if (!wallCommandInitialized && !freshAtStartup) continue;
+          if (command.type === "stop") {
+            stopZookeeper();
+            continue;
+          }
+          if (command.type === "start") {
+            if (active || startInProgress) {
+              rootLogLine("< ignored start command because a run is already active", "in");
+              continue;
+            }
+            promptInput.value = command.prompt.trim() || defaultPrompt;
+            void runZookeeper();
+          }
+        }
+        wallCommandSequence = Math.max(wallCommandSequence, payload.sequence);
+        wallCommandInitialized = true;
+      } catch (error) {
+        console.error("wall command poll failed", error);
+      } finally {
+        wallCommandTimer = window.setTimeout(() => void pollWallCommands(), 1e3);
+      }
+    };
+    if (isControllerWindow) {
+      void restoreControllerState().catch((error) => {
+        centerStatus.textContent = `Controller restore failed: ${errorToMessage(error).slice(0, 100)}`;
+        rootLogLine(`< controller restore failed: ${errorToMessage(error)}`);
+      }).finally(() => {
+        requestWallCheckpoint();
+        void pollWallCommands();
+      });
+    } else {
+      void pollDurableDisplayState();
+    }
     window.addEventListener("resize", () => {
       const size = rootViewerSize();
       centerView.el.style.width = `${size.width}px`;
@@ -7339,6 +9209,9 @@ ${interfaces}` : "",
     window.addEventListener("pagehide", () => {
       if (pageDisposed) return;
       pageDisposed = true;
+      window.clearInterval(wallHeartbeatTimer);
+      if (wallCommandTimer !== void 0) window.clearTimeout(wallCommandTimer);
+      if (wallCheckpointTimer !== void 0) window.clearTimeout(wallCheckpointTimer);
       if (isControllerWindow) clearTimers();
       else {
         runRequestAbort?.abort();

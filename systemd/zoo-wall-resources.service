@@ -1,0 +1,13 @@
+[Unit]
+Description=Zoo wall bounded resource monitor
+After=zoo-wall-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/user/web-view-wall-runtime
+ExecStart=/usr/bin/python3 /home/user/web-view-wall-runtime/scripts/monitor_wall_resources.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

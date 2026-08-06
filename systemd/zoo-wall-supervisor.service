@@ -1,0 +1,18 @@
+[Unit]
+Description=Zoo nine-display wall browser supervisor
+After=graphical-session.target zoo-wall-server.service
+Requires=zoo-wall-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/user/web-view-wall-runtime
+Environment=WALL_RUNTIME_DIR=/home/user/web-view-wall-runtime
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/run/user/1000/gdm/Xauthority
+ExecStart=/usr/bin/python3 /home/user/web-view-wall-runtime/scripts/supervise_zoo_wall.py
+Restart=always
+RestartSec=5
+KillMode=process
+
+[Install]
+WantedBy=default.target

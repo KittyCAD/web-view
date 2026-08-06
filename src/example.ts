@@ -4,6 +4,8 @@ import { ZooWebView } from '.'
 declare global {
   interface Window {
     ZOO_API_TOKEN?: string
+    __zooWallDebug?: () => unknown
+    __zooWallForceReview?: (agentId: string) => unknown
   }
 }
 
@@ -16,6 +18,12 @@ type AgentKind = 'orchestrator' | 'worker'
 type AgentStatus = 'queued' | 'starting' | 'running' | 'reviewing' | 'complete' | 'error'
 type SnapshotState = 'queued' | 'rendering' | 'persisting' | 'ready' | 'error'
 type RunPhase = 'idle' | 'architecting' | 'running' | 'finalizing' | 'complete'
+type LogDirection = 'in' | 'out' | 'sys'
+
+type LogEntry = {
+  line: string,
+  direction: LogDirection,
+}
 
 type Agent = {
   id: string,
@@ -47,6 +55,7 @@ type Agent = {
   snapshotLoadId?: number,
   snapshotState?: SnapshotState,
   snapshotMessage?: string,
+  snapshotStateChangedAtMs?: number,
   snapshotRecoveryCount?: number,
   lastSnapshotRecoveryAtMs?: number,
   lastGoodKcl?: string,
@@ -57,6 +66,9 @@ type Agent = {
   lastActivityAtMs?: number,
   supervisorRecoveryCount?: number,
   lastSupervisorRecoveryAtMs?: number,
+  pendingWorkInstruction?: string,
+  assignedTileIndex?: number,
+  logs?: LogEntry[],
 }
 
 type AgentSeed = Pick<Agent, 'id' | 'parentId' | 'kind' | 'scope' | 'name' | 'role' | 'instruction' | 'filePath' | 'imports' | 'source'>
@@ -137,8 +149,11 @@ type AgentWorkStreamEvent = {
   workId?: string,
   update: AgentStreamResponse,
 } | {
-  type: 'started' | 'ping',
+  type: 'started',
   workId?: string,
+} | {
+  type: 'ping' | 'work-status',
+  workIds?: string[],
 } | {
   type: 'error',
   workId?: string,
@@ -217,9 +232,18 @@ type BomImportRequest = {
   reason: string,
 }
 
+type BomUniqueComponentRequest = {
+  role: string,
+  reason: string,
+  instruction: string,
+  parent: string,
+  kind?: AgentKind,
+}
+
 type BomReviewResponse = {
   sharedComponents?: BomSharedComponentRequest[],
   importUpdates?: BomImportRequest[],
+  uniqueComponents?: BomUniqueComponentRequest[],
 }
 
 type AgentReviewResponse = {
@@ -263,6 +287,7 @@ type CenterRenderRequest = {
   project: RenderProject,
   label: string,
   waiters: CenterRenderWaiter[],
+  attempt: number,
 }
 
 type RankedAgent = {
@@ -286,6 +311,16 @@ type WallBroadcastMessage = {
 } | {
   type: 'run:complete',
 } | {
+  type: 'runtime',
+  phase: RunPhase,
+  rootStatus: AgentStatus,
+  blockers?: string,
+  aggregateTime?: string,
+  centerStatus?: string,
+} | {
+  type: 'center:snapshot',
+  snapshotUrl: string,
+} | {
   type: 'plan',
   sessionId: string,
   source: 'openai' | 'fallback',
@@ -295,6 +330,7 @@ type WallBroadcastMessage = {
 } | {
   type: 'agent:add',
   agent: AgentSeed & Pick<Agent, 'color' | 'status'>,
+  tileIndex: number,
 } | {
   type: 'agent:update',
   agentId: string,
@@ -340,12 +376,63 @@ type WallBroadcastMessage = {
   message?: string,
 }
 
+type DurableWallRun = {
+  phase: RunPhase,
+  rootStatus: AgentStatus,
+  prompt: string,
+  sessionId: string,
+  source: 'openai' | 'fallback',
+  rootInstruction: string,
+  plannedAgentCount: number,
+  rootElapsedMs: number,
+  rootActiveStartedAtMs?: number,
+  aggregateTime: string,
+  aggregateElapsedMs?: number,
+  centerStatus: string,
+  centerSnapshotUrl: string,
+  completionBlockers: string,
+}
+
+type DurableWallAgent = AgentSeed & {
+  color: string,
+  status: AgentStatus,
+  assignedTileIndex: number,
+  snapshotUrl?: string,
+  snapshotState?: SnapshotState,
+  snapshotMessage?: string,
+  snapshotStateChangedAtMs?: number,
+  lastGoodKcl?: string,
+  lastGoodSnapshotUrl?: string,
+  elapsedMs?: number,
+  activeStartedAtMs?: number,
+  lastActivityAtMs?: number,
+  reviewRounds?: number,
+  supervisorRecoveryCount?: number,
+  pendingWorkInstruction?: string,
+  logs: LogEntry[],
+}
+
+type DurableWallState = {
+  version: 1,
+  revision: number,
+  updatedAt?: string,
+  unchanged?: boolean,
+  controllerHeartbeatAt: number,
+  run: DurableWallRun,
+  agents: DurableWallAgent[],
+  files: Record<string, string>,
+  interfaces: Record<string, string>,
+  rootImports: string[],
+  rootLogs: LogEntry[],
+}
+
 const rows = 3
 const cols = 3
 const centerIndex = 4
 const rootAgentId = 'zookeeper-orchestrator-root'
 const perimeterOrder = [0, 1, 2, 5, 8, 7, 6, 3]
-const maxWallAgents = 48
+const wallAgentLimit: number | undefined = undefined
+const maxNestedOrchestratorDepth = 3
 const maxLiveAgentViews = 24
 const maxAgentRepairAttempts = 2
 const maxZooFallbackRetries = 3
@@ -363,29 +450,93 @@ const runCompletionRetryMs = 3000
 const viewerHealthPollMs = 10000
 const viewerStalledReloadMs = 45000
 const useAgentCadSnapshots = true
+const useStaticCenterCad = true
+const useIsolatedSnapshotRenderer = true
 const snapshotViewerSize: Size = { width: 1280, height: 720 }
 const maxQueuedDraftSnapshots = 4
+const maxConcurrentAgentSnapshots = 2
 const snapshotFrameWaitMs = 900
-const snapshotSubmitTimeoutMs = 35000
+const snapshotSubmitTimeoutMs = 85000
 const snapshotCaptureTimeoutMs = 12000
 const snapshotPersistTimeoutMs = 120000
 const snapshotImageFetchTimeoutMs = 30000
 const snapshotDisposeTimeoutMs = 5000
+const wallCheckpointTimeoutMs = 30000
+const wallCheckpointIntervalMs = 10000
+const pendingReworkSeparator = '\n\nAdditional pending rework:\n'
+const maxPendingWorkInstructionChars = 256000
 const maxSnapshotSubmissionsPerRenderer = 4
+// This includes server-side queue time. Individual render jobs remain bounded
+// by the shorter server submit/process limits.
+const isolatedSnapshotTimeoutMs = 780000
+const snapshotStaleThresholdMs = isolatedSnapshotTimeoutMs + 30000
+const workStatusMissingThreshold = 3
+const workEventPollTimeoutMs = 30000
+const localAgentWorkStallMs = isolatedSnapshotTimeoutMs + 120000
+const orphanedAgentStatusGraceMs = 120000
 const centerRendererSubmitTimeoutMs = 90000
+
+const compactPendingWorkInstruction = (
+  ...values: Array<string | undefined>
+) => {
+  const segments = values
+    .flatMap(value => value?.split(pendingReworkSeparator) ?? [])
+    .map(value => value.trim())
+    .filter(value => value.length > 0)
+  const seenSegments = new Set<string>()
+  const uniqueSegments: string[] = []
+  for (let index = segments.length - 1; index >= 0; index -= 1) {
+    const segment = segments[index]!
+    const placementTarget = segment.match(
+      /^Update (.+?)'s assembly placement layer after /,
+    )?.[1]
+    // A newer placement request includes the latest direct-child interfaces,
+    // so retaining older full copies only bloats the next parent prompt.
+    const key = placementTarget === undefined
+      ? segment
+      : `placement:${placementTarget}`
+    if (seenSegments.has(key)) continue
+    seenSegments.add(key)
+    uniqueSegments.unshift(segment)
+  }
+  const kept: string[] = []
+  let length = 0
+
+  for (let index = uniqueSegments.length - 1; index >= 0; index -= 1) {
+    const segment = uniqueSegments[index]!
+    const separatorLength = kept.length === 0 ? 0 : pendingReworkSeparator.length
+    if (length + separatorLength + segment.length <= maxPendingWorkInstructionChars) {
+      kept.unshift(segment)
+      length += separatorLength + segment.length
+      continue
+    }
+    if (kept.length === 0) {
+      kept.unshift(segment.slice(0, maxPendingWorkInstructionChars))
+    }
+    break
+  }
+
+  return kept.join(pendingReworkSeparator)
+}
 const maxCenterSubmissionsPerRenderer = 6
 const maxRootDraftVisualizations = 1
+const maxLiveCenterProjectCharacters = 900000
 const defaultPrompt = 'A terminator robot endoskeleton display assembly. Build a metallic humanoid inspection robot with roughly 28-40 concrete parts organized through nested sub-orchestrators: skull/head, neck/spine, ribcage/torso, pelvis/hips, left arm, right arm, left leg, right leg, hands/feet, exposed actuator links, and cable routing. Workers should each own one physical part file, not a set: individual skull plate, eye lens, jaw link, vertebra, rib hoop, shoulder yoke, upper-arm bone, forearm piston, finger segment, hip bracket, thigh strut, shin strut, foot plate, etc. Use shared reusable components for repeated hardware such as bolts, pins, bushings, bearings, washers, spacers, cable clips, and small actuator clevises; model each reusable component once and have orchestrators clone/place the required counts. For mirrored limbs, paired brackets, repeated ribs, bolt circles, and other arrays, create one canonical part when possible and have orchestrators apply the mirrored, radial, or linear placement transforms with BOM comments. Every sub-orchestrator should place only direct child/subassembly imports and explicit shared reusable imports, add BOM comments for reused parts, align by named mate points/local axes/dimensions, and return one renderable aggregate so parent assemblies can place it. Avoid weapons; focus on the mechanical robot body, exposed structure, and assembled presentation.'
 const rootFilePath = 'main.kcl'
 const interfaceBlockStart = 'ZOOKEEPER_INTERFACE'
 const interfaceBlockEnd = '/ZOOKEEPER_INTERFACE'
 const wallParams = new URLSearchParams(window.location.search)
-const requestedWallTile = Number(wallParams.get('wallTile'))
+const isolatedSnapshotJobId = wallParams.get('snapshotJob')?.trim() ?? ''
+const isHeadlessController = wallParams.get('wallController') === '1'
+const requestedWallTileValue = wallParams.get('wallTile')
+const requestedWallTile = requestedWallTileValue === null
+  ? Number.NaN
+  : Number(requestedWallTileValue)
 const wallTileIndex = Number.isInteger(requestedWallTile) && requestedWallTile >= 0 && requestedWallTile < rows * cols
   ? requestedWallTile
   : undefined
 const isWallTileMode = wallTileIndex !== undefined
-const isControllerWindow = !isWallTileMode || wallTileIndex === centerIndex
+const isControllerWindow = isHeadlessController || !isWallTileMode
 const shouldRenderAgentViews = !isWallTileMode || !isControllerWindow
 const wallBroadcastChannelName = 'zookeeper-wall-v1'
 
@@ -533,7 +684,7 @@ const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 const isRetryableZooFallback = (update: AgentWorkResponse) => (
   update.source === 'fallback' &&
-  /\b(websocket closed|closed while reading frame|timed out|timeout|without an EditKclCode output|socket|connection reset|connection closed)\b/i
+  /\b(websocket closed|closed while reading frame|timed out|timeout|without an EditKclCode output|socket|connection reset|connection closed|connection interrupted)\b/i
     .test(update.summary)
 )
 
@@ -821,8 +972,490 @@ const stripImportLines = (source: string) => source
   .filter(line => !line.trim().startsWith('import '))
   .join('\n')
 
+const kclExecutableFingerprint = (source: string) => stripImportLines(source)
+  .split('\n')
+  .map(line => line.trim())
+  .filter(line => line.length > 0 && !line.startsWith('//'))
+  .join('')
+  .replace(/\s+/g, '')
+
+const routeGeometryBlockPattern = /\b[A-Za-z_][A-Za-z0-9_]*(?:route|path|centerline|trunk|entry|exit|outlet|tip|jacketEnd|bend(?:Start|End|Center)|waypoint|fanout|endpoint)[A-Za-z0-9_]*(?:Plane|Datum)\b/i
+
+const routeGeometryFingerprint = (source: string) => {
+  let routeBlockDepth = 0
+  return stripImportLines(source)
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => {
+      if (line.length === 0 || line.startsWith('//')) return false
+      const startsRouteBlock = routeGeometryBlockPattern.test(line) && line.includes('{')
+      const inRouteBlock = routeBlockDepth > 0
+      const include = (
+        inRouteBlock ||
+        startsRouteBlock ||
+        /\b(?:line|arc|bezier|tangentialArc)\s*\(/i.test(line) ||
+        /\b(?:route|path|centerline|trunk|entry|exit|outlet|tip|jacketEnd|runLength|bendRadius|arcLength)\b/i.test(line) ||
+        /\b[A-Za-z_][A-Za-z0-9_]*(?:Length|Offset|Trim|Endpoint|Outlet|Fanout|BendEnd)\b/i.test(line)
+      )
+      const braceDepthChange = (line.match(/{/g)?.length ?? 0) - (line.match(/}/g)?.length ?? 0)
+      if (inRouteBlock) routeBlockDepth = Math.max(0, routeBlockDepth + braceDepthChange)
+      else if (startsRouteBlock) routeBlockDepth = Math.max(0, braceDepthChange)
+      return include
+    })
+    .join('')
+    .replace(/\s+/g, '')
+}
+
+const interfaceFieldValue = (source: string, field: string) => {
+  const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return source.match(new RegExp(`^\\s*//\\s*${escapedField}:\\s*(.*)$`, 'mi'))?.[1]
+    ?.replace(/\s+/g, ' ')
+    .trim()
+}
+
+const coordinateVectors = (source: string) => Array.from(source.matchAll(
+  /\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]/g,
+)).map(match => `[${match[1]},${match[2]},${match[3]}]`)
+
+type NumericVector = [number, number, number]
+
+const numericCoordinateVectors = (source: string) => Array.from(source.matchAll(
+  /\[\s*(?:var\s+)?(-?\d+(?:\.\d+)?)(?:mm)?\s*,\s*(?:var\s+)?(-?\d+(?:\.\d+)?)(?:mm)?\s*,\s*(?:var\s+)?(-?\d+(?:\.\d+)?)(?:mm)?\s*\]/g,
+)).map(match => [Number(match[1]), Number(match[2]), Number(match[3])] as NumericVector)
+
+const numericCoordinatePairs = (source: string) => Array.from(source.matchAll(
+  /\[\s*(?:var\s+)?(-?\d+(?:\.\d+)?)(?:mm)?\s*,\s*(?:var\s+)?(-?\d+(?:\.\d+)?)(?:mm)?\s*\]/g,
+)).map(match => [Number(match[1]), Number(match[2])] as [number, number])
+
+const formatNumericVector = (vector: NumericVector) => (
+  `[${vector.map(value => Number(value.toFixed(6))).join(', ')}]`
+)
+
+const vectorsNear = (left: NumericVector, right: NumericVector, tolerance = 0.05) => (
+  left.every((value, index) => Math.abs(value - right[index]!) <= tolerance)
+)
+
+const interfaceNamedPoint = (source: string, name: string) => {
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = source.match(new RegExp(
+    `\\b${escapedName}\\s*=?\\s*\\[\\s*(-?\\d+(?:\\.\\d+)?)\\s*,\\s*(-?\\d+(?:\\.\\d+)?)\\s*,\\s*(-?\\d+(?:\\.\\d+)?)\\s*\\]`,
+    'i',
+  ))
+  if (match === null) return undefined
+  return [Number(match[1]), Number(match[2]), Number(match[3])] as NumericVector
+}
+
+const routeEndpointSpanContract = (instruction: string, source = '') => {
+  const spanMatch = (
+    instruction.match(
+      /\broute\s+from[\s\S]{0,260}?\b(?:a|approximately)\s+(\d+(?:\.\d+)?)\s*mm\s+(?:endpoint\s+)?span\b/i,
+    ) ||
+    instruction.match(
+      /\bstraight-line\s+distance\s+from[\s\S]{0,220}?\bis\s+(?:only\s+)?(?:about|approximately)\s+(\d+(?:\.\d+)?)\s*mm\b/i,
+    ) ||
+    instruction.match(
+      /\bassembled\b[\s\S]{0,140}?\brun\s+is\s+(?:only\s+)?(?:about|approximately)\s+(\d+(?:\.\d+)?)\s*mm\b/i,
+    ) ||
+    instruction.match(
+      /\bparent\s+KCL\s+calculates\s+(\d+(?:\.\d+)?)\s*mm\s+from\b[\s\S]{0,180}?\bto\b/i,
+    )
+  )
+  if (spanMatch === null) return undefined
+  const explicitPointNames = Array.from(instruction.matchAll(/\b([A-Za-z][A-Za-z0-9_]*)\s+can mate\b/gi))
+    .map(match => match[1]!)
+  const localOriginName = interfaceFieldValue(source, 'local_origin')
+    ?.match(/^([A-Za-z][A-Za-z0-9_]*)\b/)?.[1]
+  const manifestPointNames = Array.from(
+    (interfaceFieldValue(source, 'mate_points') ?? '').matchAll(/\b([A-Za-z][A-Za-z0-9_]*)\s*=?\s*\[/g),
+  ).map(match => match[1]!)
+  const inferredEndName = manifestPointNames.at(-1) === localOriginName
+    ? [...manifestPointNames].reverse().find(name => name !== localOriginName)
+    : manifestPointNames.at(-1)
+  const pointNames = explicitPointNames.length >= 2
+    ? explicitPointNames
+    : [localOriginName, inferredEndName].filter((name): name is string => name !== undefined)
+  if (pointNames.length < 2) return undefined
+  return {
+    startName: pointNames[0]!,
+    endName: pointNames[1]!,
+    span: Number(spanMatch[1]),
+    centerlineMustExceedSpan: /\bbefore\s+allowing\s+for\s+a\s+bend\b/i.test(instruction),
+    centerlineMaximum: /\bshorten\b/i.test(instruction)
+      ? Number(spanMatch[1]) * 1.25
+      : undefined,
+  }
+}
+
+const routeCenterlineLength = (source: string) => {
+  const keyDimensions = interfaceFieldValue(source, 'key_dimensions') ?? ''
+  const interfaceMatch = keyDimensions.match(
+    /\b(?:routed)?centerline(?:Length|\s+length)?\s*=?\s*(\d+(?:\.\d+)?)\b/i,
+  )
+  if (interfaceMatch !== null) return Number(interfaceMatch[1])
+  const sourceMatch = source.match(/^\s*centerlineLength\s*=\s*(\d+(?:\.\d+)?)mm\b/m)
+  return sourceMatch === null ? undefined : Number(sourceMatch[1])
+}
+
+const controllerMateContract = (instruction: string) => {
+  const fullMatch = instruction.match(
+    /\bcontroller\s+tips?\s+are\s+at\s+Y\s*=\s*(-?\d+(?:\.\d+)?)\s*,\s*Z\s*=\s*(-?\d+(?:\.\d+)?)[\s\S]{0,220}?\b(?:NTC\s+)?tips?\s+around\s+Y\s*=\s*(-?\d+(?:\.\d+)?)\s*,\s*Z\s*=\s*(-?\d+(?:\.\d+)?)\s*[-–]\s*(-?\d+(?:\.\d+)?)/i,
+  )
+  if (fullMatch !== null) {
+    return {
+      currentY: Number(fullMatch[1]),
+      currentZ: Number(fullMatch[2]),
+      targetY: Number(fullMatch[3]),
+      targetZMin: Math.min(Number(fullMatch[4]), Number(fullMatch[5])),
+      targetZMax: Math.max(Number(fullMatch[4]), Number(fullMatch[5])),
+    }
+  }
+  const zOnlyMatch = instruction.match(
+    /\bcontroller\s+tips?\s+are\s+near\s+Z\s*=\s*(-?\d+(?:\.\d+)?)[\s\S]{0,420}?\bterminat(?:e|ing)\s+near\s+Z\s*=\s*(-?\d+(?:\.\d+)?)/i,
+  )
+  if (zOnlyMatch === null) return undefined
+  return {
+    currentY: undefined,
+    currentZ: Number(zOnlyMatch[1]),
+    targetY: undefined,
+    targetZMin: Number(zOnlyMatch[2]),
+    targetZMax: Number(zOnlyMatch[2]),
+  }
+}
+
+const parentInterfaceTranslation = (source: string) => {
+  const parentInterface = interfaceFieldValue(source, 'parent_interface') ?? ''
+  const match = parentInterface.match(
+    /\btranslation\s*(\[\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\])/i,
+  )
+  if (match !== null) return numericCoordinateVectors(match[1] ?? '')[0]
+  return /\b(?:identity\s+placement|zero\s+translation)\b/i.test(parentInterface)
+    ? [0, 0, 0] as NumericVector
+    : undefined
+}
+
+const routeThroughWaypointContract = (instruction: string, source: string) => {
+  const explicitRouteClauses = Array.from(instruction.matchAll(
+    /\b(?:curved\s+)?route\s+through\s+([^.;]+)/gi,
+  ))
+  const conductorRunClauses = Array.from(instruction.matchAll(
+    /\bconductors?\s+(?:currently\s+)?run\s+from\s+([^.;]+)/gi,
+  ))
+  const waypointClauses = [...explicitRouteClauses, ...conductorRunClauses]
+  const globalWaypoints = waypointClauses.flatMap(match => numericCoordinateVectors(match[1] ?? ''))
+  if (globalWaypoints.length === 0) return undefined
+
+  const parentInterface = interfaceFieldValue(source, 'parent_interface') ?? ''
+  const translationMatch = parentInterface.match(
+    /\btranslation\s*(\[\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\])/i,
+  )
+  const rotationMatch = parentInterface.match(
+    /\brotation\s*(\[\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\])/i,
+  )
+  const documentedTranslation = translationMatch === null
+    ? undefined
+    : numericCoordinateVectors(translationMatch[1] ?? '')[0]
+  const rotation = rotationMatch === null
+    ? undefined
+    : numericCoordinateVectors(rotationMatch[1] ?? '')[0]
+  if (rotation !== undefined && !vectorsNear(rotation, [0, 0, 0], 0.001)) {
+    return undefined
+  }
+  const translation = documentedTranslation ?? (
+    conductorRunClauses.length > 0 && globalWaypoints.length >= 2
+      ? globalWaypoints[0]
+      : undefined
+  )
+  if (translation === undefined) return undefined
+  return {
+    globalWaypoints,
+    localWaypoints: globalWaypoints.map(point => (
+      point.map((value, index) => value - translation[index]!) as NumericVector
+    )),
+  }
+}
+
+const explicitRouteAcceptanceRequirements = (instruction: string, source: string) => {
+  const requirements: string[] = []
+  const spanContract = routeEndpointSpanContract(instruction, source)
+  if (spanContract !== undefined) {
+    requirements.push(
+      `MANDATORY ENDPOINT-SPAN ACCEPTANCE: ${spanContract.startName} to ${spanContract.endName} must measure ${spanContract.span} mm within 0.5 mm. The older endpoint span is rejected even if the sleeve remains hollow and executable.${spanContract.centerlineMustExceedSpan ? ` Because this is the straight-line distance before bending, the routed centerline must also exceed ${spanContract.span} mm.` : ''}${spanContract.centerlineMaximum === undefined ? '' : ` Because the review explicitly requires shortening the route, its routed centerline must not exceed ${spanContract.centerlineMaximum.toFixed(2)} mm.`}`,
+    )
+  }
+  const waypointContract = routeThroughWaypointContract(instruction, source)
+  if (waypointContract !== undefined) {
+    requirements.push([
+      `MANDATORY ROUTE-WAYPOINT ACCEPTANCE: the executable route and mate_points must traverse assembly-frame waypoints ${waypointContract.globalWaypoints.map(formatNumericVector).join(' and ')}.`,
+      `With the current zero-rotation parent transform, their required worker-local coordinates are ${waypointContract.localWaypoints.map(formatNumericVector).join(' and ')}.`,
+      'Changing bend radius, appearance, total length, or unrelated endpoints without traversing these waypoints is rejected.',
+    ].join(' '))
+  }
+  const controllerContract = controllerMateContract(instruction)
+  if (controllerContract !== undefined) {
+    requirements.push([
+      `MANDATORY CONTROLLER-MATE ACCEPTANCE: update controllerCopperTip and its documented parent transform (identity is allowed) so the assembled tip lands ${controllerContract.targetY === undefined ? '' : `near Y=${controllerContract.targetY} mm and `}near Z=${controllerContract.targetZMin}..${controllerContract.targetZMax} mm, beside the NTC controller tips.`,
+      'The mainSleeveExit route mate must have a substantial local Z offset that carries the conductor from that controller datum down through the common main-sleeve trunk; retaining a flat local Z=0 trunk is rejected.',
+    ].join(' '))
+  }
+  return requirements
+}
+
+const genericGeometryContractParagraphPrefixes = [
+  'MANDATORY IMPORT-FRAME CONTRACT:',
+  'PRECEDENCE CLARIFICATION:',
+  'Before finishing, inspect the exported aggregate type and parent_interface.',
+  'MANDATORY TRANSFORMABLE-REPEAT CONTRACT:',
+]
+
+const geometryReviewDirectiveForValidation = (instruction: string) => (
+  (instruction.split(assemblyContextMarker, 1)[0] ?? instruction)
+    .split(/\n\s*\n/)
+    .map(paragraph => paragraph.trim())
+    .filter(paragraph => paragraph.length > 0)
+    .filter(paragraph => !genericGeometryContractParagraphPrefixes.some(prefix => (
+      paragraph.startsWith(prefix)
+    )))
+    .join('\n\n')
+)
+
+const explicitRouteReworkViolation = (
+  instruction: string,
+  previousSource: string,
+  updatedSource: string,
+) => {
+  const reviewDirective = geometryReviewDirectiveForValidation(instruction)
+  if (!/\b(?:rerout(?:e|ed|ing)|route|routed centerline|centerline|common trunk)\b/i.test(reviewDirective)) {
+    return undefined
+  }
+
+  if (routeGeometryFingerprint(previousSource) === routeGeometryFingerprint(updatedSource)) {
+    return 'route rework did not change any route-defining executable geometry; formatting, comments, appearance, and unrelated profile edits do not satisfy this review'
+  }
+
+  const compactPrevious = previousSource.replace(/\s+/g, '')
+  const compactUpdated = updatedSource.replace(/\s+/g, '')
+  const positiveRouteTargetVectors = Array.from(reviewDirective.matchAll(
+    /\b(?:passing\s+through|terminating\s+at|toward|preserv(?:e|es|ed|ing)|retain(?:s|ed|ing)?|maintain(?:s|ed|ing)?|keep(?:s|ing)?)\b[^;\n]*?(?=(?:\.(?:\s|$))|;|\n|$)/gi,
+  )).flatMap(match => numericCoordinateVectors(match[0] ?? ''))
+  const requiredWaypointVectors = new Set(
+    [
+      ...(routeThroughWaypointContract(reviewDirective, previousSource)?.globalWaypoints ?? []),
+      ...positiveRouteTargetVectors,
+    ]
+      .map(formatNumericVector)
+      .map(vector => vector.replace(/\s+/g, '')),
+  )
+  const explicitlyRejectedVectors = Array.from(reviewDirective.matchAll(
+    /\b(?:stale|old|previous|wrong|incorrect|rejected?|replace(?:d|ment)?|remov(?:e|ed|ing)|delet(?:e|ed|ing)|discard(?:ed|ing)?|must\s+not|do\s+not\s+(?:keep|preserve|retain)|(?:change|move|reroute|relocate|shift)[^;\n]*?\bfrom)\b[^;\n]*?(?=(?:\.(?:\s|$))|;|\n|$)/gi,
+  )).flatMap(match => coordinateVectors(match[0] ?? ''))
+  const citedExistingVectors = Array.from(new Set(explicitlyRejectedVectors))
+    .filter(vector => compactPrevious.includes(vector))
+    .filter(vector => !requiredWaypointVectors.has(vector))
+  if (
+    citedExistingVectors.length > 0 &&
+    citedExistingVectors.some(vector => compactUpdated.includes(vector))
+  ) {
+    return `route rework preserved an explicitly rejected stale coordinate vector (${citedExistingVectors.join(', ')}); recompute the named route instead of retaining it`
+  }
+
+  const requiredInterfaceFields = [
+    /\b(?:update|revise|correct)\b[\s\S]{0,220}\b(?:mate points?|route mates?)\b/i.test(reviewDirective)
+      ? 'mate_points'
+      : undefined,
+    /\b(?:update|revise|correct)\b[\s\S]{0,220}\b(?:bounding box|bounds|bbox)\b/i.test(reviewDirective)
+      ? 'bbox_mm'
+      : undefined,
+  ].filter((field): field is string => field !== undefined)
+
+  for (const field of requiredInterfaceFields) {
+    const previousValue = interfaceFieldValue(previousSource, field)
+    const updatedValue = interfaceFieldValue(updatedSource, field)
+    if (updatedValue === undefined) {
+      return `route rework removed the required ${field} interface field`
+    }
+    if (previousValue !== undefined && previousValue === updatedValue) {
+      return `route rework left the required ${field} interface field unchanged`
+    }
+  }
+
+  const spanContract = routeEndpointSpanContract(reviewDirective, previousSource)
+  if (spanContract !== undefined) {
+    const startPoint = interfaceNamedPoint(updatedSource, spanContract.startName)
+    const endPoint = interfaceNamedPoint(updatedSource, spanContract.endName)
+    if (startPoint === undefined || endPoint === undefined) {
+      return `route rework must preserve named interface points ${spanContract.startName} and ${spanContract.endName} for endpoint-span validation`
+    }
+    const actualSpan = Math.hypot(
+      endPoint[0] - startPoint[0],
+      endPoint[1] - startPoint[1],
+      endPoint[2] - startPoint[2],
+    )
+    if (Math.abs(actualSpan - spanContract.span) > 0.5) {
+      return `route endpoint span is ${actualSpan.toFixed(2)} mm; ${spanContract.startName} to ${spanContract.endName} must be ${spanContract.span.toFixed(2)} mm within 0.5 mm`
+    }
+    const centerlineLength = routeCenterlineLength(updatedSource)
+    if (
+      spanContract.centerlineMustExceedSpan &&
+      (centerlineLength === undefined || centerlineLength <= spanContract.span)
+    ) {
+      return `routed centerline must exceed the ${spanContract.span.toFixed(2)} mm straight-line endpoint distance before allowing for its bend`
+    }
+    if (
+      spanContract.centerlineMaximum !== undefined &&
+      (centerlineLength === undefined || centerlineLength > spanContract.centerlineMaximum)
+    ) {
+      return `routed centerline is ${centerlineLength?.toFixed(2) ?? 'undocumented'} mm; the shortened ${spanContract.span.toFixed(2)} mm endpoint run must not exceed ${spanContract.centerlineMaximum.toFixed(2)} mm`
+    }
+  }
+
+  const waypointContract = routeThroughWaypointContract(reviewDirective, previousSource)
+  if (waypointContract !== undefined) {
+    const interfaceVectors = numericCoordinateVectors(interfaceFieldValue(updatedSource, 'mate_points') ?? '')
+    const executableVectors = numericCoordinateVectors(stripImportLines(updatedSource)
+      .split('\n')
+      .filter(line => !line.trim().startsWith('//'))
+      .join('\n'))
+    const executablePairs = numericCoordinatePairs(stripImportLines(updatedSource)
+      .split('\n')
+      .filter(line => !line.trim().startsWith('//'))
+      .join('\n'))
+    for (const waypoint of waypointContract.localWaypoints) {
+      if (!interfaceVectors.some(candidate => vectorsNear(candidate, waypoint))) {
+        return `route mate_points do not include required worker-local main-sleeve waypoint ${formatNumericVector(waypoint)}`
+      }
+      const appearsInExecutableRoute = (
+        executableVectors.some(candidate => vectorsNear(candidate, waypoint)) ||
+        (
+          Math.abs(waypoint[0]) <= 0.05 &&
+          executablePairs.some(candidate => (
+            Math.abs(candidate[0] - waypoint[1]) <= 0.05 &&
+            Math.abs(candidate[1] - waypoint[2]) <= 0.05
+          ))
+        )
+      )
+      if (!appearsInExecutableRoute) {
+        return `executable route does not traverse required worker-local main-sleeve waypoint ${formatNumericVector(waypoint)}`
+      }
+    }
+  }
+
+  const controllerContract = controllerMateContract(reviewDirective)
+  if (controllerContract !== undefined) {
+    const translation = parentInterfaceTranslation(updatedSource)
+    const controllerTip = interfaceNamedPoint(updatedSource, 'controllerCopperTip')
+    if (translation === undefined || controllerTip === undefined) {
+      return 'controller-mate rework must document controllerCopperTip and a numeric or identity parent_interface transform'
+    }
+    const assembledControllerTip = controllerTip.map((value, index) => (
+      value + translation[index]!
+    )) as NumericVector
+    if (
+      (controllerContract.targetY !== undefined && Math.abs(assembledControllerTip[1] - controllerContract.targetY) > 2) ||
+      assembledControllerTip[2] < controllerContract.targetZMin - 2 ||
+      assembledControllerTip[2] > controllerContract.targetZMax + 2
+    ) {
+      return `assembled controllerCopperTip remains ${formatNumericVector(assembledControllerTip)}; it must land ${controllerContract.targetY === undefined ? '' : `near Y=${controllerContract.targetY.toFixed(3)} mm and `}near Z=${controllerContract.targetZMin.toFixed(3)}..${controllerContract.targetZMax.toFixed(3)} mm`
+    }
+    const mainSleeveExit = interfaceNamedPoint(updatedSource, 'mainSleeveExit')
+    const requiredLocalZSpan = Math.abs(
+      ((controllerContract.targetZMin + controllerContract.targetZMax) / 2) - controllerContract.currentZ,
+    ) * 0.5
+    if (
+      mainSleeveExit === undefined ||
+      Math.abs(mainSleeveExit[2] - controllerTip[2]) < requiredLocalZSpan
+    ) {
+      return `mainSleeveExit must leave the controller datum by at least ${requiredLocalZSpan.toFixed(2)} mm in local Z to enter the common elevated trunk; a near-Z=0 route is rejected`
+    }
+  }
+
+  return undefined
+}
+
+const explicitPlacementReviewStart = 'MANDATORY EXPLICIT PLACEMENT REVIEW START'
+const explicitPlacementReviewEnd = 'MANDATORY EXPLICIT PLACEMENT REVIEW END'
+
+const acceptanceDirectiveFor = (instruction: string) => {
+  const startIndex = instruction.indexOf(explicitPlacementReviewStart)
+  const endIndex = instruction.indexOf(explicitPlacementReviewEnd)
+  if (startIndex >= 0 && endIndex > startIndex) {
+    return instruction
+      .slice(startIndex + explicitPlacementReviewStart.length, endIndex)
+      .trim()
+  }
+  return instruction.split(assemblyContextMarker, 1)[0] ?? instruction
+}
+
+const reworkRequiresExecutableChange = (instruction: string) => (
+  /\b(remove|delete|reroute|re-?place|rebuild|revise|repair|move|rotate|translate|align|seat|connect|resize|reshape|replace)\b/i
+    .test(acceptanceDirectiveFor(instruction))
+)
+
+const importFrameContractMarker = 'MANDATORY IMPORT-FRAME CONTRACT'
+const assemblyContextMarker = 'Assembly context for this geometry rework follows.'
+const requiresTransformableRepeatContract = (instruction: string) => (
+  (
+    /\b(?:transformable|clone[- ]safe|reusable)\b/i.test(instruction) &&
+    /\b(?:clon(?:e|ed|able|ing)|mirror|mirrored|pattern|instances?|opposite conductor)\b/i.test(instruction)
+  ) || (
+    /\bsingle\s+canonical\s+(?:part|component|conductor)\b/i.test(instruction) &&
+    /\b(?:two|multiple)\b[\s\S]{0,80}\b(?:positions?|instances?|conductors?)\b/i.test(instruction)
+  )
+)
+
+const importFrameContractViolation = (instruction: string, source: string) => {
+  if (!instruction.includes(importFrameContractMarker)) return undefined
+  const finalExpression = source
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => line.length > 0 && !line.startsWith('//'))
+    .at(-1) ?? ''
+  const manifestName = source.match(/^\s*\/\/\s*exported_aggregate:\s*([A-Za-z_][A-Za-z0-9_]*)/m)?.[1]
+  if (manifestName === undefined) return undefined
+  const escapedManifestName = manifestName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const manifestNameIsBound = new RegExp(
+    `\\b${escapedManifestName}\\s*(?::\\s*[^\\n=]+)?\\s*=`,
+  ).test(source)
+  const exportedName = (
+    manifestNameIsBound || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(finalExpression)
+  ) ? manifestName : finalExpression
+  const escapedName = exportedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const exportedAggregateIsArray = (
+    new RegExp(`\\b${escapedName}\\s*(?::\\s*\\[[^\\n=]+\\])?\\s*=\\s*(?:flatten\\s*\\(\\s*)?\\[`).test(source) ||
+    /^\s*\/\/\s*(?:exported_aggregate_type|parent_interface):.*(?:\[any(?:;|\])|flattened\s+(?:array|aggregate)|multi-body\s+aggregate)/im.test(source)
+  )
+  const reviewDirective = instruction.split(assemblyContextMarker, 1)[0] ?? instruction
+  if (requiresTransformableRepeatContract(reviewDirective)) {
+    if (exportedAggregateIsArray) {
+      return `flattened export ${exportedName} cannot satisfy the mandatory transformable-repeat contract: return one default exported Solid that the parent can clone, mirror, rotate, and translate; do not return an array or an identity-fixed multi-body aggregate`
+    }
+    if (finalExpression !== exportedName) {
+      return `export ${exportedName} is not the file's final executable expression: after all hide and helper calls, end the KCL with a standalone ${exportedName} line so imports receive the cloneable Solid`
+    }
+    return undefined
+  }
+  if (!exportedAggregateIsArray) return undefined
+  const parentInterface = source.match(/^\s*\/\/\s*parent_interface:\s*(.*)$/m)?.[1] ?? ''
+  const zeroTransformVector = String.raw`\[\s*0(?:\.0+)?(?:mm|deg)?\s*,\s*0(?:\.0+)?(?:mm|deg)?\s*,\s*0(?:\.0+)?(?:mm|deg)?\s*\]`
+  const declaresZeroTranslation = (
+    /\b(?:zero|no)\s+translation\b/i.test(parentInterface) ||
+    new RegExp(`\btranslation\s*(?:=|:)?\s*${zeroTransformVector}`, 'i').test(parentInterface)
+  )
+  const declaresZeroRotation = (
+    /\b(?:zero|no)\s+rotation\b/i.test(parentInterface) ||
+    /\b(?:zero|no)\s+translation\s+and\s+rotation\b/i.test(parentInterface) ||
+    new RegExp(`\brotation\s*(?:=|:)?\s*${zeroTransformVector}`, 'i').test(parentInterface)
+  )
+  if (
+    /identity/i.test(parentInterface) &&
+    declaresZeroTranslation &&
+    declaresZeroRotation
+  ) return undefined
+  return `flattened export ${exportedName} violates the mandatory import-frame contract: its parent_interface must declare identity placement, zero translation, and zero rotation, and its KCL coordinates must already be in the owning parent frame`
+}
+
 const directAssemblyBlockStart = '// ZOOKEEPER_WALL_DIRECT_CHILDREN_START'
 const directAssemblyBlockEnd = '// ZOOKEEPER_WALL_DIRECT_CHILDREN_END'
+const authoredAssemblyPlacementMarker = '// ZOOKEEPER_WALL_PLACEMENT_AUTHORED'
 
 const stripDirectAssemblyBlock = (source: string) => {
   const start = source.indexOf(directAssemblyBlockStart)
@@ -895,10 +1528,151 @@ const createZooClient = () => {
   return zooClient
 }
 
+const postIsolatedSnapshotResult = async (
+  jobId: string,
+  result: { dataUrl?: string, error?: string },
+) => {
+  const response = await fetch('/api/render-job-complete', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jobId, ...result }),
+  })
+  if (!response.ok) throw await httpErrorFromResponse(response, 'isolated snapshot completion')
+}
+
+const runIsolatedSnapshotJob = async (zooClient: zoo.Client, jobId: string) => {
+  document.title = `Zoo Snapshot ${jobId.slice(0, 8)}`
+  document.body.replaceChildren()
+  document.body.style.width = `${snapshotViewerSize.width}px`
+  document.body.style.height = `${snapshotViewerSize.height}px`
+  document.body.style.margin = '0'
+  document.body.style.overflow = 'hidden'
+  try {
+    const response = await fetch(`/api/render-job?id=${encodeURIComponent(jobId)}`, {
+      cache: 'no-store',
+    })
+    if (!response.ok) throw await httpErrorFromResponse(response, 'isolated snapshot job')
+    const payload = await response.json() as {
+      files?: Record<string, string>,
+      mainFilePath?: string,
+      submitTimeoutMs?: number,
+    }
+    if (payload.files === undefined || typeof payload.mainFilePath !== 'string') {
+      throw new Error('isolated snapshot job returned an invalid project')
+    }
+
+    const view = new ZooWebView({
+      zooClient,
+      size: snapshotViewerSize,
+      allowConcurrentViews: true,
+      showStartLogo: false,
+    })
+    view.el.style.width = `${snapshotViewerSize.width}px`
+    view.el.style.height = `${snapshotViewerSize.height}px`
+    document.body.append(view.el)
+    let transportReady = false
+    view.addEventListener('ready', () => {
+      transportReady = true
+    }, { once: true })
+    view.start()
+
+    const video = view.el.querySelector<HTMLVideoElement>('video')
+    const readyDeadline = Date.now() + 30000
+    while (
+      (
+        !transportReady ||
+        view.rtc === undefined ||
+        video?.srcObject === null ||
+        (video?.readyState ?? 0) < HTMLMediaElement.HAVE_CURRENT_DATA
+      ) &&
+      Date.now() < readyDeadline
+    ) await wait(80)
+    if (
+      !transportReady ||
+      view.rtc === undefined ||
+      video?.srcObject === null ||
+      (video?.readyState ?? 0) < HTMLMediaElement.HAVE_CURRENT_DATA
+    ) {
+      throw new Error('isolated snapshot transport did not become ready within 30 seconds')
+    }
+
+    const project: RenderProject = {
+      files: new Map(Object.entries(payload.files)),
+      mainFilePath: payload.mainFilePath,
+    }
+    const submitTimeoutMs = typeof payload.submitTimeoutMs === 'number'
+      ? Math.max(snapshotSubmitTimeoutMs, Math.min(payload.submitTimeoutMs, 600000))
+      : snapshotSubmitTimeoutMs
+    await withTimeout(
+      view.rtc.executor().submit(
+        project.files as unknown as string,
+        { mainKclPathName: project.mainFilePath },
+      ),
+      submitTimeoutMs,
+      'isolated snapshot KCL submit',
+    )
+    sendInitialCameraCommands(view)
+
+    const canvas = document.createElement('canvas')
+    const validationCanvas = document.createElement('canvas')
+    validationCanvas.width = 192
+    validationCanvas.height = 108
+    let dataUrl = ''
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await wait(attempt === 0 ? snapshotFrameWaitMs : 1200)
+      if (video.videoWidth === 0 || video.videoHeight === 0) continue
+      const scale = Math.min(
+        1,
+        snapshotViewerSize.width / video.videoWidth,
+        snapshotViewerSize.height / video.videoHeight,
+      )
+      canvas.width = Math.max(1, Math.round(video.videoWidth * scale))
+      canvas.height = Math.max(1, Math.round(video.videoHeight * scale))
+      const context = canvas.getContext('2d', { willReadFrequently: true })
+      const validation = validationCanvas.getContext('2d', { willReadFrequently: true })
+      if (context === null || validation === null) throw new Error('isolated snapshot canvas is unavailable')
+      context.fillStyle = '#05070b'
+      context.fillRect(0, 0, canvas.width, canvas.height)
+      context.drawImage(video, 0, 0, canvas.width, canvas.height)
+      validation.drawImage(canvas, 0, 0, validationCanvas.width, validationCanvas.height)
+      const pixels = validation.getImageData(
+        0,
+        0,
+        validationCanvas.width,
+        validationCanvas.height,
+      ).data
+      let minimumLuminance = 255
+      let maximumLuminance = 0
+      for (let index = 0; index < pixels.length; index += 4) {
+        const luminance = (
+          pixels[index] * 0.2126 +
+          pixels[index + 1] * 0.7152 +
+          pixels[index + 2] * 0.0722
+        )
+        minimumLuminance = Math.min(minimumLuminance, luminance)
+        maximumLuminance = Math.max(maximumLuminance, luminance)
+      }
+      validation.clearRect(0, 0, validationCanvas.width, validationCanvas.height)
+      if (maximumLuminance - minimumLuminance < 8) continue
+      dataUrl = canvas.toDataURL('image/webp', 0.86)
+      break
+    }
+    if (dataUrl.length === 0) throw new Error('isolated snapshot renderer returned a blank frame')
+    await postIsolatedSnapshotResult(jobId, { dataUrl })
+    await view.deconstructor()
+  } catch (error: unknown) {
+    await postIsolatedSnapshotResult(jobId, { error: errorToMessage(error) }).catch(() => {})
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   installWorkerWebSocketSendQueuePatch()
 
   const zooClient = createZooClient()
+  if (isolatedSnapshotJobId.length > 0) {
+    void runIsolatedSnapshotJob(zooClient, isolatedSnapshotJobId)
+    return
+  }
   const wallChannel = typeof BroadcastChannel === 'undefined'
     ? undefined
     : new BroadcastChannel(wallBroadcastChannelName)
@@ -913,23 +1687,36 @@ document.addEventListener('DOMContentLoaded', () => {
   if (!isControllerWindow) {
     document.body.classList.add('wall-display-only')
   }
+  if (isHeadlessController) {
+    document.title = 'Zoo Wall Controller'
+    document.body.classList.add('wall-headless-controller')
+  }
   document.body.append(root)
 
   // One off-screen Zoo view turns KCL updates into images for every border tile.
   // Keeping this serial prevents a many-agent run from allocating many engines.
   const snapshotCaptureHost = document.createElement('div')
   snapshotCaptureHost.classList.add('snapshot-capture-host')
-  if (isControllerWindow && useAgentCadSnapshots) document.body.append(snapshotCaptureHost)
+  if (
+    isControllerWindow &&
+    useAgentCadSnapshots &&
+    !useIsolatedSnapshotRenderer
+  ) document.body.append(snapshotCaptureHost)
 
   const monitorElements = new Map<number, HTMLElement>()
   const agents = new Map<string, Agent>()
+  const agentChildren = new Map<string, Set<string>>()
   const timers = new Set<number>()
   const cameraTimers = new Set<number>()
   const reviewTimers = new Map<string, number>()
   const placementTimers = new Map<string, number>()
   const draftRenderChains = new Map<string, Promise<void>>()
   const agentWorkRevisions = new Map<string, number>()
-  const activeAgentWorkIds = new Set<string>()
+  const activeAgentWorkIds = new Map<string, number>()
+  const activeAgentWorkRequests = new Map<string, AgentWorkQueueRequest>()
+  const activeAgentWorkPhaseStartedAtMs = new Map<string, number>()
+  const untrackedAgentStatusStartedAtMs = new Map<string, number>()
+  const workStatusMissingPollsById = new Map<string, number>()
   const pendingAgentWorkRequests = new Map<string, AgentWorkQueueRequest>()
   const snapshotJobs = new Map<string, SnapshotJob>()
   const workWaiters = new Map<string, AgentWorkWaiter>()
@@ -937,9 +1724,14 @@ document.addEventListener('DOMContentLoaded', () => {
   const reviewQueue = new Map<string, QueuedReview>()
   const activeReviewRevisions = new Map<string, string>()
   const completedReviewRevisions = new Map<string, string>()
+  const upstreamReviewDirectives = new Map<string, {
+    revision: number
+    directives: Array<{ id: number; line: string }>
+  }>()
   const bomPlanningAgentIds = new Set<string>()
   const activeReviewRequests = new Set<string>()
   const supervisorReviewAtMs = new Map<string, number>()
+  let upstreamReviewDirectiveId = 0
   let workEventAbort: AbortController | undefined
   let runRequestAbort: AbortController | undefined
   let rootRenderTimer: number | undefined
@@ -947,8 +1739,15 @@ document.addEventListener('DOMContentLoaded', () => {
   let layoutTimer: number | undefined
   let aggregateTimeTimer: number | undefined
   let supervisorTimer: number | undefined
+  let reviewQueueDrainTimer: number | undefined
   let supervisorLastSummaryAtMs = 0
+  let rootSupervisorRecoveryCount = 0
+  let rootLastSupervisorRecoveryAtMs = 0
   let workEventSessionId = ''
+  let workEventReconnectTimer: number | undefined
+  let workEventReconnectAttempt = 0
+  let workEventLastMessageAtMs = 0
+  let workEventRecycleCount = 0
   let runId = 0
   let startInProgress = false
   let active = false
@@ -961,9 +1760,11 @@ document.addEventListener('DOMContentLoaded', () => {
   let activeSessionId = ''
   let rootActiveStartedAtMs: number | undefined
   let rootElapsedMs = 0
+  let aggregateElapsedFloorMs = 0
   let activeSource: 'openai' | 'fallback' = 'fallback'
   let rootReviewRounds = 0
   let rootInstruction = 'Coordinate the complete assembly and merge child KCL into the root view.'
+  let rootLogEntries: LogEntry[] = []
   let kclFiles = new Map<string, string>()
   let interfaceManifests = new Map<string, string>()
   let rootImports = new Set<string>()
@@ -971,18 +1772,22 @@ document.addEventListener('DOMContentLoaded', () => {
   let snapshotViewStarting: Promise<ZooWebView> | undefined
   let snapshotViewDisposing: Promise<void> | undefined
   let snapshotViewSubmissionCount = 0
+  let agentSnapshotRenderTail = Promise.resolve()
+  let centerSnapshotRenderTail = Promise.resolve()
   let snapshotDrainPromise: Promise<void> | undefined
   const snapshotPersistenceJobs = new Map<string, SnapshotPersistenceJob>()
   let snapshotPersistenceDrainPromise: Promise<void> | undefined
   const snapshotCanvas = document.createElement('canvas')
   const snapshotValidationCanvas = document.createElement('canvas')
-  snapshotValidationCanvas.width = 64
-  snapshotValidationCanvas.height = 36
+  snapshotValidationCanvas.width = 192
+  snapshotValidationCanvas.height = 108
   let capacityWarningRun = -1
+  let requestWallCheckpoint = () => {}
 
   const broadcastWall = (message: WallBroadcastMessage) => {
     if (!isControllerWindow) return
     wallChannel?.postMessage(message)
+    requestWallCheckpoint()
   }
 
   const centerTile = document.createElement('section')
@@ -1009,6 +1814,7 @@ document.addEventListener('DOMContentLoaded', () => {
   let centerCoalescedRenderCount = 0
   let centerViewSubmissionCount = 0
   let lastGoodCenterProject: RenderProject | undefined
+  let lastGoodCenterSnapshotDataUrl: string | undefined
 
   const centerStatus = document.createElement('div')
   centerStatus.classList.add('center-status')
@@ -1039,6 +1845,43 @@ document.addEventListener('DOMContentLoaded', () => {
       }),
     }).catch(() => {})
   }
+
+  window.__zooWallDebug = () => ({
+    runId,
+    phase: runPhase,
+    sessionId: activeSessionId,
+    activeAgentWork: Array.from(activeAgentWorkIds.entries()),
+    activeAgentWorkPhaseStartedAtMs: Object.fromEntries(activeAgentWorkPhaseStartedAtMs),
+    untrackedAgentStatusStartedAtMs: Object.fromEntries(untrackedAgentStatusStartedAtMs),
+    workStatusMissingPollsById: Object.fromEntries(workStatusMissingPollsById),
+    workEventLastMessageAtMs,
+    workEventLastMessageAgeMs: workEventLastMessageAtMs === 0
+      ? undefined
+      : Date.now() - workEventLastMessageAtMs,
+    workEventRecycleCount,
+    pendingAgentWork: Array.from(pendingAgentWorkRequests.keys()),
+    workWaiters: Array.from(workWaiters.entries()).map(([workId, waiter]) => ({
+      workId,
+      agentId: waiter.agent.id,
+      workRevision: waiter.workRevision,
+    })),
+    bomPlanningAgents: Array.from(bomPlanningAgentIds),
+    activeReviews: Array.from(activeReviewRequests),
+    queuedReviews: Array.from(reviewQueue.keys()),
+    reviewTimers: Array.from(reviewTimers.keys()),
+    placementTimers: Array.from(placementTimers.keys()),
+    draftRenderChains: Array.from(draftRenderChains.keys()),
+    snapshotJobs: Array.from(snapshotJobs.keys()),
+    snapshotPersistenceJobs: Array.from(snapshotPersistenceJobs.keys()),
+    unsettledAgents: Array.from(agents.values())
+      .filter(agent => agent.status !== 'complete')
+      .map(agent => ({
+        id: agent.id,
+        status: agent.status,
+        activeStartedAtMs: agent.activeStartedAtMs,
+        lastActivityAtMs: agent.lastActivityAtMs,
+      })),
+  })
 
   const closeActiveSession = (reason: string) => {
     const sessionId = activeSessionId
@@ -1092,6 +1935,14 @@ document.addEventListener('DOMContentLoaded', () => {
     root.dataset.rootStatus = status
     renderAllGraphs()
     reportRuntimeEvent('phase')
+    broadcastWall({
+      type: 'runtime',
+      phase,
+      rootStatus: status,
+      blockers: root.dataset.completionBlockers ?? '',
+      aggregateTime: aggregateTime?.textContent ?? undefined,
+      centerStatus: centerStatus?.textContent ?? undefined,
+    })
   }
 
   const aggregateTime = document.createElement('div')
@@ -1161,7 +2012,14 @@ document.addEventListener('DOMContentLoaded', () => {
   `
   const assemblyRenderer = document.createElement('div')
   assemblyRenderer.classList.add('assembly-renderer')
-  assemblyRenderer.append(centerView.el)
+  if (useStaticCenterCad) {
+    const placeholder = document.createElement('div')
+    placeholder.classList.add('agent-viewer-placeholder')
+    placeholder.textContent = 'Assembly snapshot pending'
+    assemblyRenderer.append(placeholder)
+  } else {
+    assemblyRenderer.append(centerView.el)
+  }
   assemblyPanel.appendChild(assemblyRenderer)
   orchestratorConsole.append(promptInput, controls, centerStatus, assemblyPanel, rootLog)
 
@@ -1174,7 +2032,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const writeLog = (
     target: HTMLElement,
     line: string,
-    direction: 'in' | 'out' | 'sys' = 'sys',
+    direction: LogDirection = 'sys',
     maxRows = 56,
   ) => {
     const row = document.createElement('div')
@@ -1185,7 +2043,9 @@ document.addEventListener('DOMContentLoaded', () => {
     target.scrollTop = target.scrollHeight
   }
 
-  const rootLogLine = (line: string, direction: 'in' | 'out' | 'sys' = 'sys') => {
+  const rootLogLine = (line: string, direction: LogDirection = 'sys') => {
+    rootLogEntries.push({ line, direction })
+    if (rootLogEntries.length > 160) rootLogEntries = rootLogEntries.slice(-160)
     writeLog(rootLog, line, direction, 160)
     broadcastWall({ type: 'root:log', line, direction })
   }
@@ -1204,15 +2064,18 @@ document.addEventListener('DOMContentLoaded', () => {
   const aggregateAgentTimeMs = () => {
     const now = Date.now()
     const rootActiveElapsed = rootActiveStartedAtMs === undefined ? 0 : now - rootActiveStartedAtMs
-    return Array.from(agents.values()).reduce((total, agent) => {
+    const calculated = Array.from(agents.values()).reduce((total, agent) => {
       const elapsed = agent.elapsedMs ?? 0
       const activeElapsed = agent.activeStartedAtMs === undefined ? 0 : now - agent.activeStartedAtMs
       return total + elapsed + activeElapsed
     }, rootElapsedMs + rootActiveElapsed)
+    aggregateElapsedFloorMs = Math.max(aggregateElapsedFloorMs, calculated)
+    return aggregateElapsedFloorMs
   }
 
   const updateAggregateTime = () => {
     aggregateTime.textContent = `Aggregate Agent Time: ${formatAggregateAgentTime(aggregateAgentTimeMs())}`
+    requestWallCheckpoint()
   }
 
   const startAggregateTimeTicker = () => {
@@ -1240,9 +2103,23 @@ document.addEventListener('DOMContentLoaded', () => {
     return agents.get(id)
   }
 
-  const graphChildren = (id: string) => Array.from(agents.values())
-    .filter(agent => agent.parentId === id)
+  const graphChildren = (id: string) => Array.from(agentChildren.get(id) ?? [])
+    .map(agentId => agents.get(agentId))
+    .filter((agent): agent is Agent => agent !== undefined)
     .sort((a, b) => a.id.localeCompare(b.id))
+
+  const indexAgentParent = (agentId: string, parentId: string) => {
+    const children = agentChildren.get(parentId) ?? new Set<string>()
+    children.add(agentId)
+    agentChildren.set(parentId, children)
+  }
+
+  const unindexAgentParent = (agentId: string, parentId: string) => {
+    const children = agentChildren.get(parentId)
+    if (children === undefined) return
+    children.delete(agentId)
+    if (children.size === 0) agentChildren.delete(parentId)
+  }
 
   const isReusableLibraryAgent = (agent: Agent) => (
     agent.kind === 'orchestrator' &&
@@ -1250,9 +2127,22 @@ document.addEventListener('DOMContentLoaded', () => {
   )
 
   const agentTileIndex = (agent: Agent) => {
+    if (agent.assignedTileIndex !== undefined) return agent.assignedTileIndex
     const agentIndex = Array.from(agents.keys()).indexOf(agent.id)
     if (agentIndex < 0) return undefined
     return perimeterOrder[agentIndex % perimeterOrder.length]
+  }
+
+  const agentGraphDepth = (agent: Agent) => {
+    let depth = 1
+    let parentId = agent.parentId
+    const visited = new Set<string>([agent.id])
+    while (parentId !== '' && parentId !== rootAgentId && !visited.has(parentId)) {
+      visited.add(parentId)
+      depth += 1
+      parentId = agents.get(parentId)?.parentId ?? rootAgentId
+    }
+    return depth
   }
 
   const shouldRenderAgentLocally = (agent: Agent) => {
@@ -1262,7 +2152,48 @@ document.addEventListener('DOMContentLoaded', () => {
     return agentTileIndex(agent) === wallTileIndex
   }
 
+  const graphRenderSignatures = new WeakMap<HTMLElement, string>()
+  const graphStatusClasses: AgentStatus[] = ['queued', 'starting', 'running', 'reviewing', 'complete', 'error']
+
+  const graphSignatureFor = (startId: string) => {
+    const visited = new Set<string>()
+    const signature: string[] = []
+    const visit = (id: string) => {
+      if (visited.has(id)) return
+      visited.add(id)
+      const agent = graphNode(id)
+      if (agent === undefined) return
+      signature.push([
+        agent.id,
+        agent.parentId,
+        agent.kind,
+        agent.scope ?? '',
+        agent.name,
+        agent.role,
+        ...(agent.imports ?? []),
+      ].join('\u001f'))
+      graphChildren(id).forEach(child => visit(child.id))
+    }
+    visit(startId)
+    return signature.join('\u001e')
+  }
+
+  const updateGraphStatuses = (container: HTMLElement) => {
+    container.querySelectorAll<SVGGElement>('.graph-node[data-agent-id]').forEach((element) => {
+      const agent = graphNode(element.dataset.agentId ?? '')
+      if (agent === undefined) return
+      graphStatusClasses.forEach(status => element.classList.remove(`graph-status-${status}`))
+      element.classList.add(`graph-status-${agent.status}`)
+    })
+  }
+
   const renderGraphFor = (container: HTMLElement, startId: string, compact: boolean) => {
+    const signature = graphSignatureFor(startId)
+    if (graphRenderSignatures.get(container) === signature) {
+      updateGraphStatuses(container)
+      return
+    }
+
     const edges: GraphEdge[] = []
     const points = new Map<string, { x: number, y: number, depth: number }>()
     const visited = new Set<string>()
@@ -1411,7 +2342,7 @@ document.addEventListener('DOMContentLoaded', () => {
         ? ''
         : `<text class="graph-bom" x="14" y="${Math.round(metrics.height * 0.8)}" style="font-size: ${detailSize}px">${escapeHtml(bomLabel)}</text>`
       return `
-        <g class="graph-node graph-${agent.kind} graph-status-${agent.status}" data-depth="${point.depth}" transform="translate(${point.x} ${point.y})">
+        <g class="graph-node graph-${agent.kind} graph-status-${agent.status}" data-agent-id="${escapeHtml(agent.id)}" data-depth="${point.depth}" transform="translate(${point.x} ${point.y})">
           <rect width="${metrics.width}" height="${metrics.height}" rx="6" style="--node-color: ${agent.color}" />
           <circle class="graph-state-dot" cx="${metrics.width - 16}" cy="16" r="${Math.max(3, Math.round((compact ? 5 : 6) * metrics.scale))}" />
           <text class="graph-name" x="14" y="${primaryY}" style="font-size: ${nameSize}px">${escapeHtml(primaryLabel)}</text>
@@ -1427,31 +2358,39 @@ document.addEventListener('DOMContentLoaded', () => {
         ${nodeSvg}
       </svg>
     `
+    graphRenderSignatures.set(container, signature)
   }
 
   const renderAllGraphsNow = () => {
-    if (!isWallTileMode || isControllerWindow) {
+    if (isHeadlessController) return
+    if (!isWallTileMode || isControllerWindow || wallTileIndex === centerIndex) {
       renderGraphFor(rootGraph, rootAgentId, false)
       graphPanel.querySelector('.graph-count')!.textContent = `${agents.size} agents`
     }
     for (const agent of agents.values()) {
       if (agent.kind !== 'orchestrator' || agent.graphElement === undefined) continue
+      if (isWallTileMode && !shouldRenderAgentLocally(agent)) continue
       renderGraphFor(agent.graphElement, agent.id, true)
     }
   }
 
   const renderAllGraphs = () => {
+    if (isHeadlessController) return
     if (graphRenderTimer !== undefined) return
+    const delay = agents.size >= 250 ? 3000 : agents.size >= 80 ? 1500 : 400
     graphRenderTimer = window.setTimeout(() => {
       graphRenderTimer = undefined
       renderAllGraphsNow()
-    }, 120)
+    }, delay)
   }
 
   const layoutAgentsNow = () => {
+    if (isHeadlessController) return
     const buckets = perimeterOrder.map((): Agent[] => [])
     Array.from(agents.values()).forEach((agent, index) => {
-      buckets[index % perimeterOrder.length]!.push(agent)
+      const monitorIndex = agentTileIndex(agent) ?? perimeterOrder[index % perimeterOrder.length]!
+      const bucketIndex = perimeterOrder.indexOf(monitorIndex)
+      buckets[bucketIndex < 0 ? index % perimeterOrder.length : bucketIndex]!.push(agent)
     })
 
     buckets.forEach((bucket, bucketIndex) => {
@@ -1498,6 +2437,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   const layoutAgents = () => {
+    if (isHeadlessController) return
     if (layoutTimer !== undefined) return
     layoutTimer = window.setTimeout(() => {
       layoutTimer = undefined
@@ -1650,7 +2590,75 @@ document.addEventListener('DOMContentLoaded', () => {
     }), snapshotCaptureTimeoutMs, 'snapshot data URL conversion')
   }
 
+  const withSnapshotRenderer = async <T>(
+    operation: () => Promise<T>,
+    lane: 'agent' | 'center' = 'agent',
+  ): Promise<T> => {
+    const previous = lane === 'center' ? centerSnapshotRenderTail : agentSnapshotRenderTail
+    let release = () => {}
+    const next = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    if (lane === 'center') centerSnapshotRenderTail = next
+    else agentSnapshotRenderTail = next
+    await previous.catch(() => {})
+    try {
+      return await operation()
+    } finally {
+      release()
+    }
+  }
+
+  const renderProjectSnapshot = (
+    project: RenderProject,
+    label: string,
+    snapshotId: string,
+  ) => {
+    const operation = async () => {
+    if (useIsolatedSnapshotRenderer) {
+      const response = await runFetchWithTimeout('/api/render-snapshot', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          files: objectFromMap(project.files),
+          mainFilePath: project.mainFilePath,
+          label,
+          snapshotId,
+        }),
+      }, isolatedSnapshotTimeoutMs, `${label} isolated snapshot`)
+      if (!response.ok) throw await httpErrorFromResponse(response, `${label} isolated snapshot`)
+      const payload = await response.json() as { url?: unknown, dataUrl?: unknown }
+      const snapshotUrl = typeof payload.url === 'string' ? payload.url : payload.dataUrl
+      if (typeof snapshotUrl !== 'string' || snapshotUrl.length === 0) {
+        throw new Error(`${label} isolated snapshot returned no image`)
+      }
+      return snapshotUrl
+    }
+    try {
+      const view = await waitForSnapshotView()
+      snapshotViewSubmissionCount += 1
+      await withTimeout(submitProject(view, project, (message) => {
+        throw new Error(message)
+      }), snapshotSubmitTimeoutMs, `${label} submit`)
+      return await captureSnapshotDataUrl(view)
+    } catch (error: unknown) {
+      await disposeSnapshotView()
+      throw error
+    } finally {
+      if (snapshotViewSubmissionCount >= maxSnapshotSubmissionsPerRenderer) {
+        await disposeSnapshotView()
+      }
+    }
+    }
+    if (useIsolatedSnapshotRenderer) return operation()
+    return withSnapshotRenderer(
+      operation,
+      label.startsWith('center ') ? 'center' : 'agent',
+    )
+  }
+
   const persistSnapshot = async (agentId: string, dataUrl: string) => {
+    if (dataUrl.startsWith('/snapshots/')) return dataUrl
     const response = await runFetchWithTimeout('/api/snapshot', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1769,6 +2777,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const setAgentSnapshotState = (agent: Agent, state: SnapshotState, message = '') => {
     agent.snapshotState = state
     agent.snapshotMessage = message
+    agent.snapshotStateChangedAtMs = Date.now()
     if (state === 'ready') {
       agent.snapshotRecoveryCount = 0
       agent.lastSnapshotRecoveryAtMs = undefined
@@ -1783,9 +2792,8 @@ document.addEventListener('DOMContentLoaded', () => {
     scheduleRunCompletionCheck()
   }
 
-  const drainAgentSnapshots = async () => {
-    while (snapshotJobs.size > 0) {
-      const next = Array.from(snapshotJobs.entries()).sort((left, right) => {
+  const takeNextSnapshotJob = () => {
+    const next = Array.from(snapshotJobs.entries()).sort((left, right) => {
         const leftAgent = agents.get(left[0])
         const rightAgent = agents.get(right[0])
         const priority = (agent: Agent | undefined, job: SnapshotJob) => {
@@ -1797,22 +2805,24 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         return priority(leftAgent, left[1]) - priority(rightAgent, right[1])
       })[0]
-      if (next === undefined) break
+    if (next !== undefined) snapshotJobs.delete(next[0])
+    return next
+  }
+
+  const processAgentSnapshot = async (next: [string, SnapshotJob]) => {
       const [agentId, job] = next
-      snapshotJobs.delete(agentId)
       const agent = agents.get(agentId)
-      if (agent === undefined || !agentStillActive(agent, job.currentRun)) continue
+      if (agent === undefined || !agentStillActive(agent, job.currentRun)) return
 
       try {
         setAgentSnapshotState(agent, 'rendering', job.label)
         appendAgentLog(agent, `< rendering CAD snapshot: ${job.label}`, 'in')
-        const view = await waitForSnapshotView()
-        snapshotViewSubmissionCount += 1
-        await withTimeout(submitProject(view, job.project, (message) => {
-          throw new Error(message)
-        }), snapshotSubmitTimeoutMs, 'snapshot renderer submit')
-        const snapshotDataUrl = await captureSnapshotDataUrl(view)
-        if (!agentStillActive(agent, job.currentRun)) continue
+        const snapshotDataUrl = await renderProjectSnapshot(
+          job.project,
+          `agent ${agent.id} snapshot`,
+          agent.id,
+        )
+        if (!agentStillActive(agent, job.currentRun)) return
         setAgentSnapshotState(agent, 'persisting', job.label)
         if (job.kind === 'final' && job.sourceKcl.trim().length > 0) agent.lastGoodKcl = job.sourceKcl
         queueSnapshotPersistence(agent, job.currentRun, snapshotDataUrl, job.sourceKcl)
@@ -1832,9 +2842,8 @@ document.addEventListener('DOMContentLoaded', () => {
           } else if (agentStillActive(agent, job.currentRun)) {
             setAgentSnapshotState(agent, 'error', 'rendered frame contained no visible geometry')
           }
-          continue
+          return
         }
-        await disposeSnapshotView()
         if (job.attempt < 1 && agentStillActive(agent, job.currentRun)) {
           snapshotJobs.set(agent.id, { ...job, attempt: job.attempt + 1 })
           setAgentSnapshotState(agent, 'queued', 'retry after renderer recovery')
@@ -1842,13 +2851,28 @@ document.addEventListener('DOMContentLoaded', () => {
         } else if (agentStillActive(agent, job.currentRun)) {
           setAgentSnapshotState(agent, 'error', message)
         }
-      } finally {
-        if (snapshotViewSubmissionCount >= maxSnapshotSubmissionsPerRenderer) {
-          await disposeSnapshotView()
-        }
       }
+  }
+
+  const drainAgentSnapshots = async () => {
+    const activeRenders = new Set<Promise<void>>()
+    while (snapshotJobs.size > 0 || activeRenders.size > 0) {
+      while (
+        snapshotJobs.size > 0 &&
+        activeRenders.size < maxConcurrentAgentSnapshots
+      ) {
+        const next = takeNextSnapshotJob()
+        if (next === undefined) break
+        const rendering = processAgentSnapshot(next).finally(() => {
+          activeRenders.delete(rendering)
+        })
+        activeRenders.add(rendering)
+      }
+      if (activeRenders.size > 0) await Promise.race(activeRenders)
     }
-    if (snapshotJobs.size === 0) await disposeSnapshotView()
+    if (snapshotJobs.size === 0) {
+      await withSnapshotRenderer(disposeSnapshotView)
+    }
   }
 
   const ensureSnapshotDrain = () => {
@@ -1993,7 +3017,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   const isTransientControlPlaneError = (message: string) => (
-    /\b(failed to fetch|networkerror|load failed|event stream|agent work start|review start|aborterror|connection reset|connection aborted|broken pipe|socket|timed out|timeout|http 50[0234])\b/i
+    /\b(failed to fetch|networkerror|load failed|event stream|final event|agent work start|review start|aborterror|connection reset|connection aborted|connection interrupted|broken pipe|socket|timed out|timeout|http 50[0234]|worker stream returned empty KCL|worker stream returned a BOM instead of KCL)\b/i
       .test(message)
   )
 
@@ -2168,21 +3192,56 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const drainCenterRenders = async () => {
     while (centerRenderPending !== undefined) {
-      if (centerRebuildPromise !== undefined) await centerRebuildPromise
-      if (centerView.rtc === undefined) return
-      if (centerViewSubmissionCount >= maxCenterSubmissionsPerRenderer) {
-        await rebuildCenterViewer('bounded renderer lifecycle')
-        return
+      if (!useStaticCenterCad) {
+        if (centerRebuildPromise !== undefined) await centerRebuildPromise
+        if (centerView.rtc === undefined) return
+        if (centerViewSubmissionCount >= maxCenterSubmissionsPerRenderer) {
+          await rebuildCenterViewer('bounded renderer lifecycle')
+          return
+        }
       }
 
       const request = centerRenderPending
       centerRenderPending = undefined
+      const projectCharacters = Array.from(request.project.files.values())
+        .reduce((total, source) => total + source.length, 0)
+      if (
+        useStaticCenterCad &&
+        runPhase === 'running' &&
+        lastGoodCenterSnapshotDataUrl !== undefined &&
+        projectCharacters > maxLiveCenterProjectCharacters
+      ) {
+        const status = 'Assembly view retained; oversized final render deferred'
+        if (centerStatus.textContent !== status) {
+          rootLogLine(
+            `< center renderer deferred ${projectCharacters} character live project; retaining last successful assembly frame`,
+            'in',
+          )
+          reportRuntimeEvent('center.render.deferred')
+        }
+        centerStatus.textContent = status
+        request.waiters.forEach(waiter => waiter.resolve())
+        continue
+      }
       const renderStartedAt = Date.now()
       try {
-        centerViewSubmissionCount += 1
-        await withTimeout(submitProject(centerView, request.project, () => {}, () => {
-          sendRootCameraCommand(centerView)
-        }), centerRendererSubmitTimeoutMs, `center render ${request.label}`)
+        if (useStaticCenterCad) {
+          centerStatus.textContent = `Rendering assembly snapshot: ${request.label}`
+          const snapshotDataUrl = await renderProjectSnapshot(
+            request.project,
+            `center ${request.label}`,
+            rootAgentId,
+          )
+          lastGoodCenterSnapshotDataUrl = snapshotDataUrl
+          await replaceCenterWithStaticSnapshot(snapshotDataUrl)
+          broadcastWall({ type: 'center:snapshot', snapshotUrl: snapshotDataUrl })
+          centerStatus.textContent = 'Center assembly snapshot updated'
+        } else {
+          centerViewSubmissionCount += 1
+          await withTimeout(submitProject(centerView, request.project, () => {}, () => {
+            sendRootCameraCommand(centerView)
+          }), centerRendererSubmitTimeoutMs, `center render ${request.label}`)
+        }
         lastGoodCenterProject = {
           files: new Map(request.project.files),
           mainFilePath: request.project.mainFilePath,
@@ -2195,12 +3254,26 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       } catch (error: unknown) {
         const renderError = error instanceof Error ? error : new Error(errorToMessage(error))
-        request.waiters.forEach(waiter => waiter.reject(renderError))
         const message = errorToMessage(error)
         rootLogLine(`< center render failed after ${Math.round((Date.now() - renderStartedAt) / 1000)}s: ${message}`)
         reportRuntimeEvent('center.render.error')
         centerStatus.textContent = `Center KCL failed: ${message}`
-        if (isViewerFailureMessage(message) || message.includes('timed out')) {
+        if (
+          useStaticCenterCad &&
+          request.attempt < 1 &&
+          !request.label.startsWith('final ')
+        ) {
+          centerRenderPending = centerRenderPending === undefined
+            ? { ...request, attempt: request.attempt + 1 }
+            : {
+              ...centerRenderPending,
+              waiters: [...request.waiters, ...centerRenderPending.waiters],
+            }
+          rootLogLine('< center snapshot renderer retrying after recovery', 'in')
+          continue
+        }
+        request.waiters.forEach(waiter => waiter.reject(renderError))
+        if (!useStaticCenterCad && (isViewerFailureMessage(message) || message.includes('timed out'))) {
           scheduleCenterViewerReload(message)
           return
         }
@@ -2214,7 +3287,7 @@ document.addEventListener('DOMContentLoaded', () => {
       centerRenderDrainPromise = undefined
       if (
         centerRenderPending !== undefined &&
-        centerView.rtc !== undefined &&
+        (useStaticCenterCad || centerView.rtc !== undefined) &&
         centerRebuildPromise === undefined
       ) ensureCenterRenderDrain()
       else scheduleRunCompletionCheck()
@@ -2224,7 +3297,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const queueCenterProject = (project: RenderProject, label: string) => new Promise<void>((resolve, reject) => {
     const waiter: CenterRenderWaiter = { resolve, reject }
     if (centerRenderPending === undefined) {
-      centerRenderPending = { project, label, waiters: [waiter] }
+      centerRenderPending = { project, label, waiters: [waiter], attempt: 0 }
     } else {
       // Every waiting caller is satisfied by the newest complete assembly.
       centerRenderPending.project = project
@@ -2816,9 +3889,9 @@ document.addEventListener('DOMContentLoaded', () => {
     .map(line => line.replace(/\/\/.*$/, '').trim())
     .some(Boolean)
 
-  const placementComponentReady = (agent: Agent) => (
-    agent.status !== 'error' && agentKclReady(agent)
-  )
+  // A failed update must not make the last-good child disappear from its
+  // parent's imports while the supervisor retries that child.
+  const placementComponentReady = (agent: Agent) => agentKclReady(agent)
 
   const workerBodyReady = (agent: Agent) => agent.status === 'error' || agentKclReady(agent)
 
@@ -2830,10 +3903,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const placementReady = (agent: Agent) => placementComponentsFor(agent).length > 0
 
-  const rankAgentTarget = (candidates: Agent[], request: ReworkRequest): RankedAgent | undefined => {
+  const rankAgentTarget = (
+    candidates: Agent[],
+    request: ReworkRequest,
+    includeTarget = true,
+  ): RankedAgent | undefined => {
     if (candidates.length === 0) return undefined
-    const targetText = request.target.toLowerCase()
-    const fullText = `${request.target} ${request.instruction} ${request.reason}`.toLowerCase()
+    const targetText = includeTarget ? request.target.toLowerCase() : ''
+    const fullText = `${includeTarget ? request.target : ''} ${request.instruction} ${request.reason}`.toLowerCase()
     const score = (candidate: Agent) => {
       const fields = [
         candidate.id,
@@ -2866,6 +3943,83 @@ document.addEventListener('DOMContentLoaded', () => {
   const rankOrchestratorReworkTarget = (parent: Agent, request: ReworkRequest) => (
     rankAgentTarget(reviewOrchestratorTargets(parent), request)
   )
+
+  const explicitReworkTarget = (request: ReworkRequest) => {
+    const target = request.target.trim().toLowerCase()
+    if (target.length === 0) return undefined
+    const rootAgent = graphNode(rootAgentId)
+    const candidates = [
+      ...(rootAgent === undefined ? [] : [rootAgent]),
+      ...Array.from(agents.values()),
+    ]
+    const strongMatch = candidates
+      .flatMap(candidate => [
+        candidate.id,
+        candidate.name,
+        candidate.filePath,
+        renderPathForFilePath(candidate.filePath),
+      ].map(value => ({ candidate, value: value.toLowerCase() })))
+      .filter(({ value }) => value.length > 0 && target.includes(value))
+      .sort((left, right) => right.value.length - left.value.length)[0]
+    if (strongMatch !== undefined) return strongMatch.candidate
+    return candidates.find((candidate) => {
+      const role = candidate.role.trim().toLowerCase()
+      return target === role || target.startsWith(`${role} /`) || target.startsWith(`${role} |`)
+    })
+  }
+
+  const directChildOrchestratorForDescendant = (
+    reviewParent: Agent,
+    target: Agent,
+  ) => {
+    let candidate = target
+    const visited = new Set<string>()
+    while (candidate.parentId !== '' && candidate.parentId !== reviewParent.id) {
+      if (visited.has(candidate.id)) return undefined
+      visited.add(candidate.id)
+      const next = graphNode(candidate.parentId)
+      if (next === undefined) return undefined
+      candidate = next
+    }
+    if (
+      candidate.parentId !== reviewParent.id ||
+      candidate.kind !== 'orchestrator'
+    ) return undefined
+    return candidate
+  }
+
+  const delegateDescendantGeometryRework = (
+    reviewParent: Agent,
+    target: Agent,
+    instruction: string,
+  ) => {
+    const delegate = directChildOrchestratorForDescendant(reviewParent, target)
+    if (delegate === undefined) return false
+    const line = [
+      `Upstream review from ${reviewParent.name} found a possible defect in descendant ${target.name}`,
+      `(${target.role}, ${target.filePath}): ${instruction}`,
+      'Evaluate this finding in your local assembly coordinate frame and dispatch the smallest local correction only if the defect is still present.',
+    ].join(' ')
+    const state = upstreamReviewDirectives.get(delegate.id) ?? {
+      revision: 0,
+      directives: [],
+    }
+    const alreadyPending = state.directives.some(item => item.line === line)
+    if (!alreadyPending) {
+      upstreamReviewDirectiveId += 1
+      state.revision += 1
+      state.directives.push({ id: upstreamReviewDirectiveId, line })
+      upstreamReviewDirectives.set(delegate.id, state)
+    }
+    reviewLogLine(
+      reviewParent,
+      `< delegate descendant rework through ${delegate.name}: ${target.name}`,
+      'in',
+    )
+    appendAgentLog(delegate, `< upstream review directive: ${line}`, 'in')
+    scheduleOrchestratorReview(delegate, target)
+    return true
+  }
 
   const findReworkTarget = (parent: Agent, request: ReworkRequest, fallbackChild: Agent) => {
     const ranked = rankWorkerReworkTarget(parent, request)
@@ -2904,6 +4058,69 @@ document.addEventListener('DOMContentLoaded', () => {
     return parent
   }
 
+  const geometryReworkInstructionFor = (
+    reviewParent: Agent,
+    target: Agent,
+    instruction: string,
+  ) => {
+    const requiresTransformableRepeat = requiresTransformableRepeatContract(instruction)
+    const importFrameContract = [
+      'MANDATORY IMPORT-FRAME CONTRACT: if this worker exports a heterogeneous or flattened [any; N] aggregate, the owning parent cannot clone, translate, or rotate that imported value. Author every constituent body directly in the owning parent assembly coordinate frame instead. Every named worker mate point must numerically equal its parent target at identity placement. A nonzero transform proposed in parent_interface, or local-coordinate geometry that still requires such a transform, is a failed result and must not be returned.',
+      'PRECEDENCE CLARIFICATION: this contract overrides any later request to preserve an existing nonzero translation/rotation interface or stale local coordinates for the named route and mate points. Preserve the semantic identity of those mates and every unrelated interface, but replace the named numeric coordinates with their parent-frame targets so the import is correct at identity.',
+      'Before finishing, inspect the exported aggregate type and parent_interface. For an [any; N] export, parent_interface must explicitly say identity placement with zero translation and zero rotation; the KCL coordinates themselves must implement that placement.',
+      ...(requiresTransformableRepeat
+        ? ['MANDATORY TRANSFORMABLE-REPEAT CONTRACT: this review requires cloning, mirroring, or patterning the imported component. Return one default exported Solid, not an array or flattened multi-body aggregate. Fuse overlapping material regions if necessary and preserve material/strip details in interface metadata; parent transformability takes precedence over separate appearance bodies for this canonical repeated part.']
+        : []),
+    ]
+    const targetSource = kclFiles.get(target.filePath) ?? ''
+    const explicitRouteRequirements = explicitRouteAcceptanceRequirements(instruction, targetSource)
+    const targetOwner = graphNode(target.parentId)
+    const contextOwners = [reviewParent, targetOwner]
+      .filter((candidate): candidate is Agent => candidate?.kind === 'orchestrator')
+      .filter((candidate, index, candidates) => (
+        candidates.findIndex(other => other.id === candidate.id) === index
+      ))
+    const fileContext = contextOwners.flatMap((owner) => {
+      const filePath = owner.id === rootAgentId ? rootFilePath : owner.filePath
+      const source = kclFiles.get(filePath)?.trim()
+      if (!source) return []
+      const clipped = source.slice(0, 60000)
+      return [
+        `Parent assembly KCL (${filePath}):\n${clipped}${source.length > clipped.length ? '\n// [parent KCL clipped]' : ''}`,
+      ]
+    })
+    const interfaceAgents = contextOwners.flatMap(owner => [owner, ...graphChildren(owner)])
+      .filter((candidate, index, candidates) => (
+        candidates.findIndex(other => other.id === candidate.id) === index
+      ))
+    const interfaceContext = interfaceAgents.flatMap((candidate) => {
+      const manifest = interfaceManifests.get(candidate.filePath)?.trim()
+      if (!manifest) return []
+      const clipped = manifest.slice(0, 12000)
+      return [
+        `${candidate.role} interface (${candidate.filePath}):\n${clipped}${manifest.length > clipped.length ? '\n// [interface clipped]' : ''}`,
+      ]
+    })
+    if (fileContext.length === 0 && interfaceContext.length === 0) {
+      return [...importFrameContract, '', instruction].join('\n\n')
+    }
+    return [
+      ...importFrameContract,
+      ...explicitRouteRequirements,
+      '',
+      instruction,
+      '',
+      `${assemblyContextMarker} Use the parent transforms and child mate points to derive exact geometry; do not guess coordinates from the prose request alone.`,
+      'Measurements and coordinates in the review reason are the latest observed facts for the named defect and override stale values in the current target interface. Recompute the named route or mate points from those measurements instead of preserving the stale named datums.',
+      "Modify only the geometry and interfaces explicitly named in the request. Preserve every unrelated body, dimension, opening, mate point, axis, and interface coordinate from this worker's current KCL.",
+      "The worker's current KCL is authoritative for unrelated geometry. Parent KCL and manifests are placement context only; do not copy stale or conflicting parent coordinates into unrelated worker interfaces.",
+      ...fileContext,
+      ...(interfaceContext.length === 0
+        ? []
+        : [`Relevant interface manifests:\n${interfaceContext.join('\n\n')}`]),
+    ].join('\n\n')
+  }
+
   const placementInstructionFor = (parent: Agent, changedChild: Agent, extra = '') => {
     const childImports = placementComponentsFor(parent)
       .map(child => `- ${aliasForFilePath(child.filePath)} from ${child.filePath}: ${child.role}`)
@@ -2915,6 +4132,9 @@ document.addEventListener('DOMContentLoaded', () => {
     return [
       `Update ${parent.name}'s assembly placement layer after ${changedChild.role} changed.`,
       'This is an incremental assembly update. Place every currently available import now; do not wait for pending children and do not invent stand-ins for them.',
+      'An explicit review instruction below overrides the generic place-every-import rule. If the review identifies a redundant or unsupported direct child, remove it from the final aggregate and leave its required import unused or hidden rather than placing it again.',
+      `${explicitPlacementReviewStart}\n${extra.trim()}\n${explicitPlacementReviewEnd}`,
+      'If the explicit review block is empty and the current transforms remain correct, validate and return the current placement KCL unchanged. The imported child update is already present dynamically; do not invent screw rotations, cosmetic transforms, or unrelated executable edits merely to make the file differ.',
       "Use imported child aliases, clone(), hide(), translate(), rotate(), scale(), and appearance() only.",
       "You own mirrored, symmetric, radial-pattern, and linear-pattern placement. Express those by cloning imported aliases and applying explicit translate/rotate/scale transforms in this assembly file.",
       "Do not push repeated placement down into worker part files. Workers model one canonical part; this orchestrator creates left/right instances, bolt circles, rib arrays, repeated rollers/pins/washers, and other patterns.",
@@ -2922,8 +4142,11 @@ document.addEventListener('DOMContentLoaded', () => {
       "Do not create or modify part geometry. Do not use sketches, profiles, lines, circles, extrude, subtract, or boolean modeling tools.",
       "Place only direct child/sub-assembly imports and explicit shared reusable imports listed below. Do not place non-direct worker descendants or grandchild part files in this parent assembly.",
       "If a direct child/sub-assembly import has no usable return value, leave this parent partial and record that child in placement_warnings instead of reaching through to import/place its children.",
+      "KCL flatten() returns [any], so never pass an alias whose exported aggregate was built with flatten() into translate(), rotate(), scale(), clone(), or appearance(). If KCL reports that an alias is [any; N], do not retry the invalid transform: keep that child at identity when its manifest is already in this parent's frame, or request a child-local frame correction and record a placement warning.",
+      "Transforms remain allowed for a single Solid, ImportedGeometry, or a statically typed [Solid; 1+] aggregate. Do not replace flatten() with another std::array helper merely to transform it; concat(), map(), reduce(), and flatten() all erase the solid type to [any].",
       "Return one renderable aggregate as the final expression so this assembly can itself be imported and placed by its parent.",
       "Before choosing transforms, inspect the child KCL and the interface manifests below for local origins, axes, bounding boxes, mate points, and dimensions.",
+      "Measured coordinates and transforms in an explicit review reason are newer than stale named values in the current assembly manifest. For the interfaces named by the review, recompute placement from the measured values and update the manifest to match.",
       "Place children by aligning named mate points and axes. If a child is missing an interface manifest, infer only from its KCL and leave a concise interface warning in the assembly manifest.",
       "For every shared/reusable component import you place, add a concise comment near the placement in the form `// BOM: <quantity>x <alias> (<role>)` so the graph can display the bill of materials.",
       "If a child is listed as failed, do not import or place it. Continue the partial assembly and record the omission in placement_warnings.",
@@ -2931,11 +4154,15 @@ document.addEventListener('DOMContentLoaded', () => {
       childImports ? `Child imports:\n${childImports}` : "",
       failedChildren ? `Failed children to omit from this placement update:\n${failedChildren}` : "",
       interfaces ? `Child interface manifests:\n${interfaces}` : "",
-      extra,
     ].filter(Boolean).join("\n")
   }
 
-  const scheduleOrchestratorPlacement = (parent: Agent, changedChild: Agent, extraInstruction = '') => {
+  const scheduleOrchestratorPlacement = (
+    parent: Agent,
+    changedChild: Agent,
+    extraInstruction = '',
+    zooRetryAttempt = 0,
+  ) => {
     if (!active || runPhase !== 'running' || parent.kind !== 'orchestrator') return
     if (!placementReady(parent)) {
       appendWorkAgentLog(parent, `< placement waiting for first renderable direct child`, 'in')
@@ -2948,7 +4175,14 @@ document.addEventListener('DOMContentLoaded', () => {
       placementTimers.delete(parent.id)
       if (!agentStillActive(parent, currentRun)) return
       appendWorkAgentLog(parent, `-> placement update after ${changedChild.role}`, 'out')
-      void requestAgentWork(parent, currentRun, '', 0, placementInstructionFor(parent, changedChild, extraInstruction))
+      void requestAgentWork(
+        parent,
+        currentRun,
+        '',
+        0,
+        placementInstructionFor(parent, changedChild, extraInstruction),
+        zooRetryAttempt,
+      )
     }, 1400)
     placementTimers.set(parent.id, timer)
   }
@@ -2975,6 +4209,19 @@ document.addEventListener('DOMContentLoaded', () => {
     if (parent.id === rootAgentId) rootReviewRounds += 1
     else parent.reviewRounds = reviewCount + 1
     reviewLogLine(parent, `-> visual review ${reviewCount + 1} after ${changedChild.role} update`, 'out')
+    const priorReviewSummaries = (
+      parent.id === rootAgentId ? rootLogEntries : (parent.logs ?? [])
+    )
+      .map(entry => entry.line)
+      .filter(line => line.startsWith('< visual review: ') && !line.includes('no child rework'))
+      .slice(-6)
+    const pendingUpstreamDirectives = [
+      ...(upstreamReviewDirectives.get(parent.id)?.directives ?? []),
+    ]
+    const reviewContext = [
+      ...priorReviewSummaries,
+      ...pendingUpstreamDirectives.map(item => `< visual review: ${item.line}`),
+    ].slice(-14)
 
     try {
       const review = await requestReviewStream(parent, currentRun, {
@@ -3018,8 +4265,16 @@ document.addEventListener('DOMContentLoaded', () => {
           })),
           files: reviewFilesFor(parent),
           interfaces: reviewInterfacesFor(parent),
+          reviewRound: reviewCount + 1,
+          priorReviewSummaries: reviewContext,
       })
       if (currentRun !== runId || !active) return false
+      const currentUpstreamState = upstreamReviewDirectives.get(parent.id)
+      if (currentUpstreamState !== undefined && pendingUpstreamDirectives.length > 0) {
+        const consumedIds = new Set(pendingUpstreamDirectives.map(item => item.id))
+        currentUpstreamState.directives = currentUpstreamState.directives
+          .filter(item => !consumedIds.has(item.id))
+      }
 
       review.dialog?.slice(-2).forEach(line => reviewLogLine(parent, `< review ws: ${line}`, 'in'))
       reviewLogLine(parent, `< visual review: ${review.summary}`, 'in')
@@ -3034,6 +4289,25 @@ document.addEventListener('DOMContentLoaded', () => {
 
       review.rework.forEach((item) => {
         const instruction = `${item.reason ? `${item.reason}: ` : ''}${item.instruction}`
+        const explicitTarget = explicitReworkTarget(item)
+        if (explicitTarget?.kind === 'worker') {
+          if (delegateDescendantGeometryRework(parent, explicitTarget, instruction)) return
+          reviewLogLine(parent, `< dispatch geometry rework to ${explicitTarget.name}: ${instruction}`, 'in')
+          appendAgentLog(explicitTarget, `-> orchestrator rework: ${instruction}`, 'out')
+          void requestAgentWork(
+            explicitTarget,
+            currentRun,
+            '',
+            0,
+            geometryReworkInstructionFor(parent, explicitTarget, instruction),
+          )
+          return
+        }
+        if (explicitTarget?.kind === 'orchestrator') {
+          reviewLogLine(parent, `< dispatch placement rework to ${explicitTarget.name}: ${instruction}`, 'in')
+          scheduleOrchestratorPlacement(explicitTarget, changedChild, instruction)
+          return
+        }
         const rankedTarget = rankWorkerReworkTarget(parent, item)
         const hasWorkerTarget = rankedTarget !== undefined && rankedTarget.score > 0
         if (isOrchestratorOwnedRework(item) && (!isGeometryRework(item) || isPlacementRework(item))) {
@@ -3052,8 +4326,15 @@ document.addEventListener('DOMContentLoaded', () => {
           reviewLogLine(parent, `< geometry rework skipped for non-worker target ${target.name}`)
           return
         }
+        if (delegateDescendantGeometryRework(parent, target, instruction)) return
         appendAgentLog(target, `-> orchestrator rework: ${instruction}`, 'out')
-        void requestAgentWork(target, currentRun, '', 0, instruction)
+        void requestAgentWork(
+          target,
+          currentRun,
+          '',
+          0,
+          geometryReworkInstructionFor(parent, target, instruction),
+        )
       })
       return true
     } catch (error: unknown) {
@@ -3082,24 +4363,82 @@ document.addEventListener('DOMContentLoaded', () => {
       append(interfaces[filePath] ?? '')
     })
     reviewWorkerTargets(parent).forEach((agent) => append(`${agent.id}:${agent.status}:${agent.filePath}`))
+    const upstreamState = upstreamReviewDirectives.get(parent.id)
+    if (upstreamState !== undefined) append(`upstream:${upstreamState.revision}`)
     return `${Object.keys(files).length}:${(hash >>> 0).toString(16)}`
   }
 
+  const agentUpdatePendingForReview = (agent: Agent) => (
+    activeAgentWorkIds.has(agent.id) ||
+    activeAgentWorkRequests.has(agent.id) ||
+    pendingAgentWorkRequests.has(agent.id) ||
+    Array.from(workWaiters.values()).some(waiter => waiter.agent.id === agent.id) ||
+    placementTimers.has(agent.id) ||
+    draftRenderChains.has(agent.id) ||
+    (agent.pendingWorkInstruction?.trim().length ?? 0) > 0
+  )
+
+  const parentUpdatePendingForReview = (parent: Agent) => {
+    if (agentUpdatePendingForReview(parent)) return true
+    const descendants = [
+      ...reviewOrchestratorTargets(parent).filter(agent => agent.id !== parent.id),
+      ...reviewWorkerTargets(parent),
+    ]
+    return descendants.some(agent => (
+      agentUpdatePendingForReview(agent) ||
+      bomPlanningAgentIds.has(agent.id) ||
+      activeReviewRequests.has(agent.id) ||
+      reviewQueue.has(agent.id) ||
+      reviewTimers.has(agent.id)
+    ))
+  }
+
+  const scheduleReviewQueueDrain = () => {
+    if (reviewQueueDrainTimer !== undefined) return
+    reviewQueueDrainTimer = window.setTimeout(() => {
+      reviewQueueDrainTimer = undefined
+      drainReviewQueue()
+    }, 1000)
+  }
+
   function drainReviewQueue() {
-    while (activeReviewRequests.size < maxConcurrentReviews && reviewQueue.size > 0) {
+    const queuedAtStart = reviewQueue.size
+    let inspected = 0
+    let deferred = false
+    while (
+      activeReviewRequests.size < maxConcurrentReviews &&
+      reviewQueue.size > 0 &&
+      inspected < queuedAtStart
+    ) {
       const next = reviewQueue.entries().next().value as [string, QueuedReview] | undefined
       if (next === undefined) return
       const [parentId, request] = next
       reviewQueue.delete(parentId)
+      inspected += 1
       if (!agentStillActive(request.parent, request.currentRun) || runPhase !== 'running') continue
+      if (activeReviewRequests.has(parentId)) {
+        reviewQueue.set(parentId, request)
+        deferred = true
+        continue
+      }
       if (completedReviewRevisions.get(parentId) === request.revision) continue
+      if (parentUpdatePendingForReview(request.parent)) {
+        reviewQueue.set(parentId, request)
+        deferred = true
+        continue
+      }
 
       activeReviewRequests.add(parentId)
       activeReviewRevisions.set(parentId, request.revision)
       void requestOrchestratorReview(request.parent, request.changedChild, request.currentRun)
         .then((completed) => {
           if (completed && request.currentRun === runId) {
-            completedReviewRevisions.set(parentId, request.revision)
+            // Snapshot persistence and deterministic import reconciliation can
+            // update the review input while a review is in flight without
+            // changing its geometry. Mark the settled revision so an already
+            // queued copy of that same review is discarded. Any dispatched
+            // rework will change the revision again when its KCL returns.
+            completedReviewRevisions.set(parentId, reviewRevisionFor(request.parent))
           }
         })
         .finally(() => {
@@ -3109,6 +4448,7 @@ document.addEventListener('DOMContentLoaded', () => {
           drainReviewQueue()
         })
     }
+    if (deferred) scheduleReviewQueueDrain()
   }
 
   const enqueueOrchestratorReview = (parent: Agent, changedChild: Agent, currentRun: number) => {
@@ -3121,6 +4461,24 @@ document.addEventListener('DOMContentLoaded', () => {
     ) return
     reviewQueue.set(parent.id, { parent, changedChild, currentRun, revision })
     drainReviewQueue()
+  }
+
+  window.__zooWallForceReview = (agentId: string) => {
+    if (!isControllerWindow || !active || runPhase !== 'running') {
+      return { ok: false, error: 'wall controller is not running' }
+    }
+    const parent = graphNode(agentId)
+    if (parent === undefined || parent.kind !== 'orchestrator') {
+      return { ok: false, error: `orchestrator not found: ${agentId}` }
+    }
+    const changedChild = placementComponentsFor(parent)[0]
+    if (changedChild === undefined) {
+      return { ok: false, error: `no renderable direct child: ${agentId}` }
+    }
+    completedReviewRevisions.delete(parent.id)
+    reviewQueue.delete(parent.id)
+    enqueueOrchestratorReview(parent, changedChild, runId)
+    return { ok: true, agentId: parent.id, changedChildId: changedChild.id }
   }
 
   const scheduleOrchestratorReview = (parent: Agent, changedChild: Agent) => {
@@ -3256,6 +4614,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const createAgentPanel = (agent: Agent) => {
     const panel = document.createElement('section')
     panel.classList.add('agent-card', `agent-${agent.kind}`)
+    panel.dataset.agentId = agent.id
     panel.style.setProperty('--agent-color', agent.color)
     panel.dataset.status = agent.status
 
@@ -3293,6 +4652,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const log = document.createElement('div')
     log.classList.add('agent-log', 'websocket-log')
     agent.logElement = log
+    ;(agent.logs ?? []).forEach(entry => writeLog(log, entry.line, entry.direction))
 
     if (agent.kind === 'worker') {
       const body = document.createElement('div')
@@ -3362,8 +4722,11 @@ document.addEventListener('DOMContentLoaded', () => {
     scheduleRunCompletionCheck()
   }
 
-  const appendAgentLog = (agent: Agent, line: string, direction: 'in' | 'out' | 'sys' = 'sys') => {
+  const appendAgentLog = (agent: Agent, line: string, direction: LogDirection = 'sys') => {
     agent.lastActivityAtMs = Date.now()
+    agent.logs ??= []
+    agent.logs.push({ line, direction })
+    if (agent.logs.length > 56) agent.logs = agent.logs.slice(-56)
     if (agent.logElement !== undefined) writeLog(agent.logElement, line, direction)
     broadcastWall({ type: 'agent:log', agentId: agent.id, line, direction })
   }
@@ -3378,24 +4741,38 @@ document.addEventListener('DOMContentLoaded', () => {
     void agent
   }
 
-  const remainingWallAgentSlots = () => Math.max(0, maxWallAgents - agents.size)
+  const remainingWallAgentSlots = () => (
+    wallAgentLimit === undefined
+      ? undefined
+      : Math.max(0, wallAgentLimit - agents.size)
+  )
+  const hasWallAgentCapacity = (requiredSlots = 1) => {
+    const remaining = remainingWallAgentSlots()
+    return remaining === undefined || remaining >= requiredSlots
+  }
 
   const logWallAgentCap = () => {
+    if (wallAgentLimit === undefined) return
     if (capacityWarningRun === runId) return
     capacityWarningRun = runId
-    rootLogLine(`< wall hard cap reached: ${maxWallAgents} total agents; further BOM children will not be created`, 'in')
+    rootLogLine(`< wall hard cap reached: ${wallAgentLimit} total agents; further BOM children will not be created`, 'in')
   }
 
   const addAgent = (agent: Agent): boolean => {
     if (agents.has(agent.id)) return true
-    if (agents.size >= maxWallAgents) {
+    if (wallAgentLimit !== undefined && agents.size >= wallAgentLimit) {
       logWallAgentCap()
       return false
     }
+    agent.assignedTileIndex ??= perimeterOrder[agents.size % perimeterOrder.length]
+    agent.logs ??= []
     agents.set(agent.id, agent)
+    indexAgentParent(agent.id, agent.parentId)
     if (
+      !isHeadlessController && (
       !isWallTileMode ||
       (!isControllerWindow && agentTileIndex(agent) === wallTileIndex)
+      )
     ) {
       createAgentPanel(agent)
     }
@@ -3417,6 +4794,7 @@ document.addEventListener('DOMContentLoaded', () => {
         color: agent.color,
         status: agent.status,
       },
+      tileIndex: agent.assignedTileIndex,
     })
     rootLogLine(`< zookeeper.spawn ${agent.name}`, 'in')
     appendAgentLog(agent, `assigned parent: ${graphNode(agent.parentId)?.name ?? 'unknown'}`)
@@ -3430,7 +4808,11 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   const updateAgent = (agent: Agent, update: Partial<Pick<Agent, 'parentId' | 'imports' | 'instruction' | 'role'>>) => {
-    if (update.parentId !== undefined) agent.parentId = update.parentId
+    if (update.parentId !== undefined && update.parentId !== agent.parentId) {
+      unindexAgentParent(agent.id, agent.parentId)
+      agent.parentId = update.parentId
+      indexAgentParent(agent.id, agent.parentId)
+    }
     if (update.imports !== undefined) agent.imports = [...new Set(update.imports)]
     if (update.instruction !== undefined) agent.instruction = update.instruction
     if (update.role !== undefined) {
@@ -3454,7 +4836,117 @@ document.addEventListener('DOMContentLoaded', () => {
     kclFiles.set(filePath, kcl)
     completionCandidateAtMs = undefined
     if (!useAgentCadSnapshots) broadcastWall({ type: 'project:file', filePath, kcl })
+    requestWallCheckpoint()
     scheduleRunCompletionCheck()
+  }
+
+  let wallCheckpointTimer: number | undefined
+  let wallCheckpointInFlight: Promise<void> | undefined
+  let wallCheckpointDirty = false
+
+  const durableAgent = (agent: Agent): DurableWallAgent => ({
+    id: agent.id,
+    parentId: agent.parentId,
+    kind: agent.kind,
+    scope: agent.scope,
+    name: agent.name,
+    role: agent.role,
+    instruction: agent.instruction,
+    filePath: agent.filePath,
+    imports: agent.imports ?? [],
+    source: agent.source,
+    color: agent.color,
+    status: agent.status,
+    assignedTileIndex: agentTileIndex(agent) ?? perimeterOrder[0]!,
+    snapshotUrl: agent.snapshotUrl,
+    snapshotState: agent.snapshotState,
+    snapshotMessage: agent.snapshotMessage,
+    snapshotStateChangedAtMs: agent.snapshotStateChangedAtMs,
+    lastGoodKcl: agent.lastGoodKcl === kclFiles.get(agent.filePath)
+      ? undefined
+      : agent.lastGoodKcl,
+    lastGoodSnapshotUrl: agent.lastGoodSnapshotUrl,
+    elapsedMs: agent.elapsedMs,
+    activeStartedAtMs: agent.activeStartedAtMs,
+    lastActivityAtMs: agent.lastActivityAtMs,
+    reviewRounds: agent.reviewRounds,
+    supervisorRecoveryCount: agent.supervisorRecoveryCount,
+    pendingWorkInstruction: compactPendingWorkInstruction(agent.pendingWorkInstruction) || undefined,
+    logs: (agent.logs ?? []).slice(-24),
+  })
+
+  const serializeWallState = (): Omit<DurableWallState, 'revision'> => ({
+    version: 1,
+    controllerHeartbeatAt: Date.now() / 1000,
+    run: {
+      phase: runPhase,
+      rootStatus,
+      prompt: promptInput.value,
+      sessionId: activeSessionId,
+      source: activeSource,
+      rootInstruction,
+      plannedAgentCount,
+      rootElapsedMs,
+      rootActiveStartedAtMs,
+      aggregateTime: aggregateTime.textContent ?? 'Aggregate Agent Time: 0s',
+      aggregateElapsedMs: aggregateAgentTimeMs(),
+      centerStatus: centerStatus.textContent ?? '',
+      centerSnapshotUrl: lastGoodCenterSnapshotDataUrl ?? '',
+      completionBlockers: root.dataset.completionBlockers ?? '',
+    },
+    agents: Array.from(agents.values()).map(durableAgent),
+    files: objectFromMap(kclFiles),
+    interfaces: objectFromMap(interfaceManifests),
+    rootImports: Array.from(rootImports),
+    rootLogs: rootLogEntries.slice(-120),
+  })
+
+  const flushWallCheckpoint = async () => {
+    if (!isControllerWindow) return
+    if (wallCheckpointInFlight !== undefined) {
+      wallCheckpointDirty = true
+      return
+    }
+    wallCheckpointDirty = false
+    const checkpoint = (async () => {
+      const json = JSON.stringify({ state: serializeWallState() })
+      let body: BodyInit = json
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+      }
+      if (typeof CompressionStream !== 'undefined') {
+        body = await new Response(
+          new Blob([json]).stream().pipeThrough(new CompressionStream('gzip')),
+        ).arrayBuffer()
+        headers['content-encoding'] = 'gzip'
+      }
+      const response = await runFetchWithTimeout('/api/wall-state', {
+        method: 'POST',
+        headers,
+        body,
+      }, wallCheckpointTimeoutMs, 'wall state checkpoint')
+      if (!response.ok) throw await httpErrorFromResponse(response, 'wall state checkpoint')
+    })()
+    wallCheckpointInFlight = checkpoint
+    try {
+      await checkpoint
+    } catch (error: unknown) {
+      console.error('wall state checkpoint failed', error)
+      wallCheckpointDirty = true
+    } finally {
+      if (wallCheckpointInFlight === checkpoint) wallCheckpointInFlight = undefined
+      if (wallCheckpointDirty) requestWallCheckpoint()
+    }
+  }
+
+  requestWallCheckpoint = () => {
+    if (!isControllerWindow) return
+    wallCheckpointDirty = true
+    if (wallCheckpointTimer !== undefined) return
+    wallCheckpointTimer = window.setTimeout(() => {
+      wallCheckpointTimer = undefined
+      void flushWallCheckpoint()
+    }, wallCheckpointIntervalMs)
   }
 
   const syncReusableLibraryMetadata = (library: Agent) => {
@@ -3498,25 +4990,32 @@ document.addEventListener('DOMContentLoaded', () => {
       .split('\n')
       .filter(line => !line.trim().startsWith('//'))
       .join('\n')
-    return new RegExp(
-      `\\bclone\\s*\\(\\s*${alias}\\s*\\)|\\b${alias}\\b\\s*\\|>|=\\s*${alias}\\b`,
-    ).test(code)
+    // Imports are stripped before this check, so any remaining alias reference
+    // is an actual use in the assembly body.
+    return new RegExp(`\\b${alias}\\b`).test(code)
   }
 
   const directChildComposition = (filePaths: string[], body: string) => {
     const missingFiles = [...new Set(filePaths)]
       .filter(filePath => !hasVisibleChildPlacement(body, filePath))
     if (missingFiles.length === 0) return ''
-    const clonedChildren = missingFiles
-      .map(filePath => `  clone(${aliasForFilePath(filePath)}),`)
-      .join('\n')
+    const finalAggregate = body
+      .split('\n')
+      .map(line => line.trim())
+      .reverse()
+      .find(line => /^[A-Za-z_][A-Za-z0-9_]*$/.test(line))
+    const aggregateEntries = [
+      ...(finalAggregate === undefined ? [] : [`  ${finalAggregate},`]),
+      ...missingFiles
+      .map(filePath => `  ${aliasForFilePath(filePath)},`)
+    ].join('\n')
     return [
       directAssemblyBlockStart,
-      '// Temporary identity composition for ready direct children.',
+      '// Temporary completion for ready direct children not yet placed by the parent.',
       '// The parent Zookeeper placement pass replaces each entry with its own transform.',
-      'wallDirectChildren = [',
-      clonedChildren,
-      ']',
+      'wallDirectChildren = flatten([',
+      aggregateEntries,
+      '])',
       'wallDirectChildren',
       directAssemblyBlockEnd,
     ].join('\n')
@@ -3529,7 +5028,9 @@ document.addEventListener('DOMContentLoaded', () => {
   ) => {
     const body = stripDirectAssemblyBlock(stripImportLines(currentFile)).trim()
     const importFiles = [...new Set([...directChildFiles, ...additionalImports])]
-    const composition = directChildComposition(directChildFiles, body)
+    const composition = body.includes(authoredAssemblyPlacementMarker)
+      ? ''
+      : directChildComposition(directChildFiles, body)
     return [
       mainFileFor(importFiles).trimEnd(),
       body,
@@ -3575,7 +5076,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const ensureReusableLibraryAgent = (): Agent | undefined => {
     const existing = findReusableLibraryAgent()
     if (existing !== undefined) return existing
-    if (remainingWallAgentSlots() < 1) {
+    if (remainingWallAgentSlots() === 0) {
       logWallAgentCap()
       return undefined
     }
@@ -3605,25 +5106,55 @@ document.addEventListener('DOMContentLoaded', () => {
     return agent
   }
 
-  const findSharedAgentFor = (component: string) => {
-    const normalized = component.toLowerCase()
-    return Array.from(agents.values()).find(agent => (
-      agent.scope === 'shared_part' &&
-      (
-        agent.role.toLowerCase() === normalized ||
-        agent.filePath.toLowerCase().includes(slugLabel(component)) ||
-        normalized.includes(agent.role.toLowerCase()) ||
-        agent.role.toLowerCase().includes(normalized)
-      )
-    ))
+  const sharedReferenceTokens = (value: string) => {
+    const stopWords = new Set([
+      'a', 'an', 'and', 'canonical', 'component', 'for', 'nominal',
+      'part', 'reusable', 'shared', 'the',
+    ])
+    const normalized = value.toLowerCase()
+      .replace(/([a-z])[-_\s]+(?=\d)/g, '$1')
+    return new Set(
+      (normalized.match(/[a-z]+\d+(?:\.\d+)?|[a-z]+|\d+(?:\.\d+)?/g) ?? [])
+        .filter(token => !stopWords.has(token) && !/^\d{4}$/.test(token)),
+    )
   }
+
+  const sharedReferenceScore = (component: string, agent: Agent) => {
+    const normalized = component.trim().toLowerCase()
+    const role = agent.role.trim().toLowerCase()
+    const fileName = agent.filePath.split('/').at(-1)?.toLowerCase() ?? ''
+    if (normalized === role) return 1000
+    if (normalized.includes(agent.id.toLowerCase())) return 950
+    if (fileName.length > 0 && normalized.includes(fileName)) return 900
+    if (normalized.includes(role) || role.includes(normalized)) return 850
+
+    const requestedTokens = sharedReferenceTokens(component)
+    const candidateTokens = sharedReferenceTokens(agent.role)
+    if (requestedTokens.size === 0 || candidateTokens.size === 0) return 0
+    const requestedSizes = new Set([...requestedTokens].filter(token => /\d/.test(token)))
+    const candidateSizes = new Set([...candidateTokens].filter(token => /\d/.test(token)))
+    if (
+      requestedSizes.size > 0 &&
+      candidateSizes.size > 0 &&
+      ![...requestedSizes].some(token => candidateSizes.has(token))
+    ) return 0
+    const intersection = [...requestedTokens].filter(token => candidateTokens.has(token)).length
+    const similarity = intersection / Math.max(requestedTokens.size, candidateTokens.size)
+    return intersection >= 2 && similarity >= 0.7 ? similarity * 100 : 0
+  }
+
+  const findSharedAgentFor = (component: string) => Array.from(agents.values())
+    .filter(agent => agent.scope === 'shared_part')
+    .map(agent => ({ agent, score: sharedReferenceScore(component, agent) }))
+    .filter(match => match.score > 0)
+    .sort((left, right) => right.score - left.score)[0]?.agent
 
   const createSharedComponentAgent = (request: BomSharedComponentRequest, currentRun: number): Agent | undefined => {
     const existing = findSharedAgentFor(request.role)
     if (existing !== undefined) return existing
     const library = findReusableLibraryAgent()
     const requiredSlots = library === undefined ? 2 : 1
-    if (remainingWallAgentSlots() < requiredSlots) {
+    if (!hasWallAgentCapacity(requiredSlots)) {
       logWallAgentCap()
       return undefined
     }
@@ -3681,6 +5212,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const addImportToConsumer = (consumer: Agent, shared: Agent, reason = '') => {
     if (consumer.kind !== 'orchestrator') return
+    if (shared.scope !== 'shared_part') {
+      appendAgentLog(
+        consumer,
+        `< interface dependency noted without import: ${shared.role}${reason ? ` (${reason})` : ''}`,
+        'in',
+      )
+      return
+    }
     if (consumer.id === rootAgentId) {
       if (rootImports.has(shared.filePath)) return
       rootImports.add(shared.filePath)
@@ -3706,6 +5245,42 @@ document.addEventListener('DOMContentLoaded', () => {
   const applyBomReview = (parent: Agent, bom: BomReviewResponse | undefined, currentRun: number) => {
     if (bom === undefined) return 0
     let applied = 0
+
+    ;(bom.uniqueComponents ?? []).forEach((request) => {
+      const role = request.role.trim()
+      if (role.length === 0) return
+      const consumer = findConsumerAgent(request.parent, parent)
+      const existing = graphChildren(consumer.id).find(child => (
+        child.role.trim().toLowerCase() === role.toLowerCase() ||
+        slugLabel(child.role) === slugLabel(role)
+      ))
+      if (existing !== undefined) {
+        reviewLogLine(parent, `< BOM review: retained existing unique ${existing.role}`, 'in')
+        return
+      }
+      const kind: AgentKind = request.kind === 'orchestrator' ? 'orchestrator' : 'worker'
+      const child = createSubassemblyBomChild(consumer, {
+        key: slugLabel(role),
+        kind,
+        scope: kind === 'orchestrator' ? 'assembly' : 'part',
+        role,
+        instruction: [
+          request.instruction || `Generate one unique ${role} for ${consumer.role}.`,
+          `This is a unique direct child of ${consumer.role}, not shared catalog hardware.`,
+          request.reason ? `Reason: ${request.reason}` : '',
+        ].filter(Boolean).join(' '),
+        imports: [],
+      }, currentRun)
+      if (child === undefined) {
+        reviewLogLine(parent, `< BOM review deferred unique ${role}: wall agent cap reached`, 'in')
+        return
+      }
+      syncAssemblyFileImports(consumer)
+      setWorkAgentStatus(consumer, 'reviewing')
+      startSubassemblyBomChild(child, currentRun)
+      reviewLogLine(parent, `< BOM review: added unique ${role} under ${consumer.role}`, 'in')
+      applied += 1
+    })
 
     ;(bom.sharedComponents ?? []).forEach((request) => {
       const role = request.role.trim()
@@ -3780,7 +5355,7 @@ document.addEventListener('DOMContentLoaded', () => {
       }, currentRun)
     }
 
-    if (remainingWallAgentSlots() < 1) {
+    if (!hasWallAgentCapacity()) {
       logWallAgentCap()
       return undefined
     }
@@ -3832,7 +5407,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const requestSubassemblyBom = async (agent: Agent, currentRun: number, retryAttempt = 0) => {
     if (!agentStillActive(agent, currentRun) || agent.kind !== 'orchestrator' || isReusableLibraryAgent(agent)) return
     if (bomPlanningAgentIds.has(agent.id)) return
-    if (remainingWallAgentSlots() <= 0) {
+    if (remainingWallAgentSlots() === 0) {
       logWallAgentCap()
       appendWorkAgentLog(agent, '< direct BOM capacity exhausted; generating this scope as one terminal sub-assembly', 'in')
       void requestAgentWork(
@@ -3851,7 +5426,15 @@ document.addEventListener('DOMContentLoaded', () => {
 
     bomPlanningAgentIds.add(agent.id)
     setWorkAgentStatus(agent, 'running')
-    appendWorkAgentLog(agent, '-> hosted Zookeeper: plan direct BOM', 'out')
+    const bomDepth = agentGraphDepth(agent)
+    const terminalChildrenOnly = bomDepth >= maxNestedOrchestratorDepth
+    appendWorkAgentLog(
+      agent,
+      terminalChildrenOnly
+        ? `-> hosted Zookeeper: plan terminal physical-part BOM at hierarchy depth ${bomDepth}`
+        : `-> hosted Zookeeper: plan direct BOM at hierarchy depth ${bomDepth}`,
+      'out',
+    )
     try {
       const context = requestContextFor(agent.filePath)
       const update = await requestAgentWorkStream(agent, currentRun, {
@@ -3871,7 +5454,10 @@ document.addEventListener('DOMContentLoaded', () => {
         },
         files: context.files,
         remainingAgentSlots: remainingWallAgentSlots(),
-        wallMaxAgents: maxWallAgents,
+        wallMaxAgents: wallAgentLimit,
+        bomDepth,
+        maxBomDepth: maxNestedOrchestratorDepth,
+        terminalChildrenOnly,
         knownAgents: Array.from(agents.values()).map(candidate => ({
           id: candidate.id,
           key: candidate.id,
@@ -3895,6 +5481,14 @@ document.addEventListener('DOMContentLoaded', () => {
         ;(childSeed.imports ?? []).forEach((reference) => {
           const imported = resolveBomImport(reference, spawned)
           if (imported === undefined || imported.parentId === agent.id) return
+          if (imported.scope !== 'shared_part') {
+            appendWorkAgentLog(
+              agent,
+              `< interface dependency retained as context, not imported geometry: ${imported.role}`,
+              'in',
+            )
+            return
+          }
           addImportToConsumer(agent, imported, `direct BOM reference: ${reference}`)
         })
       })
@@ -4030,12 +5624,28 @@ document.addEventListener('DOMContentLoaded', () => {
   const recoverAgentVisual = (agent: Agent, currentRun: number, now: number) => {
     if (
       !useAgentCadSnapshots ||
-      isReusableLibraryAgent(agent) ||
-      agent.status !== 'complete' ||
-      (agent.snapshotState === 'ready' && agent.snapshotUrl !== undefined) ||
+      isReusableLibraryAgent(agent)
+    ) return false
+
+    if (
       agent.snapshotState === 'queued' ||
       agent.snapshotState === 'rendering' ||
       agent.snapshotState === 'persisting'
+    ) {
+      const stateAge = now - (agent.snapshotStateChangedAtMs ?? now)
+      if (stateAge < snapshotStaleThresholdMs) return false
+      const staleState = agent.snapshotState
+      appendWorkAgentLog(
+        agent,
+        `< visual supervisor cleared stale ${staleState} state after ${Math.round(stateAge / 1000)}s`,
+        'in',
+      )
+      setAgentSnapshotState(agent, 'error', `stale ${staleState} state recovered`)
+    }
+
+    if (
+      agent.status !== 'complete' ||
+      (agent.snapshotState === 'ready' && agent.snapshotUrl !== undefined)
     ) return false
 
     const lastRecovery = agent.lastSnapshotRecoveryAtMs ?? 0
@@ -4046,6 +5656,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
     if (agent.snapshotState === 'error' && recovery % snapshotRetriesBeforeKclRepair === 0) {
       const reason = agent.snapshotMessage || 'snapshot contained no visible geometry'
+      if (agent.lastGoodSnapshotUrl !== undefined) {
+        setAgentSnapshot(agent, agent.lastGoodSnapshotUrl)
+        setAgentSnapshotState(agent, 'ready', 'retained last good CAD snapshot after render failure')
+        appendWorkAgentLog(
+          agent,
+          `< visual supervisor retained last good snapshot after ${recovery} failed render attempts: ${reason}`,
+          'in',
+        )
+        return true
+      }
       appendWorkAgentLog(agent, `< visual supervisor requesting KCL repair after ${recovery} failed snapshot attempts: ${reason}`, 'in')
       void requestAgentWork(
         agent,
@@ -4077,6 +5697,10 @@ document.addEventListener('DOMContentLoaded', () => {
       window.clearInterval(supervisorTimer)
       supervisorTimer = undefined
     }
+    if (reviewQueueDrainTimer !== undefined) {
+      window.clearTimeout(reviewQueueDrainTimer)
+      reviewQueueDrainTimer = undefined
+    }
     if (aggregateTimeTimer !== undefined) {
       window.clearInterval(aggregateTimeTimer)
       aggregateTimeTimer = undefined
@@ -4100,6 +5724,13 @@ document.addEventListener('DOMContentLoaded', () => {
     workEventAbort?.abort()
     workEventAbort = undefined
     workEventSessionId = ''
+    if (workEventReconnectTimer !== undefined) {
+      window.clearTimeout(workEventReconnectTimer)
+      workEventReconnectTimer = undefined
+    }
+    workEventReconnectAttempt = 0
+    workEventLastMessageAtMs = 0
+    workEventRecycleCount = 0
     await disposeSnapshotView()
     await centerView.deconstructor()
     snapshotCanvas.width = 1
@@ -4115,9 +5746,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
       synchronizeCompletedAssemblies()
       const finalProject = renderProjectFor(rootFilePath)
-      await queueCenterProject(finalProject, 'final complete root assembly')
-      sendRootCameraCommand(centerView)
-      const snapshotDataUrl = await captureSnapshotDataUrl(centerView)
+      try {
+        await queueCenterProject(finalProject, 'final complete root assembly')
+      } catch (error: unknown) {
+        if (lastGoodCenterSnapshotDataUrl === undefined) throw error
+        rootLogLine(
+          `< final root renderer unavailable; retaining last successful assembly frame while persisting complete KCL: ${errorToMessage(error)}`,
+          'in',
+        )
+      }
+      const snapshotDataUrl = useStaticCenterCad
+        ? lastGoodCenterSnapshotDataUrl
+        : await captureSnapshotDataUrl(centerView)
+      if (snapshotDataUrl === undefined) {
+        throw new Error('final root snapshot renderer returned no image')
+      }
       let snapshotUrl = snapshotDataUrl
       try {
         snapshotUrl = await persistSnapshot(rootAgentId, snapshotDataUrl)
@@ -4216,13 +5859,24 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const wakeFailedAgent = (agent: Agent, currentRun: number) => {
     const now = Date.now()
-    const recoveries = agent.supervisorRecoveryCount ?? 0
-    const lastRecovery = agent.lastSupervisorRecoveryAtMs ?? 0
+    const isRoot = agent.id === rootAgentId
+    const recoveries = isRoot
+      ? rootSupervisorRecoveryCount
+      : (agent.supervisorRecoveryCount ?? 0)
+    const lastRecovery = isRoot
+      ? rootLastSupervisorRecoveryAtMs
+      : (agent.lastSupervisorRecoveryAtMs ?? 0)
     if (now - lastRecovery < supervisorRecoveryCooldownMs) return false
 
-    agent.supervisorRecoveryCount = recoveries + 1
-    agent.lastSupervisorRecoveryAtMs = now
-    const reason = `Root supervisor recovery ${agent.supervisorRecoveryCount}`
+    const recoveryCount = recoveries + 1
+    if (isRoot) {
+      rootSupervisorRecoveryCount = recoveryCount
+      rootLastSupervisorRecoveryAtMs = now
+    } else {
+      agent.supervisorRecoveryCount = recoveryCount
+      agent.lastSupervisorRecoveryAtMs = now
+    }
+    const reason = `Root supervisor recovery ${recoveryCount}`
     rootLogLine(`< supervisor waking ${agent.name}: ${reason}`, 'in')
     appendWorkAgentLog(agent, `< ${reason}; retaining current KCL and interface context`, 'in')
 
@@ -4233,15 +5887,39 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     setWorkAgentStatus(agent, 'reviewing')
+    const pendingInstruction = agent.pendingWorkInstruction?.trim()
     void requestAgentWork(
       agent,
       currentRun,
       '',
       0,
-      'Root supervisor: resume this child using the current KCL, interfaces, and direct imports. Repair the failed operation and return a renderable result for the parent assembly.',
+      pendingInstruction || 'Root supervisor: resume this child using the current KCL, interfaces, and direct imports. Repair the failed operation and return a renderable result for the parent assembly.',
+      isRoot ? 1 : 0,
     )
     return true
   }
+
+  const hasAgentWorkWaiter = (agentId: string, workRevision?: number) => (
+    Array.from(workWaiters.values()).some(waiter => (
+      waiter.agent.id === agentId &&
+      (workRevision === undefined || waiter.workRevision === workRevision)
+    ))
+  )
+
+  const rootHasAgentDispatchWork = () => (
+    activeAgentWorkIds.has(rootAgentId) ||
+    activeAgentWorkRequests.has(rootAgentId) ||
+    pendingAgentWorkRequests.has(rootAgentId) ||
+    hasAgentWorkWaiter(rootAgentId)
+  )
+
+  const rootHasTrackedRuntimeWork = () => (
+    rootHasAgentDispatchWork() ||
+    activeReviewRequests.has(rootAgentId) ||
+    reviewTimers.has(rootAgentId) ||
+    placementTimers.has(rootAgentId) ||
+    draftRenderChains.has(rootAgentId)
+  )
 
   const runRootSupervisorSweep = () => {
     if (!isControllerWindow || !active || runPhase !== 'running') return
@@ -4253,6 +5931,119 @@ document.addEventListener('DOMContentLoaded', () => {
     for (const agent of agents.values()) {
       statusCounts.set(agent.status, (statusCounts.get(agent.status) ?? 0) + 1)
       if (!agentStillActive(agent, currentRun) || isReusableLibraryAgent(agent)) continue
+
+      const activeWorkRevision = activeAgentWorkIds.get(agent.id)
+      const activeWorkAge = now - (activeAgentWorkPhaseStartedAtMs.get(agent.id) ?? now)
+      if (
+        activeWorkRevision !== undefined &&
+        !hasAgentWorkWaiter(agent.id, activeWorkRevision) &&
+        activeWorkAge >= localAgentWorkStallMs
+      ) {
+        const stalledRequest = activeAgentWorkRequests.get(agent.id)
+        const retainedKcl = agent.lastGoodKcl?.trim() ?? ''
+        const previousKcl = kclFiles.get(agent.filePath) ?? ''
+        const reviewInstruction = stalledRequest?.reviewInstruction
+          ?? agent.pendingWorkInstruction
+          ?? ''
+        const retainedRouteViolation = agent.kind === 'worker' && retainedKcl.length > 0
+          ? explicitRouteReworkViolation(reviewInstruction, previousKcl, retainedKcl)
+          : undefined
+        const retainedFrameViolation = retainedKcl.length > 0
+          ? importFrameContractViolation(reviewInstruction, retainedKcl)
+          : undefined
+        const canReconcileRetainedResult = (
+          retainedKcl.length > 0 &&
+          agent.snapshotState === 'ready' &&
+          agent.lastGoodSnapshotUrl !== undefined &&
+          retainedRouteViolation === undefined &&
+          retainedFrameViolation === undefined &&
+          (
+            !reworkRequiresExecutableChange(reviewInstruction) ||
+            kclExecutableFingerprint(retainedKcl) !== kclExecutableFingerprint(previousKcl)
+          )
+        )
+        activeAgentWorkIds.delete(agent.id)
+        activeAgentWorkRequests.delete(agent.id)
+        activeAgentWorkPhaseStartedAtMs.delete(agent.id)
+        draftRenderChains.delete(agent.id)
+        if (canReconcileRetainedResult) {
+          kclFiles.set(agent.filePath, retainedKcl)
+          updateInterfaceManifest(agent, retainedKcl)
+          if (
+            reviewInstruction.trim().length > 0 &&
+            agent.pendingWorkInstruction?.trim() === reviewInstruction.trim()
+          ) {
+            agent.pendingWorkInstruction = undefined
+          }
+          stalledRequest?.waiters.forEach(waiter => waiter.resolve())
+          appendWorkAgentLog(
+            agent,
+            `< supervisor accepted validated retained KCL and visual after final event stalled for ${Math.round(activeWorkAge / 1000)}s`,
+            'in',
+          )
+          setWorkAgentStatus(agent, 'complete')
+          refreshAncestorProjects(agent)
+          continue
+        }
+        appendWorkAgentLog(
+          agent,
+          `< supervisor cleared stalled local post-processing after ${Math.round(activeWorkAge / 1000)}s`,
+          'in',
+        )
+        setWorkAgentStatus(agent, 'error')
+        wakeFailedAgent(agent, currentRun)
+        continue
+      }
+
+      const hasTrackedWork = (
+        activeWorkRevision !== undefined ||
+        pendingAgentWorkRequests.has(agent.id) ||
+        hasAgentWorkWaiter(agent.id) ||
+        bomPlanningAgentIds.has(agent.id) ||
+        activeReviewRequests.has(agent.id) ||
+        reviewQueue.has(agent.id) ||
+        reviewTimers.has(agent.id) ||
+        placementTimers.has(agent.id) ||
+        draftRenderChains.has(agent.id) ||
+        snapshotJobs.has(agent.id) ||
+        snapshotPersistenceJobs.has(agent.id)
+      )
+      const isActiveStatus = agent.status === 'running' || agent.status === 'reviewing'
+      if (!isActiveStatus || hasTrackedWork) {
+        untrackedAgentStatusStartedAtMs.delete(agent.id)
+      } else if (!untrackedAgentStatusStartedAtMs.has(agent.id)) {
+        untrackedAgentStatusStartedAtMs.set(agent.id, now)
+      }
+      const untrackedStatusAge = now - (untrackedAgentStatusStartedAtMs.get(agent.id) ?? now)
+      if (
+        isActiveStatus &&
+        !hasTrackedWork &&
+        untrackedStatusAge >= orphanedAgentStatusGraceMs
+      ) {
+        untrackedAgentStatusStartedAtMs.delete(agent.id)
+        if (
+          agentKclReady(agent) &&
+          agent.snapshotState === 'ready' &&
+          agent.snapshotUrl !== undefined
+        ) {
+          appendWorkAgentLog(
+            agent,
+            `< supervisor reconciled orphaned ${agent.status} state with retained final KCL and visual`,
+            'in',
+          )
+          setWorkAgentStatus(agent, 'complete')
+          refreshAncestorProjects(agent)
+        } else {
+          appendWorkAgentLog(
+            agent,
+            `< supervisor found orphaned ${agent.status} state after ${Math.round(untrackedStatusAge / 1000)}s`,
+            'in',
+          )
+          setWorkAgentStatus(agent, 'error')
+          wakeFailedAgent(agent, currentRun)
+        }
+        continue
+      }
 
       if (agent.status === 'error') {
         wakeFailedAgent(agent, currentRun)
@@ -4280,19 +6071,51 @@ document.addEventListener('DOMContentLoaded', () => {
       scheduleOrchestratorReview(agent, readyChild)
     }
 
+    const rootAgent = graphNode(rootAgentId)
     if (
+      rootAgent !== undefined &&
+      rootStatus === 'error' &&
+      !rootHasAgentDispatchWork() &&
+      !activeReviewRequests.has(rootAgentId)
+    ) {
+      const rootReviewTimer = reviewTimers.get(rootAgentId)
+      if (rootReviewTimer !== undefined) window.clearTimeout(rootReviewTimer)
+      reviewTimers.delete(rootAgentId)
+      reviewQueue.delete(rootAgentId)
+      wakeFailedAgent(rootAgent, currentRun)
+      return
+    }
+
+    const allAgentsComplete = (
       agents.size > 0 &&
       Array.from(agents.values()).every(agent => agent.status === 'complete')
-    ) {
+    )
+    if (allAgentsComplete) {
+      const readyRootChild = rootAgent === undefined ? undefined : placementComponentsFor(rootAgent)[0]
+      if (
+        rootStatus !== 'complete' &&
+        !rootHasTrackedRuntimeWork() &&
+        rootAgent !== undefined &&
+        readyRootChild !== undefined
+      ) {
+        rootLogLine('< supervisor recovered orphaned root status; resuming final placement and review', 'in')
+        scheduleOrchestratorPlacement(
+          rootAgent,
+          readyRootChild,
+          'Controller recovery: validate the current completed root assembly without inventing unrelated changes.',
+          1,
+        )
+        scheduleOrchestratorReview(rootAgent, readyRootChild)
+        return
+      }
       scheduleRunCompletionCheck()
       if (now - supervisorLastSummaryAtMs >= supervisorSummaryIntervalMs) {
         supervisorLastSummaryAtMs = now
-        rootLogLine(`< supervisor sweep: ${agents.size}/${maxWallAgents} agents complete; validating final assembly and snapshots`, 'in')
+        rootLogLine(`< supervisor sweep: ${agents.size} agents complete; validating final assembly and snapshots`, 'in')
       }
       return
     }
 
-    const rootAgent = graphNode(rootAgentId)
     const readyRootChild = rootAgent === undefined ? undefined : placementComponentsFor(rootAgent)[0]
     const lastRootReview = supervisorReviewAtMs.get(rootAgentId) ?? 0
     if (!reviewScheduled && rootAgent !== undefined && readyRootChild !== undefined && now - lastRootReview >= supervisorSummaryIntervalMs) {
@@ -4307,7 +6130,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const summary = ['running', 'reviewing', 'complete', 'error', 'queued', 'starting']
         .map(status => `${status}:${statusCounts.get(status as AgentStatus) ?? 0}`)
         .join(', ')
-      rootLogLine(`< supervisor sweep: ${agents.size}/${maxWallAgents} agents (${summary})`, 'in')
+      rootLogLine(`< supervisor sweep: ${agents.size} agents (${summary})`, 'in')
     }
   }
 
@@ -4354,6 +6177,8 @@ document.addEventListener('DOMContentLoaded', () => {
     activeReviewRevisions.clear()
     completedReviewRevisions.clear()
     reviewQueue.clear()
+    upstreamReviewDirectives.clear()
+    upstreamReviewDirectiveId = 0
     supervisorReviewAtMs.clear()
     supervisorLastSummaryAtMs = 0
     for (const timer of reviewTimers.values()) window.clearTimeout(timer)
@@ -4376,6 +6201,10 @@ document.addEventListener('DOMContentLoaded', () => {
     })
     pendingAgentWorkRequests.clear()
     activeAgentWorkIds.clear()
+    activeAgentWorkRequests.clear()
+    activeAgentWorkPhaseStartedAtMs.clear()
+    untrackedAgentStatusStartedAtMs.clear()
+    workStatusMissingPollsById.clear()
     agentWorkRevisions.clear()
     bomPlanningAgentIds.clear()
     workWaiters.forEach(waiter => waiter.reject(new Error('run reset')))
@@ -4385,6 +6214,11 @@ document.addEventListener('DOMContentLoaded', () => {
     workEventAbort?.abort()
     workEventAbort = undefined
     workEventSessionId = ''
+    if (workEventReconnectTimer !== undefined) {
+      window.clearTimeout(workEventReconnectTimer)
+      workEventReconnectTimer = undefined
+    }
+    workEventReconnectAttempt = 0
   }
 
   const clearCameraTimers = () => {
@@ -4404,6 +6238,7 @@ document.addEventListener('DOMContentLoaded', () => {
       agent.element?.remove()
     })
     agents.clear()
+    agentChildren.clear()
     plannedAgentCount = 0
     updateAggregateTime()
     layoutAgents()
@@ -4419,10 +6254,10 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   const startCenterView = () => {
-    centerView.start()
+    if (!useStaticCenterCad) centerView.start()
   }
 
-  if (isControllerWindow) attachCenterViewHandlers(centerView)
+  if (isControllerWindow && !useStaticCenterCad) attachCenterViewHandlers(centerView)
   else void centerView.deconstructor()
 
   const demoAgents = (): AgentSeed[] => {
@@ -4566,7 +6401,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const response = await runFetch('/api/orchestrate-stream', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt, maxAgents: maxWallAgents }),
+        body: JSON.stringify({ prompt, maxAgents: wallAgentLimit }),
       })
       if (!response.ok) {
         throw new Error(`orchestrate ${response.status}`)
@@ -4610,13 +6445,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  const parseAgentWorkStreamEvent = (line: string): AgentWorkStreamEvent | undefined => {
-    if (line.trim().length === 0) return undefined
-    return JSON.parse(line) as AgentWorkStreamEvent
-  }
-
   const handleAgentWorkEvent = (event: AgentWorkStreamEvent | undefined) => {
-    if (event === undefined || event.type === 'ping') return
+    if (event === undefined) return
+    workEventLastMessageAtMs = Date.now()
+    if (event.type === 'ping' || event.type === 'work-status') {
+      if (Array.isArray(event.workIds)) reconcileStartedWork(event.workIds)
+      return
+    }
     const workId = event.workId
     if (workId === undefined) return
     if (
@@ -4687,6 +6522,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (event.type === 'final') {
       workWaiters.delete(workId)
+      activeAgentWorkPhaseStartedAtMs.set(agent.id, Date.now())
       waiter.resolve(event.update)
       return
     }
@@ -4696,49 +6532,119 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   const ensureWorkEventStream = (sessionId: string) => {
-    if (workEventAbort !== undefined && workEventSessionId === sessionId) return
+    if (workEventSessionId === sessionId) return
 
-    workEventAbort?.abort()
-    workEventAbort = new AbortController()
+    if (workEventReconnectTimer !== undefined) {
+      window.clearTimeout(workEventReconnectTimer)
+      workEventReconnectTimer = undefined
+    }
     workEventSessionId = sessionId
-    const signal = workEventAbort.signal
+    workEventLastMessageAtMs = Date.now()
 
-    const readEvents = async () => {
-      const response = await fetch(`/api/zookeeper/events?sessionId=${encodeURIComponent(sessionId)}`, { signal })
-      if (!response.ok || response.body === null) throw new Error(`event stream ${response.status}`)
-
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      for (;;) {
-        const { done, value } = await reader.read()
-        buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done })
-        const lines = buffer.split('\n')
-        buffer = lines.pop() ?? ''
-        lines.forEach(line => handleAgentWorkEvent(parseAgentWorkStreamEvent(line)))
-        if (done) break
+    const poll = async () => {
+      if (!active || activeSessionId !== sessionId || workEventSessionId !== sessionId) return
+      const controller = new AbortController()
+      workEventAbort = controller
+      const timeout = window.setTimeout(() => controller.abort(), workEventPollTimeoutMs)
+      let retryDelay = 0
+      try {
+        const response = await fetch(
+          `/api/zookeeper/events-poll?sessionId=${encodeURIComponent(sessionId)}&limit=1`,
+          { cache: 'no-store', signal: controller.signal },
+        )
+        if (!response.ok) throw new Error(`event poll ${response.status}`)
+        const payload = await response.json() as {
+          events?: unknown,
+          remaining?: unknown,
+          workIds?: unknown,
+        }
+        if (!Array.isArray(payload.events)) throw new Error('event poll returned invalid events')
+        payload.events.forEach(event => handleAgentWorkEvent(event as AgentWorkStreamEvent))
+        if (Array.isArray(payload.workIds)) {
+          reconcileStartedWork(payload.workIds.filter(value => typeof value === 'string'))
+        }
+        workEventLastMessageAtMs = Date.now()
+        workEventReconnectAttempt = 0
+      } catch (error: unknown) {
+        if (
+          !controller.signal.aborted ||
+          (active && activeSessionId === sessionId && workEventSessionId === sessionId)
+        ) {
+          workEventRecycleCount += 1
+          const attempt = workEventReconnectAttempt
+          workEventReconnectAttempt += 1
+          retryDelay = Math.min(10000, 500 * (2 ** attempt))
+          if (attempt === 0 || attempt % 4 === 0) {
+            rootLogLine(
+              `system: zookeeper event poll interrupted; retrying in ${Math.ceil(retryDelay / 1000)}s (${errorToMessage(error)})`,
+            )
+          }
+        }
+      } finally {
+        window.clearTimeout(timeout)
+        if (workEventAbort === controller) workEventAbort = undefined
       }
-      handleAgentWorkEvent(parseAgentWorkStreamEvent(buffer))
-      if (!signal.aborted) throw new Error('zookeeper event stream ended')
+      if (!active || activeSessionId !== sessionId || workEventSessionId !== sessionId) return
+      if (retryDelay === 0) {
+        void poll()
+        return
+      }
+      workEventReconnectTimer = window.setTimeout(() => {
+        workEventReconnectTimer = undefined
+        void poll()
+      }, retryDelay)
     }
 
-    void readEvents().catch((error: unknown) => {
-      if (signal.aborted) return
-      if (workEventAbort?.signal === signal) {
-        workEventAbort = undefined
-        workEventSessionId = ''
-      }
-      rootLogLine(`system: zookeeper event stream failed (${errorToMessage(error)})`)
-      Array.from(workWaiters.entries()).forEach(([workId, waiter]) => {
-        workWaiters.delete(workId)
-        waiter.reject(new Error(errorToMessage(error)))
-      })
-      Array.from(reviewWaiters.entries()).forEach(([workId, waiter]) => {
-        reviewWaiters.delete(workId)
-        waiter.reject(new Error(errorToMessage(error)))
-      })
-    })
+    void poll()
   }
+
+  const reconcileStartedWork = (activeWorkIds: string[]) => {
+    if (
+      !active ||
+      activeSessionId.length === 0 ||
+      (workWaiters.size === 0 && reviewWaiters.size === 0)
+    ) {
+      workStatusMissingPollsById.clear()
+      return
+    }
+
+    const serverWorkIds = new Set(
+      activeWorkIds.filter(value => typeof value === 'string'),
+    )
+    const trackedWorkIds = new Set([...workWaiters.keys(), ...reviewWaiters.keys()])
+    for (const workId of trackedWorkIds) {
+      if (serverWorkIds.has(workId)) {
+        workStatusMissingPollsById.delete(workId)
+        continue
+      }
+      const missingPolls = (workStatusMissingPollsById.get(workId) ?? 0) + 1
+      workStatusMissingPollsById.set(workId, missingPolls)
+      if (missingPolls < workStatusMissingThreshold) continue
+
+      const workWaiter = workWaiters.get(workId)
+      if (workWaiter !== undefined) {
+        workWaiters.delete(workId)
+        workWaiter.reject(new Error('Zookeeper work ended before its final event was received'))
+      }
+      const reviewWaiter = reviewWaiters.get(workId)
+      if (reviewWaiter !== undefined) {
+        reviewWaiters.delete(workId)
+        reviewWaiter.reject(new Error('Zookeeper review ended before its final event was received'))
+      }
+      workStatusMissingPollsById.delete(workId)
+    }
+    for (const workId of workStatusMissingPollsById.keys()) {
+      if (!trackedWorkIds.has(workId)) workStatusMissingPollsById.delete(workId)
+    }
+  }
+
+  const monitorStartedWork = <T>(
+    _sessionId: string,
+    _workId: string,
+    _isPending: () => boolean,
+    _rejectPending: (error: Error) => void,
+    completion: Promise<T>,
+  ) => completion
 
   const requestReviewStream = async (
     parent: Agent,
@@ -4746,8 +6652,11 @@ document.addEventListener('DOMContentLoaded', () => {
     payload: Record<string, unknown>,
   ): Promise<AgentReviewResponse> => {
     ensureWorkEventStream(activeSessionId)
+    const sessionId = activeSessionId
     const workId = randomId()
+    let rejectFinalReview = (_error: Error) => {}
     const finalReview = new Promise<AgentReviewResponse>((resolve, reject) => {
+      rejectFinalReview = reject
       reviewWaiters.set(workId, { parent, currentRun, resolve, reject })
     })
 
@@ -4763,7 +6672,17 @@ document.addEventListener('DOMContentLoaded', () => {
       throw error
     }
 
-    return finalReview
+    return monitorStartedWork(
+      sessionId,
+      workId,
+      () => reviewWaiters.has(workId),
+      (error) => {
+        if (!reviewWaiters.has(workId)) return
+        reviewWaiters.delete(workId)
+        rejectFinalReview(error)
+      },
+      finalReview,
+    )
   }
 
   const requestAgentWorkStream = async (
@@ -4774,10 +6693,13 @@ document.addEventListener('DOMContentLoaded', () => {
     workRevision?: number,
   ): Promise<AgentStreamResponse> => {
     ensureWorkEventStream(activeSessionId)
+    const sessionId = activeSessionId
     const workId = randomId()
     const body = { ...payload, workId }
 
+    let rejectFinalUpdate = (_error: Error) => {}
     const finalUpdate = new Promise<AgentStreamResponse>((resolve, reject) => {
+      rejectFinalUpdate = reject
       workWaiters.set(workId, { agent, currentRun, workRevision, resolve, reject })
     })
 
@@ -4791,7 +6713,17 @@ document.addEventListener('DOMContentLoaded', () => {
       throw new Error(`agent work start ${response.status}`)
     }
 
-    return finalUpdate
+    return monitorStartedWork(
+      sessionId,
+      workId,
+      () => workWaiters.has(workId),
+      (error) => {
+        if (!workWaiters.has(workId)) return
+        workWaiters.delete(workId)
+        rejectFinalUpdate(error)
+      },
+      finalUpdate,
+    )
   }
 
   const performAgentWork = async (
@@ -4804,6 +6736,20 @@ document.addEventListener('DOMContentLoaded', () => {
     zooRetryAttempt = 0,
   ) => {
     if (!agentStillActive(agent, currentRun)) return
+    if (agentWorkRevisions.get(agent.id) !== workRevision) return
+    if (
+      !agentKclReady(agent) &&
+      agent.lastGoodKcl !== undefined &&
+      stripImportLines(agent.lastGoodKcl).trim().length > 0
+    ) {
+      kclFiles.set(agent.filePath, agent.lastGoodKcl)
+      updateInterfaceManifest(agent, agent.lastGoodKcl)
+      if (agent.lastGoodSnapshotUrl !== undefined) {
+        setAgentSnapshotState(agent, 'ready', 'restored last good CAD snapshot')
+        setAgentSnapshot(agent, agent.lastGoodSnapshotUrl)
+      }
+      appendWorkAgentLog(agent, '< restored last validated KCL before retry', 'in')
+    }
     if (isReusableLibraryAgent(agent)) {
       syncReusableLibraryMetadata(agent)
       setWorkAgentStatus(agent, 'complete')
@@ -4825,6 +6771,7 @@ document.addEventListener('DOMContentLoaded', () => {
     try {
       const entryFilePath = agent.id === rootAgentId ? rootFilePath : agent.filePath
       const context = requestContextFor(entryFilePath, false)
+      const previousKcl = kclFiles.get(agent.filePath) ?? ''
       const update = await requestAgentWorkStream(agent, currentRun, {
         sessionId: activeSessionId,
         prompt: promptInput.value.trim() || defaultPrompt,
@@ -4846,6 +6793,7 @@ document.addEventListener('DOMContentLoaded', () => {
         renderError,
         reviewInstruction,
         attempt: repairAttempt,
+        transportRetryAttempt: zooRetryAttempt,
       }, '/api/zookeeper/work-start', workRevision)
       if (!agentStillActive(agent, currentRun)) return
       if (agentWorkRevisions.get(agent.id) !== workRevision) {
@@ -4874,7 +6822,67 @@ document.addEventListener('DOMContentLoaded', () => {
       await (draftRenderChains.get(agent.id) ?? Promise.resolve()).catch(() => {})
       if (!agentStillActive(agent, currentRun)) return
 
-      kclFiles.set(agent.filePath, update.kcl)
+      if (stripImportLines(update.kcl).trim().length === 0) {
+        throw new Error('Zookeeper worker stream returned empty KCL')
+      }
+      if (
+        previousKcl.trim().length > 0 &&
+        reworkRequiresExecutableChange(reviewInstruction) &&
+        kclExecutableFingerprint(update.kcl) === kclExecutableFingerprint(previousKcl)
+      ) {
+        const message = 'Zookeeper returned rework KCL with no executable change'
+        if (repairAttempt < maxAgentRepairAttempts) {
+          appendWorkAgentLog(agent, `-> ${message}; requesting repair ${repairAttempt + 1}`, 'out')
+          await performAgentWork(
+            agent,
+            currentRun,
+            workRevision,
+            message,
+            repairAttempt + 1,
+            reviewInstruction,
+          )
+          return
+        }
+        throw new Error(`${message} after ${maxAgentRepairAttempts} repair attempts`)
+      }
+      const routeViolation = agent.kind === 'worker'
+        ? explicitRouteReworkViolation(reviewInstruction, previousKcl, update.kcl)
+        : undefined
+      if (routeViolation !== undefined) {
+        if (repairAttempt < maxAgentRepairAttempts) {
+          appendWorkAgentLog(agent, `-> ${routeViolation}; requesting repair ${repairAttempt + 1}`, 'out')
+          await performAgentWork(
+            agent,
+            currentRun,
+            workRevision,
+            routeViolation,
+            repairAttempt + 1,
+            reviewInstruction,
+          )
+          return
+        }
+        throw new Error(`${routeViolation} after ${maxAgentRepairAttempts} repair attempts`)
+      }
+      const frameViolation = importFrameContractViolation(reviewInstruction, update.kcl)
+      if (frameViolation !== undefined) {
+        if (repairAttempt < maxAgentRepairAttempts) {
+          appendWorkAgentLog(agent, `-> ${frameViolation}; requesting repair ${repairAttempt + 1}`, 'out')
+          await performAgentWork(
+            agent,
+            currentRun,
+            workRevision,
+            frameViolation,
+            repairAttempt + 1,
+            reviewInstruction,
+          )
+          return
+        }
+        throw new Error(`${frameViolation} after ${maxAgentRepairAttempts} repair attempts`)
+      }
+      const acceptedSource = agent.kind === 'orchestrator' && !update.kcl.includes(authoredAssemblyPlacementMarker)
+        ? `${authoredAssemblyPlacementMarker}\n${update.kcl}`
+        : update.kcl
+      kclFiles.set(agent.filePath, acceptedSource)
       if (agent.kind === 'orchestrator') syncAssemblyFileImports(agent)
       const acceptedKcl = kclFiles.get(agent.filePath) ?? update.kcl
       completionCandidateAtMs = undefined
@@ -4913,6 +6921,13 @@ document.addEventListener('DOMContentLoaded', () => {
         return
       }
 
+      if (
+        reviewInstruction.trim().length > 0 &&
+        agent.pendingWorkInstruction?.trim() === reviewInstruction.trim()
+      ) {
+        agent.pendingWorkInstruction = undefined
+        requestWallCheckpoint()
+      }
       refreshAncestorProjects(agent)
 
       if (agent.kind === 'orchestrator') {
@@ -4952,7 +6967,9 @@ document.addEventListener('DOMContentLoaded', () => {
       return
     }
 
-    activeAgentWorkIds.add(agentId)
+    activeAgentWorkIds.set(agentId, request.workRevision)
+    activeAgentWorkRequests.set(agentId, request)
+    activeAgentWorkPhaseStartedAtMs.set(agentId, Date.now())
     void performAgentWork(
       request.agent,
       request.currentRun,
@@ -4968,8 +6985,13 @@ document.addEventListener('DOMContentLoaded', () => {
         request.waiters.forEach(waiter => waiter.reject(workError))
       })
       .finally(() => {
-        activeAgentWorkIds.delete(agentId)
-        drainAgentWorkQueue(agentId)
+        if (activeAgentWorkIds.get(agentId) === request.workRevision) {
+          activeAgentWorkIds.delete(agentId)
+          activeAgentWorkRequests.delete(agentId)
+          activeAgentWorkPhaseStartedAtMs.delete(agentId)
+          drainAgentWorkQueue(agentId)
+        }
+        drainReviewQueue()
         scheduleRunCompletionCheck()
       })
   }
@@ -4987,16 +7009,53 @@ document.addEventListener('DOMContentLoaded', () => {
       return
     }
 
+    const previous = pendingAgentWorkRequests.get(agent.id)
+    const activeRequest = activeAgentWorkRequests.get(agent.id)
+    const mergedReviewInstruction = compactPendingWorkInstruction(
+      activeRequest?.reviewInstruction,
+      previous?.reviewInstruction,
+      reviewInstruction,
+    )
+    const matchesExistingRequest = (request: AgentWorkQueueRequest) => (
+      request.reviewInstruction === mergedReviewInstruction &&
+      (renderError.length === 0 || request.renderError === renderError) &&
+      request.repairAttempt >= repairAttempt &&
+      request.zooRetryAttempt >= zooRetryAttempt
+    )
+    const waiter = { resolve, reject }
+    if (previous !== undefined && matchesExistingRequest(previous)) {
+      previous.waiters.push(waiter)
+      appendWorkAgentLog(agent, '< coalesced duplicate rework into pending request', 'in')
+      scheduleRunCompletionCheck()
+      return
+    }
+    if (
+      previous === undefined &&
+      activeRequest !== undefined &&
+      matchesExistingRequest(activeRequest)
+    ) {
+      activeRequest.waiters.push(waiter)
+      appendWorkAgentLog(agent, '< coalesced duplicate rework into active request', 'in')
+      scheduleRunCompletionCheck()
+      return
+    }
+
     const workRevision = (agentWorkRevisions.get(agent.id) ?? 0) + 1
     agentWorkRevisions.set(agent.id, workRevision)
-    const previous = pendingAgentWorkRequests.get(agent.id)
-    const waiters = [...(previous?.waiters ?? []), { resolve, reject }]
+    agent.pendingWorkInstruction = mergedReviewInstruction || undefined
+    requestWallCheckpoint()
+    previous?.waiters.forEach(waiter => waiter.resolve())
+    const waiters = [waiter]
     pendingAgentWorkRequests.set(agent.id, {
       agent,
       currentRun,
-      renderError,
-      repairAttempt,
-      reviewInstruction,
+      renderError: renderError || previous?.renderError || activeRequest?.renderError || '',
+      repairAttempt: Math.max(
+        repairAttempt,
+        previous?.repairAttempt ?? 0,
+        activeRequest?.repairAttempt ?? 0,
+      ),
+      reviewInstruction: mergedReviewInstruction,
       zooRetryAttempt,
       workRevision,
       waiters,
@@ -5010,13 +7069,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const runZookeeper = async () => {
     if (startInProgress) return
-    const centerNeedsRebuild = !assemblyRenderer.contains(centerView.el) || centerView.rtc === undefined
+    const centerNeedsRebuild = !useStaticCenterCad && (
+      !assemblyRenderer.contains(centerView.el) ||
+      centerView.rtc === undefined
+    )
     startInProgress = true
     active = true
     runId += 1
     const currentRun = runId
     rootElapsedMs = 0
     rootActiveStartedAtMs = Date.now()
+    aggregateElapsedFloorMs = 0
     startButton.disabled = true
     startButton.textContent = 'Architecting BOM...'
     stopButton.disabled = false
@@ -5029,6 +7092,7 @@ document.addEventListener('DOMContentLoaded', () => {
     centerViewerReloadAttempts = 0
     capacityWarningRun = -1
     rootLog.replaceChildren()
+    rootLogEntries = []
     broadcastWall({ type: 'reset' })
     if (centerNeedsRebuild) await rebuildCenterViewer('new run after static completion')
     const prompt = promptInput.value.trim() || defaultPrompt
@@ -5046,7 +7110,9 @@ document.addEventListener('DOMContentLoaded', () => {
     kclFiles = new Map(Object.entries(plan.files))
     interfaceManifests = new Map()
     rootImports = new Set()
-    const seeds = plan.agents.slice(0, maxWallAgents)
+    const seeds = wallAgentLimit === undefined
+      ? plan.agents
+      : plan.agents.slice(0, wallAgentLimit)
     if (plan.agents.length > seeds.length) {
       rootLogLine(`< plan capped from ${plan.agents.length} to ${seeds.length} total agents`, 'in')
     }
@@ -5058,7 +7124,7 @@ document.addEventListener('DOMContentLoaded', () => {
       plannedAgentCount: seeds.length,
       files: useAgentCadSnapshots ? {} : plan.files,
     })
-    rootLogLine(`< ${plan.source} plan accepted: ${seeds.length} sub-agents (hard cap ${maxWallAgents})`, 'in')
+    rootLogLine(`< ${plan.source} plan accepted: ${seeds.length} sub-agents (no fixed wall agent cap)`, 'in')
     plan.notes?.forEach(note => rootLogLine(`system: ${note}`))
     renderAllGraphs()
     setRunPhase('running', 'running')
@@ -5142,6 +7208,322 @@ document.addEventListener('DOMContentLoaded', () => {
     })
   }
 
+  const createHydratedAgent = (durable: DurableWallAgent) => {
+    const agent: Agent = {
+      ...durable,
+      imports: [...(durable.imports ?? [])],
+      logs: [...(durable.logs ?? [])],
+      assignedTileIndex: durable.assignedTileIndex,
+      pendingWorkInstruction: compactPendingWorkInstruction(durable.pendingWorkInstruction) || undefined,
+    }
+    agents.set(agent.id, agent)
+    indexAgentParent(agent.id, agent.parentId)
+    if (
+      !isHeadlessController &&
+      isWallTileMode &&
+      wallTileIndex !== centerIndex &&
+      agentTileIndex(agent) === wallTileIndex
+    ) {
+      createAgentPanel(agent)
+    }
+    return agent
+  }
+
+  const reconcileHydratedAgent = (durable: DurableWallAgent) => {
+    const existing = agents.get(durable.id)
+    const previousSnapshotUrl = existing?.snapshotUrl
+    const agent = existing ?? createHydratedAgent(durable)
+    if (agent.parentId !== durable.parentId) {
+      unindexAgentParent(agent.id, agent.parentId)
+      agent.parentId = durable.parentId
+      indexAgentParent(agent.id, agent.parentId)
+    }
+    agent.kind = durable.kind
+    agent.scope = durable.scope
+    agent.name = durable.name
+    agent.role = durable.role
+    agent.instruction = durable.instruction
+    agent.filePath = durable.filePath
+    agent.imports = [...(durable.imports ?? [])]
+    agent.source = durable.source
+    agent.color = durable.color
+    agent.assignedTileIndex = durable.assignedTileIndex
+    agent.elapsedMs = durable.elapsedMs
+    agent.activeStartedAtMs = durable.activeStartedAtMs
+    agent.lastActivityAtMs = durable.lastActivityAtMs
+    agent.reviewRounds = durable.reviewRounds
+    agent.supervisorRecoveryCount = durable.supervisorRecoveryCount
+    agent.pendingWorkInstruction = compactPendingWorkInstruction(durable.pendingWorkInstruction) || undefined
+    agent.snapshotState = durable.snapshotState
+    agent.snapshotMessage = durable.snapshotMessage
+    agent.snapshotStateChangedAtMs = durable.snapshotStateChangedAtMs
+    agent.lastGoodKcl = durable.lastGoodKcl
+    agent.lastGoodSnapshotUrl = durable.lastGoodSnapshotUrl
+    agent.logs = [...(durable.logs ?? [])]
+    agent.element?.querySelector('.agent-title')?.replaceChildren(document.createTextNode(agent.name))
+    agent.element?.querySelector('.agent-role')?.replaceChildren(document.createTextNode(agent.role))
+    if (agent.status !== durable.status) setAgentStatus(agent, durable.status)
+    else updateViewerPlaceholderText(agent)
+    if (agent.logElement !== undefined) {
+      agent.logElement.replaceChildren()
+      agent.logs.forEach(entry => writeLog(agent.logElement!, entry.line, entry.direction))
+    }
+    if (
+      durable.snapshotUrl !== undefined &&
+      (
+        durable.snapshotUrl !== previousSnapshotUrl ||
+        (agent.viewerSlot !== undefined && agent.snapshotObjectUrl === undefined)
+      )
+    ) {
+      setAgentSnapshot(agent, durable.snapshotUrl)
+    }
+    return agent
+  }
+
+  let hydratedWallRevision = 0
+  let hydratedSessionId = ''
+
+  const applyDurableDisplayState = (state: DurableWallState) => {
+    if (state.unchanged || state.revision <= hydratedWallRevision) return
+    hydratedWallRevision = state.revision
+    const sessionChanged = hydratedSessionId !== state.run.sessionId
+    hydratedSessionId = state.run.sessionId
+    if (sessionChanged) {
+      resetAgents()
+      rootLogEntries = []
+      rootLog.replaceChildren()
+    }
+
+    active = ['architecting', 'running', 'finalizing'].includes(state.run.phase)
+    runPhase = state.run.phase
+    rootStatus = state.run.rootStatus
+    root.dataset.runPhase = runPhase
+    root.dataset.rootStatus = rootStatus
+    root.dataset.completionBlockers = state.run.completionBlockers ?? ''
+    activeSessionId = state.run.sessionId
+    activeSource = state.run.source
+    rootInstruction = state.run.rootInstruction
+    plannedAgentCount = state.run.plannedAgentCount
+    promptInput.value = document.activeElement === promptInput
+      ? promptInput.value
+      : state.run.prompt
+    aggregateTime.textContent = state.run.aggregateTime
+    centerStatus.textContent = state.run.centerStatus
+    startButton.disabled = active
+    startButton.textContent = active
+      ? (runPhase === 'architecting' ? 'Architecting BOM...' : 'Running Zookeeper')
+      : (runPhase === 'complete' ? 'Start New Run' : 'Start Zookeeper')
+    stopButton.disabled = !active && runPhase !== 'complete'
+
+    rootLogEntries = [...(state.rootLogs ?? [])]
+    rootLog.replaceChildren()
+    rootLogEntries.forEach(entry => writeLog(rootLog, entry.line, entry.direction, 160))
+
+    const incomingIds = new Set(state.agents.map(agent => agent.id))
+    for (const [agentId, agent] of agents) {
+      if (incomingIds.has(agentId)) continue
+      unindexAgentParent(agent.id, agent.parentId)
+      releaseAgentSnapshotDisplay(agent)
+      agent.element?.remove()
+      agents.delete(agentId)
+    }
+    state.agents.forEach(reconcileHydratedAgent)
+
+    if (
+      wallTileIndex === centerIndex &&
+      state.run.centerSnapshotUrl &&
+      state.run.centerSnapshotUrl !== lastGoodCenterSnapshotDataUrl
+    ) {
+      lastGoodCenterSnapshotDataUrl = state.run.centerSnapshotUrl
+      void replaceCenterWithStaticSnapshot(state.run.centerSnapshotUrl).catch((error: unknown) => {
+        centerStatus.textContent = `Center snapshot reload failed: ${errorToMessage(error).slice(0, 100)}`
+      })
+    }
+    layoutAgents()
+    renderAllGraphs()
+  }
+
+  const restoreControllerState = async () => {
+    if (!isControllerWindow) return
+    const response = await fetch('/api/wall-state?controller=1')
+    if (!response.ok) throw await httpErrorFromResponse(response, 'wall controller restore')
+    const state = await response.json() as DurableWallState
+    if (state.unchanged) return
+
+    const recoveredAtMs = Date.now()
+    const persistedAtMs = Date.parse(state.updatedAt ?? '')
+    const recoveryAccountingCutoffMs = Number.isFinite(persistedAtMs)
+      ? Math.min(recoveredAtMs, persistedAtMs)
+      : recoveredAtMs
+    const aggregateParts = state.run.aggregateTime.match(
+      /Aggregate Agent Time:\s*(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:(\d+)s)?/,
+    )
+    const aggregateFromLabelMs = aggregateParts === null
+      ? 0
+      : (
+        Number(aggregateParts[1] ?? 0) * 3600 +
+        Number(aggregateParts[2] ?? 0) * 60 +
+        Number(aggregateParts[3] ?? 0)
+      ) * 1000
+    aggregateElapsedFloorMs = Math.max(
+      0,
+      state.run.aggregateElapsedMs ?? aggregateFromLabelMs,
+    )
+    promptInput.value = state.run.prompt || defaultPrompt
+    activeSource = state.run.source
+    rootInstruction = state.run.rootInstruction || rootInstruction
+    rootElapsedMs = (state.run.rootElapsedMs || 0) + (
+      typeof state.run.rootActiveStartedAtMs === 'number'
+        ? Math.max(0, recoveryAccountingCutoffMs - state.run.rootActiveStartedAtMs)
+        : 0
+    )
+    rootActiveStartedAtMs = undefined
+    lastGoodCenterSnapshotDataUrl = state.run.centerSnapshotUrl || undefined
+    rootLogEntries = [...(state.rootLogs ?? [])]
+    rootLog.replaceChildren()
+    rootLogEntries.forEach(entry => writeLog(rootLog, entry.line, entry.direction, 160))
+    kclFiles = new Map(Object.entries(state.files ?? {}))
+    interfaceManifests = new Map(Object.entries(state.interfaces ?? {}))
+    rootImports = new Set(state.rootImports ?? [])
+
+    resetAgents()
+    plannedAgentCount = state.run.plannedAgentCount
+    state.agents.forEach((durable) => {
+      const restored = createHydratedAgent(durable)
+      restored.snapshotStateChangedAtMs = durable.snapshotStateChangedAtMs ?? recoveredAtMs
+      if (typeof durable.activeStartedAtMs === 'number') {
+        restored.elapsedMs = (durable.elapsedMs ?? 0) +
+          Math.max(0, recoveryAccountingCutoffMs - durable.activeStartedAtMs)
+      }
+      restored.activeStartedAtMs = undefined
+      restored.status = durable.status === 'complete' ? 'complete' : 'error'
+      restored.snapshotUrl = durable.snapshotUrl
+      restored.snapshotState = durable.snapshotState
+      if (
+        restored.snapshotState === 'queued' ||
+        restored.snapshotState === 'rendering' ||
+        restored.snapshotState === 'persisting'
+      ) {
+        const restoredSnapshotUrl = durable.lastGoodSnapshotUrl ?? durable.snapshotUrl
+        if (restoredSnapshotUrl !== undefined && restoredSnapshotUrl.length > 0) {
+          restored.snapshotState = 'ready'
+          restored.snapshotMessage = 'restored last good CAD snapshot after interrupted render'
+          restored.snapshotUrl = restoredSnapshotUrl
+        } else {
+          restored.snapshotState = 'error'
+          restored.snapshotMessage = 'controller recovery requires a fresh persisted visual'
+        }
+      }
+      if (
+        !agentKclReady(restored) &&
+        durable.lastGoodKcl !== undefined &&
+        stripImportLines(durable.lastGoodKcl).trim().length > 0
+      ) {
+        kclFiles.set(restored.filePath, durable.lastGoodKcl)
+        updateInterfaceManifest(restored, durable.lastGoodKcl)
+        if (durable.lastGoodSnapshotUrl !== undefined) {
+          restored.snapshotState = 'ready'
+          restored.snapshotMessage = 'restored last good CAD snapshot'
+          restored.snapshotUrl = durable.lastGoodSnapshotUrl
+        }
+        appendAgentLog(restored, '< controller restored last validated KCL after an empty update', 'in')
+      }
+      if (
+        restored.status === 'complete' &&
+        !isReusableLibraryAgent(restored) &&
+        (
+          restored.snapshotState !== 'ready' ||
+          typeof restored.snapshotUrl !== 'string' ||
+          restored.snapshotUrl.length === 0
+        )
+      ) {
+        restored.snapshotState = 'error'
+        restored.snapshotMessage = 'controller recovery requires a fresh persisted visual'
+      }
+    })
+    const restoredHistoricalElapsedMs = rootElapsedMs + Array.from(agents.values())
+      .reduce((total, agent) => total + (agent.elapsedMs ?? 0), 0)
+    if (aggregateElapsedFloorMs > restoredHistoricalElapsedMs) {
+      rootElapsedMs += aggregateElapsedFloorMs - restoredHistoricalElapsedMs
+    }
+
+    if (lastGoodCenterSnapshotDataUrl !== undefined) {
+      await replaceCenterWithStaticSnapshot(lastGoodCenterSnapshotDataUrl).catch(() => {})
+    }
+
+    if (state.run.phase === 'architecting' && state.agents.length === 0) {
+      rootLogLine('< controller recovered during architecture; restarting the persisted prompt', 'in')
+      void runZookeeper()
+      return
+    }
+
+    if (!['running', 'finalizing'].includes(state.run.phase) || agents.size === 0) {
+      active = false
+      runPhase = state.run.phase
+      rootStatus = state.run.rootStatus
+      root.dataset.runPhase = runPhase
+      root.dataset.rootStatus = rootStatus
+      centerStatus.textContent = state.run.centerStatus || 'Zookeeper ready'
+      requestWallCheckpoint()
+      return
+    }
+
+    const previousSessionId = state.run.sessionId
+    if (previousSessionId) {
+      await fetch('/api/zookeeper/session-close', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          sessionId: previousSessionId,
+          reason: 'controller recovery; cancel orphaned work before redispatch',
+        }),
+      }).catch(() => {})
+    }
+
+    runId += 1
+    active = true
+    startInProgress = false
+    runPhase = 'running'
+    rootStatus = 'running'
+    root.dataset.runPhase = runPhase
+    root.dataset.rootStatus = rootStatus
+    const recoveryBaseSessionId = (
+      previousSessionId.split('-recovery-')[0].slice(0, 80) || randomId()
+    )
+    activeSessionId = `${recoveryBaseSessionId}-recovery-${Date.now()}-${randomId().slice(0, 8)}`
+    runRequestAbort = new AbortController()
+    rootActiveStartedAtMs = Date.now()
+    centerStatus.textContent = 'Controller recovered - resuming unfinished agents'
+    rootLogLine(`< controller restored ${agents.size} agents from durable state`, 'in')
+    rootLogLine('< orphaned Zoo work cancelled; unfinished agents will be redispatched with persisted KCL', 'in')
+    synchronizeCompletedAssemblies()
+    const supervisorResumeAtMs = Date.now()
+    supervisorReviewAtMs.set(rootAgentId, supervisorResumeAtMs)
+    Array.from(agents.values())
+      .filter(agent => agent.kind === 'orchestrator')
+      .forEach(agent => supervisorReviewAtMs.set(agent.id, supervisorResumeAtMs))
+    startAggregateTimeTicker()
+    startRootSupervisor()
+    scheduleRootProjectSubmit()
+    requestWallCheckpoint()
+  }
+
+  const pollDurableDisplayState = async () => {
+    if (isControllerWindow || wallTileIndex === undefined) return
+    try {
+      const response = await fetch(
+        `/api/wall-state?tile=${wallTileIndex}&after=${hydratedWallRevision}`,
+        { cache: 'no-store' },
+      )
+      if (!response.ok) throw await httpErrorFromResponse(response, 'wall display state')
+      applyDurableDisplayState(await response.json() as DurableWallState)
+    } catch (error: unknown) {
+      centerStatus.textContent = `Display reconnecting: ${errorToMessage(error).slice(0, 100)}`
+    } finally {
+      window.setTimeout(() => void pollDurableDisplayState(), 1000)
+    }
+  }
+
   const handleWallBroadcast = (message: WallBroadcastMessage) => {
     if (isControllerWindow) return
 
@@ -5157,6 +7539,7 @@ document.addEventListener('DOMContentLoaded', () => {
       interfaceManifests = new Map()
       rootImports = new Set()
       rootLog.replaceChildren()
+      rootLogEntries = []
       setRunPhase('idle', 'queued')
       renderAllGraphs()
       return
@@ -5189,18 +7572,47 @@ document.addEventListener('DOMContentLoaded', () => {
       return
     }
 
+    if (message.type === 'runtime') {
+      runPhase = message.phase
+      rootStatus = message.rootStatus
+      root.dataset.runPhase = runPhase
+      root.dataset.rootStatus = rootStatus
+      root.dataset.completionBlockers = message.blockers ?? ''
+      if (message.aggregateTime !== undefined) aggregateTime.textContent = message.aggregateTime
+      if (message.centerStatus !== undefined) centerStatus.textContent = message.centerStatus
+      renderAllGraphs()
+      return
+    }
+
+    if (message.type === 'center:snapshot') {
+      if (wallTileIndex !== centerIndex) return
+      lastGoodCenterSnapshotDataUrl = message.snapshotUrl
+      void replaceCenterWithStaticSnapshot(message.snapshotUrl).catch(() => {})
+      return
+    }
+
     if (message.type === 'root:log') {
-      rootLogLine(message.line, message.direction)
+      if (wallTileIndex === centerIndex) {
+        rootLogEntries.push({ line: message.line, direction: message.direction })
+        if (rootLogEntries.length > 160) rootLogEntries = rootLogEntries.slice(-160)
+        writeLog(rootLog, message.line, message.direction, 160)
+      }
       return
     }
 
     if (message.type === 'agent:add') {
+      if (
+        wallTileIndex !== centerIndex &&
+        message.tileIndex !== wallTileIndex
+      ) return
       if (agents.has(message.agent.id)) return
-      addAgent({
+      createHydratedAgent({
         ...message.agent,
-        color: message.agent.color,
-        status: message.agent.status,
+        assignedTileIndex: message.tileIndex,
+        logs: [],
       })
+      layoutAgents()
+      renderAllGraphs()
       return
     }
 
@@ -5262,7 +7674,7 @@ document.addEventListener('DOMContentLoaded', () => {
     handleWallBroadcast(event.data)
   })
 
-  stopButton.addEventListener('click', () => {
+  const stopZookeeper = () => {
     if (!isControllerWindow) return
     runId += 1
     if (rootActiveStartedAtMs !== undefined) {
@@ -5278,6 +7690,8 @@ document.addEventListener('DOMContentLoaded', () => {
     kclFiles = new Map()
     interfaceManifests = new Map()
     rootImports = new Set()
+    rootLogEntries = []
+    aggregateElapsedFloorMs = 0
     centerViewerReloadAttempts = 0
     if (centerViewerHealthTimer !== undefined) {
       window.clearInterval(centerViewerHealthTimer)
@@ -5294,11 +7708,44 @@ document.addEventListener('DOMContentLoaded', () => {
     centerStatus.textContent = 'Zookeeper ready'
     setRunPhase('idle', 'queued')
     renderAllGraphs()
+    requestWallCheckpoint()
+  }
+
+  const sendWallCommand = async (type: 'start' | 'stop', prompt = '') => {
+    const response = await fetch('/api/wall-command', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ type, prompt }),
+    })
+    if (!response.ok) throw await httpErrorFromResponse(response, `wall ${type} command`)
+  }
+
+  stopButton.addEventListener('click', () => {
+    if (isControllerWindow) {
+      stopZookeeper()
+      return
+    }
+    stopButton.disabled = true
+    centerStatus.textContent = 'Stop requested'
+    void sendWallCommand('stop').catch((error: unknown) => {
+      centerStatus.textContent = `Stop request failed: ${errorToMessage(error).slice(0, 100)}`
+      stopButton.disabled = false
+    })
   })
 
   startButton.addEventListener('click', () => {
-    if (!isControllerWindow) return
-    void runZookeeper()
+    if (isControllerWindow) {
+      void runZookeeper()
+      return
+    }
+    startButton.disabled = true
+    startButton.textContent = 'Start requested...'
+    centerStatus.textContent = 'Waiting for wall controller'
+    void sendWallCommand('start', promptInput.value.trim() || defaultPrompt).catch((error: unknown) => {
+      centerStatus.textContent = `Start request failed: ${errorToMessage(error).slice(0, 100)}`
+      startButton.disabled = false
+      startButton.textContent = 'Start Zookeeper'
+    })
   })
 
   stopButton.disabled = true
@@ -5328,6 +7775,82 @@ document.addEventListener('DOMContentLoaded', () => {
   renderAllGraphs()
   layoutAgents()
 
+  const wallClientId = `${isControllerWindow ? 'controller' : `tile-${wallTileIndex}`}-${randomId()}`
+  const sendWallHeartbeat = () => {
+    void fetch('/api/wall-heartbeat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientId: wallClientId,
+        kind: isControllerWindow ? 'controller' : 'display',
+        tile: wallTileIndex,
+      }),
+    }).catch(() => {})
+    if (isControllerWindow) requestWallCheckpoint()
+  }
+  sendWallHeartbeat()
+  const wallHeartbeatTimer = window.setInterval(sendWallHeartbeat, 5000)
+
+  let wallCommandTimer: number | undefined
+  let wallCommandSequence = 0
+  let wallCommandInitialized = false
+  const controllerStartedAt = Date.now() / 1000
+  const pollWallCommands = async () => {
+    if (!isControllerWindow) return
+    try {
+      const response = await fetch(`/api/wall-command?after=${wallCommandSequence}`, {
+        cache: 'no-store',
+      })
+      if (!response.ok) throw await httpErrorFromResponse(response, 'wall command poll')
+      const payload = await response.json() as {
+        sequence: number,
+        commands: Array<{
+          sequence: number,
+          type: 'start' | 'stop' | 'reload-displays',
+          prompt: string,
+          createdAt: number,
+        }>,
+      }
+      for (const command of payload.commands) {
+        wallCommandSequence = Math.max(wallCommandSequence, command.sequence)
+        const freshAtStartup = command.createdAt >= controllerStartedAt - 10
+        if (!wallCommandInitialized && !freshAtStartup) continue
+        if (command.type === 'stop') {
+          stopZookeeper()
+          continue
+        }
+        if (command.type === 'start') {
+          if (active || startInProgress) {
+            rootLogLine('< ignored start command because a run is already active', 'in')
+            continue
+          }
+          promptInput.value = command.prompt.trim() || defaultPrompt
+          void runZookeeper()
+        }
+      }
+      wallCommandSequence = Math.max(wallCommandSequence, payload.sequence)
+      wallCommandInitialized = true
+    } catch (error: unknown) {
+      console.error('wall command poll failed', error)
+    } finally {
+      wallCommandTimer = window.setTimeout(() => void pollWallCommands(), 1000)
+    }
+  }
+
+  if (isControllerWindow) {
+    void restoreControllerState()
+      .catch((error: unknown) => {
+        centerStatus.textContent = `Controller restore failed: ${errorToMessage(error).slice(0, 100)}`
+        rootLogLine(`< controller restore failed: ${errorToMessage(error)}`)
+      })
+      .finally(() => {
+        requestWallCheckpoint()
+        void pollWallCommands()
+      })
+  } else {
+    void pollDurableDisplayState()
+  }
+
   window.addEventListener('resize', () => {
     const size = rootViewerSize()
     centerView.el.style.width = `${size.width}px`
@@ -5342,6 +7865,9 @@ document.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('pagehide', () => {
     if (pageDisposed) return
     pageDisposed = true
+    window.clearInterval(wallHeartbeatTimer)
+    if (wallCommandTimer !== undefined) window.clearTimeout(wallCommandTimer)
+    if (wallCheckpointTimer !== undefined) window.clearTimeout(wallCheckpointTimer)
     if (isControllerWindow) clearTimers()
     else {
       runRequestAbort?.abort()

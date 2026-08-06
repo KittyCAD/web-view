@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import base64
 import binascii
+import copy
+import gzip
 import hashlib
+import io
 import json
 import mimetypes
 import os
@@ -11,6 +14,7 @@ import shutil
 import socket
 import ssl
 import struct
+import subprocess
 import threading
 import time
 import traceback
@@ -38,6 +42,8 @@ WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 EVENT_QUEUES = {}
 EVENT_QUEUES_LOCK = threading.Lock()
 EVENT_QUEUE_WARNED = set()
+EVENT_STREAM_GENERATIONS = {}
+EVENT_STREAM_LOCKS = {}
 SESSION_WORK = {}
 SESSION_WORK_LOCK = threading.Lock()
 SESSION_CONTEXT = threading.local()
@@ -52,17 +58,24 @@ SNAPSHOT_MAX_TOTAL_BYTES = max(
     MAX_SNAPSHOT_BYTES,
     int(os.environ.get("WALL_SNAPSHOT_MAX_TOTAL_BYTES", str(512 * 1024 * 1024))),
 )
-WALL_MAX_AGENTS = max(1, int(os.environ.get("WALL_MAX_AGENTS", "48")))
-EVENT_QUEUE_MAX = max(64, int(os.environ.get("WALL_EVENT_QUEUE_MAX", "256")))
-EVENT_QUEUE_RESERVED_FINALS = min(EVENT_QUEUE_MAX // 2, WALL_MAX_AGENTS + 16)
+_wall_max_agents = os.environ.get("WALL_MAX_AGENTS", "").strip().lower()
+WALL_MAX_AGENTS = (
+    None
+    if _wall_max_agents in {"", "0", "none", "unlimited"}
+    else max(1, int(_wall_max_agents))
+)
+EVENT_QUEUE_MAX = max(64, int(os.environ.get("WALL_EVENT_QUEUE_MAX", "2048")))
+EVENT_QUEUE_RESERVED_FINALS = min(EVENT_QUEUE_MAX // 2, 64)
 ZOOKEEPER_TEXT_BUFFER_MAX = max(100000, int(os.environ.get("WALL_ZOOKEEPER_TEXT_BUFFER_MAX", "1000000")))
 MAX_KCL_CHARS = max(100000, int(os.environ.get("WALL_MAX_KCL_CHARS", "1000000")))
 MAX_WEBSOCKET_MESSAGE_BYTES = max(
     1024 * 1024,
     int(os.environ.get("WALL_MAX_WEBSOCKET_MESSAGE_BYTES", str(16 * 1024 * 1024))),
 )
-ZOOKEEPER_REVIEW_TIMEOUT = max(60, int(os.environ.get("WALL_ZOOKEEPER_REVIEW_TIMEOUT", "600")))
-ZOOKEEPER_REVIEW_IDLE_TIMEOUT = max(30, int(os.environ.get("WALL_ZOOKEEPER_REVIEW_IDLE_TIMEOUT", "120")))
+ZOOKEEPER_REVIEW_TIMEOUT = max(60, int(os.environ.get("WALL_ZOOKEEPER_REVIEW_TIMEOUT", "1200")))
+ZOOKEEPER_REVIEW_IDLE_TIMEOUT = max(30, int(os.environ.get("WALL_ZOOKEEPER_REVIEW_IDLE_TIMEOUT", "600")))
+ZOOKEEPER_WORK_TIMEOUT = max(300, int(os.environ.get("WALL_ZOOKEEPER_WORK_TIMEOUT", "3600")))
+ZOOKEEPER_WORK_IDLE_TIMEOUT = max(30, int(os.environ.get("WALL_ZOOKEEPER_WORK_IDLE_TIMEOUT", "600")))
 REVIEW_CONCURRENCY = max(1, int(os.environ.get("WALL_REVIEW_CONCURRENCY", "2")))
 EVENT_LOG_MAX_BYTES = max(1024 * 1024, int(os.environ.get("WALL_EVENT_LOG_MAX_BYTES", str(32 * 1024 * 1024))))
 EVENT_LOG_BACKUPS = max(1, int(os.environ.get("WALL_EVENT_LOG_BACKUPS", "3")))
@@ -89,6 +102,64 @@ TRACE_LOCK = threading.Lock()
 PROJECT_LOCK = threading.Lock()
 SNAPSHOT_LOCK = threading.Lock()
 REVIEW_SEMAPHORE = threading.BoundedSemaphore(REVIEW_CONCURRENCY)
+SNAPSHOT_RENDER_JOBS = {}
+SNAPSHOT_RENDER_JOBS_LOCK = threading.Lock()
+SNAPSHOT_DISPLAY_LOCK = threading.Lock()
+SNAPSHOT_DISPLAYS = set()
+SNAPSHOT_RENDER_TIMEOUT = max(
+    45,
+    int(os.environ.get("WALL_SNAPSHOT_RENDER_TIMEOUT", "100")),
+)
+SNAPSHOT_CENTER_RENDER_TIMEOUT = max(
+    SNAPSHOT_RENDER_TIMEOUT,
+    int(os.environ.get("WALL_SNAPSHOT_CENTER_RENDER_TIMEOUT", "660")),
+)
+SNAPSHOT_SUBMIT_TIMEOUT = max(
+    45,
+    int(os.environ.get("WALL_SNAPSHOT_SUBMIT_TIMEOUT", "85")),
+)
+SNAPSHOT_CENTER_SUBMIT_TIMEOUT = max(
+    SNAPSHOT_SUBMIT_TIMEOUT,
+    int(os.environ.get("WALL_SNAPSHOT_CENTER_SUBMIT_TIMEOUT", "600")),
+)
+SNAPSHOT_LARGE_PROJECT_BYTES = max(
+    128 * 1024,
+    int(os.environ.get("WALL_SNAPSHOT_LARGE_PROJECT_BYTES", str(160 * 1024))),
+)
+SNAPSHOT_LARGE_RENDER_TIMEOUT = max(
+    SNAPSHOT_RENDER_TIMEOUT,
+    int(os.environ.get("WALL_SNAPSHOT_LARGE_RENDER_TIMEOUT", "260")),
+)
+SNAPSHOT_LARGE_SUBMIT_TIMEOUT = max(
+    SNAPSHOT_SUBMIT_TIMEOUT,
+    int(os.environ.get("WALL_SNAPSHOT_LARGE_SUBMIT_TIMEOUT", "240")),
+)
+CHROME_BIN = os.environ.get("WALL_CHROME_BIN", "/usr/bin/google-chrome")
+XVFB_BIN = os.environ.get("WALL_XVFB_BIN", "/usr/bin/Xvfb")
+CORS_ORIGIN = os.environ.get("WALL_CORS_ORIGIN", "").strip()
+WALL_PID_PATH = Path(
+    os.environ.get("WALL_PID_PATH", Path.cwd() / "wall-server.pid")
+).resolve()
+WALL_STATE_PATH = Path(
+    os.environ.get("WALL_STATE_PATH", LOG_DIR / "wall-state.json")
+).resolve()
+WALL_STATE_MAX_BYTES = max(
+    16 * 1024 * 1024,
+    int(os.environ.get("WALL_STATE_MAX_BYTES", str(128 * 1024 * 1024))),
+)
+WALL_STATE_LOCK = threading.RLock()
+WALL_STATE = {}
+WALL_STATE_LOADED = False
+WALL_COMMAND_LOCK = threading.Lock()
+WALL_COMMANDS = deque(maxlen=128)
+WALL_COMMAND_SEQUENCE = 0
+WALL_HEARTBEAT_LOCK = threading.Lock()
+WALL_HEARTBEATS = {}
+SNAPSHOT_RENDER_CONCURRENCY = max(
+    1,
+    int(os.environ.get("WALL_SNAPSHOT_RENDER_CONCURRENCY", "2")),
+)
+SNAPSHOT_RENDER_SEMAPHORE = threading.BoundedSemaphore(SNAPSHOT_RENDER_CONCURRENCY)
 
 
 class SessionCancelled(RuntimeError):
@@ -186,6 +257,11 @@ def sanitize_text(value, fallback):
     return (text or fallback)[:220]
 
 
+def sanitize_review_text(value, fallback, max_chars=2000):
+    text = re.sub(r"\s+", " ", str(value or fallback)).strip()
+    return (text or fallback)[:max_chars]
+
+
 def sanitize_dialog_text(value, fallback):
     """Keep the hosted Zookeeper's reasoning intact for the wall feed."""
     text = re.sub(r"\s+", " ", str(value or fallback)).strip()
@@ -250,6 +326,245 @@ def unique_list(values):
 
 def utc_timestamp():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def default_wall_state():
+    return {
+        "version": 1,
+        "revision": 0,
+        "updatedAt": utc_timestamp(),
+        "controllerHeartbeatAt": 0,
+        "run": {
+            "phase": "idle",
+            "rootStatus": "queued",
+            "prompt": "",
+            "sessionId": "",
+            "source": "fallback",
+            "rootInstruction": "",
+            "plannedAgentCount": 0,
+            "rootElapsedMs": 0,
+            "rootActiveStartedAtMs": None,
+            "aggregateTime": "Aggregate Agent Time: 0s",
+            "centerStatus": "Zookeeper ready",
+            "centerSnapshotUrl": "",
+            "completionBlockers": "",
+        },
+        "agents": [],
+        "files": {},
+        "interfaces": {},
+        "rootImports": [],
+        "rootLogs": [],
+    }
+
+
+def ensure_wall_state_loaded():
+    global WALL_STATE, WALL_STATE_LOADED
+    with WALL_STATE_LOCK:
+        if WALL_STATE_LOADED:
+            return
+        state = default_wall_state()
+        try:
+            if WALL_STATE_PATH.is_file():
+                loaded = json.loads(WALL_STATE_PATH.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict) and loaded.get("version") == 1:
+                    state.update(loaded)
+        except (OSError, ValueError, TypeError):
+            pass
+        WALL_STATE = state
+        WALL_STATE_LOADED = True
+
+
+def persist_wall_state_file(state):
+    WALL_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = WALL_STATE_PATH.with_name(
+        f".{WALL_STATE_PATH.name}.{uuid.uuid4().hex[:8]}.tmp"
+    )
+    try:
+        temporary.write_text(
+            json.dumps(state, separators=(",", ":"), sort_keys=True),
+            encoding="utf-8",
+        )
+        os.replace(temporary, WALL_STATE_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def normalize_wall_state(body):
+    raw_state = body.get("state") if isinstance(body, dict) else None
+    if not isinstance(raw_state, dict):
+        raise RuntimeError("wall state checkpoint requires a state object")
+    encoded_size = len(json.dumps(raw_state, separators=(",", ":")).encode("utf-8"))
+    if encoded_size > WALL_STATE_MAX_BYTES:
+        raise RequestBodyTooLarge(
+            f"wall state checkpoint exceeds {WALL_STATE_MAX_BYTES} bytes"
+        )
+
+    state = default_wall_state()
+    run = raw_state.get("run")
+    agents = raw_state.get("agents")
+    files = raw_state.get("files")
+    interfaces = raw_state.get("interfaces")
+    root_imports = raw_state.get("rootImports")
+    root_logs = raw_state.get("rootLogs")
+    if isinstance(run, dict):
+        state["run"].update(run)
+    state["agents"] = agents if isinstance(agents, list) else []
+    state["files"] = files if isinstance(files, dict) else {}
+    state["interfaces"] = interfaces if isinstance(interfaces, dict) else {}
+    state["rootImports"] = root_imports if isinstance(root_imports, list) else []
+    state["rootLogs"] = root_logs[-160:] if isinstance(root_logs, list) else []
+    try:
+        state["controllerHeartbeatAt"] = float(
+            raw_state.get("controllerHeartbeatAt") or time.time()
+        )
+    except (TypeError, ValueError):
+        state["controllerHeartbeatAt"] = time.time()
+    return state, encoded_size
+
+
+def save_wall_state(body):
+    global WALL_STATE
+    ensure_wall_state_loaded()
+    state, encoded_size = normalize_wall_state(body)
+    with WALL_STATE_LOCK:
+        revision = int(WALL_STATE.get("revision") or 0) + 1
+        state["revision"] = revision
+        state["updatedAt"] = utc_timestamp()
+        persist_wall_state_file(state)
+        WALL_STATE = state
+    if revision == 1 or revision % 30 == 0:
+        log_event("wall.state.saved", {
+            "revision": revision,
+            "bytes": encoded_size,
+            "phase": state["run"].get("phase"),
+            "agents": len(state["agents"]),
+        })
+    return {
+        "ok": True,
+        "revision": revision,
+        "bytes": encoded_size,
+    }
+
+
+def wall_state_for_client(tile=None, controller=False, after=0):
+    ensure_wall_state_loaded()
+    with WALL_STATE_LOCK:
+        revision = int(WALL_STATE.get("revision") or 0)
+        if revision <= after:
+            return {"version": 1, "revision": revision, "unchanged": True}
+        state = copy.deepcopy(WALL_STATE)
+
+    if controller:
+        return state
+
+    agents = state.get("agents") if isinstance(state.get("agents"), list) else []
+    if tile == 4:
+        state["agents"] = [
+            {**agent, "logs": []}
+            for agent in agents
+            if isinstance(agent, dict)
+        ]
+    elif tile is not None:
+        state["agents"] = [
+            agent
+            for agent in agents
+            if (
+                isinstance(agent, dict) and
+                int(agent.get("assignedTileIndex", -1)) == tile
+            )
+        ]
+    else:
+        state["agents"] = []
+    state["files"] = {}
+    state["interfaces"] = {}
+    state["rootImports"] = []
+    return state
+
+
+def enqueue_wall_command(body):
+    global WALL_COMMAND_SEQUENCE
+    command_type = sanitize_text(body.get("type"), "")[:32]
+    if command_type not in {"start", "stop", "reload-displays"}:
+        raise RuntimeError(f"unsupported wall command: {command_type or 'missing'}")
+    with WALL_COMMAND_LOCK:
+        WALL_COMMAND_SEQUENCE += 1
+        command = {
+            "sequence": WALL_COMMAND_SEQUENCE,
+            "type": command_type,
+            "prompt": str(body.get("prompt") or "")[:20000],
+            "createdAt": time.time(),
+        }
+        WALL_COMMANDS.append(command)
+    log_event("wall.command", {
+        "sequence": command["sequence"],
+        "type": command_type,
+    })
+    return {"ok": True, **command}
+
+
+def wall_commands_after(after):
+    with WALL_COMMAND_LOCK:
+        return {
+            "sequence": WALL_COMMAND_SEQUENCE,
+            "commands": [
+                copy.deepcopy(command)
+                for command in WALL_COMMANDS
+                if int(command.get("sequence") or 0) > after
+            ],
+        }
+
+
+def record_wall_heartbeat(body):
+    client_id = sanitize_text(body.get("clientId"), "")[:80]
+    if not client_id:
+        raise RuntimeError("wall heartbeat requires a client id")
+    heartbeat = {
+        "clientId": client_id,
+        "kind": sanitize_text(body.get("kind"), "display")[:32],
+        "tile": body.get("tile"),
+        "pid": body.get("pid"),
+        "time": time.time(),
+    }
+    with WALL_HEARTBEAT_LOCK:
+        stale_before = heartbeat["time"] - 300
+        for stale_id in [
+            key
+            for key, value in WALL_HEARTBEATS.items()
+            if float(value.get("time") or 0) < stale_before
+        ]:
+            WALL_HEARTBEATS.pop(stale_id, None)
+        WALL_HEARTBEATS[client_id] = heartbeat
+    return {"ok": True, "serverTime": heartbeat["time"]}
+
+
+def wall_health():
+    ensure_wall_state_loaded()
+    now = time.time()
+    with WALL_STATE_LOCK:
+        controller_heartbeat = float(
+            WALL_STATE.get("controllerHeartbeatAt") or 0
+        )
+        revision = int(WALL_STATE.get("revision") or 0)
+        phase = str((WALL_STATE.get("run") or {}).get("phase") or "idle")
+    with WALL_HEARTBEAT_LOCK:
+        heartbeats = copy.deepcopy(WALL_HEARTBEATS)
+    return {
+        "ok": True,
+        "serverTime": now,
+        "stateRevision": revision,
+        "phase": phase,
+        "controllerHeartbeatAgeSeconds": (
+            None if controller_heartbeat <= 0 else max(0, now - controller_heartbeat)
+        ),
+        "clients": [
+            {
+                **heartbeat,
+                "ageSeconds": max(0, now - float(heartbeat.get("time") or 0)),
+            }
+            for heartbeat in heartbeats.values()
+        ],
+        "snapshotRenderConcurrency": SNAPSHOT_RENDER_CONCURRENCY,
+    }
 
 
 def clip_for_log(value, max_string=100000):
@@ -401,6 +716,269 @@ def persist_snapshot(body):
         "revision": revision,
     })
     return {"url": f"/snapshots/{urllib.parse.quote(filename)}?v={revision}"}
+
+
+def normalize_snapshot_render_project(body):
+    files = body.get("files")
+    main_file_path = sanitize_text(body.get("mainFilePath"), "")
+    if not isinstance(files, dict) or not files:
+        raise RuntimeError("snapshot render project must include KCL files")
+    normalized_files = {}
+    total_bytes = 0
+    for raw_path, raw_source in files.items():
+        file_path = str(raw_path).strip()
+        source = str(raw_source)
+        pure_path = PurePosixPath(file_path)
+        if (
+            not file_path or
+            pure_path.is_absolute() or
+            ".." in pure_path.parts or
+            not file_path.endswith(".kcl")
+        ):
+            raise RuntimeError(f"invalid snapshot KCL path: {file_path!r}")
+        total_bytes += len(file_path.encode("utf-8")) + len(source.encode("utf-8"))
+        if total_bytes > MAX_REQUEST_BYTES:
+            raise RequestBodyTooLarge(
+                f"snapshot render project exceeds {MAX_REQUEST_BYTES} bytes"
+            )
+        normalized_files[file_path] = source
+    if main_file_path not in normalized_files:
+        raise RuntimeError("snapshot main KCL path is missing from project files")
+    return {
+        "files": normalized_files,
+        "mainFilePath": main_file_path,
+        "label": sanitize_text(body.get("label"), "snapshot")[:200],
+        "bytes": total_bytes,
+    }
+
+
+def snapshot_render_job(job_id):
+    with SNAPSHOT_RENDER_JOBS_LOCK:
+        job = SNAPSHOT_RENDER_JOBS.get(job_id)
+        if job is None:
+            raise RuntimeError("snapshot render job was not found")
+        return job["project"]
+
+
+def complete_snapshot_render_job(body):
+    job_id = sanitize_text(body.get("jobId"), "")
+    if not job_id:
+        raise RuntimeError("snapshot render completion requires a job id")
+    data_url = str(body.get("dataUrl") or "")
+    error = sanitize_text(body.get("error"), "")[:2000]
+    if not error:
+        if not data_url.startswith("data:image/webp;base64,"):
+            raise RuntimeError("snapshot renderer returned an invalid image")
+        if len(data_url) > MAX_SNAPSHOT_BYTES * 2:
+            raise RuntimeError("snapshot renderer image exceeds the configured limit")
+    with SNAPSHOT_RENDER_JOBS_LOCK:
+        job = SNAPSHOT_RENDER_JOBS.get(job_id)
+        if job is None:
+            raise RuntimeError("snapshot render job has expired")
+        job["result"] = {
+            "dataUrl": data_url,
+            "error": error,
+        }
+        job["event"].set()
+    return {"ok": True, "jobId": job_id}
+
+
+def reserve_snapshot_display(job_id):
+    preferred = 90 + (int(job_id[:4], 16) % 900)
+    with SNAPSHOT_DISPLAY_LOCK:
+        for offset in range(900):
+            display_number = 90 + ((preferred - 90 + offset) % 900)
+            if display_number in SNAPSHOT_DISPLAYS:
+                continue
+            if Path(f"/tmp/.X11-unix/X{display_number}").exists():
+                continue
+            SNAPSHOT_DISPLAYS.add(display_number)
+            return display_number
+    raise RuntimeError("no isolated snapshot display number is available")
+
+
+def release_snapshot_display(display_number):
+    with SNAPSHOT_DISPLAY_LOCK:
+        SNAPSHOT_DISPLAYS.discard(display_number)
+
+
+def render_snapshot_isolated(body):
+    project = normalize_snapshot_render_project(body)
+    is_center_snapshot = project["label"].startswith("center ")
+    is_large_snapshot = project["bytes"] >= SNAPSHOT_LARGE_PROJECT_BYTES
+    submit_timeout = (
+        SNAPSHOT_CENTER_SUBMIT_TIMEOUT
+        if is_center_snapshot
+        else SNAPSHOT_LARGE_SUBMIT_TIMEOUT
+        if is_large_snapshot
+        else SNAPSHOT_SUBMIT_TIMEOUT
+    )
+    render_timeout = (
+        SNAPSHOT_CENTER_RENDER_TIMEOUT
+        if is_center_snapshot
+        else SNAPSHOT_LARGE_RENDER_TIMEOUT
+        if is_large_snapshot
+        else SNAPSHOT_RENDER_TIMEOUT
+    )
+    job_id = uuid.uuid4().hex
+    completion = threading.Event()
+    job = {
+        "project": {
+            "files": project["files"],
+            "mainFilePath": project["mainFilePath"],
+            "submitTimeoutMs": submit_timeout * 1000,
+        },
+        "event": completion,
+        "result": None,
+    }
+    profile_dir = Path(f"/tmp/zoo-wall-snapshot-profile-{job_id}")
+    cache_dir = Path(f"/tmp/zoo-wall-snapshot-cache-{job_id}")
+    display_number = reserve_snapshot_display(job_id)
+    display_name = f":{display_number}"
+    display_socket = Path(f"/tmp/.X11-unix/X{display_number}")
+    process = None
+    xvfb_process = None
+    renderer_log = None
+    started_at = time.monotonic()
+    with SNAPSHOT_RENDER_SEMAPHORE:
+        with SNAPSHOT_RENDER_JOBS_LOCK:
+            SNAPSHOT_RENDER_JOBS[job_id] = job
+        try:
+            if not Path(CHROME_BIN).is_file():
+                raise RuntimeError(f"snapshot Chrome binary was not found at {CHROME_BIN}")
+            if not Path(XVFB_BIN).is_file():
+                raise RuntimeError(f"snapshot Xvfb binary was not found at {XVFB_BIN}")
+            profile_dir.mkdir(parents=True, exist_ok=False)
+            cache_dir.mkdir(parents=True, exist_ok=False)
+            renderer_log_path = LOG_DIR / "snapshot-renderer.log"
+            renderer_log_path.parent.mkdir(parents=True, exist_ok=True)
+            renderer_log = renderer_log_path.open("ab", buffering=0)
+            xvfb_process = subprocess.Popen(
+                [
+                    XVFB_BIN,
+                    display_name,
+                    "-screen",
+                    "0",
+                    "1280x720x24",
+                    "-nolisten",
+                    "tcp",
+                    "-noreset",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=renderer_log,
+                stderr=renderer_log,
+                start_new_session=True,
+            )
+            for _ in range(100):
+                if display_socket.exists():
+                    break
+                if xvfb_process.poll() is not None:
+                    raise RuntimeError("isolated snapshot Xvfb exited before becoming ready")
+                time.sleep(0.05)
+            else:
+                raise RuntimeError("isolated snapshot Xvfb did not become ready")
+            snapshot_url = (
+                f"http://127.0.0.1:{PORT}/?"
+                f"snapshotJob={urllib.parse.quote(job_id)}"
+            )
+            command = [
+                CHROME_BIN,
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-accelerated-video-decode",
+                "--disable-accelerated-2d-canvas",
+                "--disable-background-networking",
+                "--disable-features=Translate,AutofillServerCommunication,OptimizationHints",
+                "--disable-session-crashed-bubble",
+                "--hide-crash-restore-bubble",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--no-proxy-server",
+                "--password-store=basic",
+                "--force-device-scale-factor=1",
+                "--autoplay-policy=no-user-gesture-required",
+                f"--user-data-dir={profile_dir}",
+                f"--disk-cache-dir={cache_dir}",
+                "--window-position=0,0",
+                f"--window-size=1280,720",
+                f"--app={snapshot_url}",
+            ]
+            process_env = os.environ.copy()
+            process_env["DISPLAY"] = display_name
+            process_env["XDG_RUNTIME_DIR"] = "/run/user/1000"
+            process_env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/run/user/1000/bus"
+            process_env.pop("XAUTHORITY", None)
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=renderer_log,
+                stderr=renderer_log,
+                env=process_env,
+                start_new_session=True,
+            )
+            renderer_log.close()
+            renderer_log = None
+            if not completion.wait(render_timeout):
+                raise RuntimeError(
+                    f"isolated snapshot renderer timed out after {render_timeout}s"
+                )
+            result = job["result"]
+            if not isinstance(result, dict):
+                raise RuntimeError("isolated snapshot renderer returned no result")
+            if result.get("error"):
+                raise RuntimeError(str(result["error"]))
+            data_url = str(result.get("dataUrl") or "")
+            if not data_url:
+                raise RuntimeError("isolated snapshot renderer returned no image")
+            snapshot_id = sanitize_text(
+                body.get("snapshotId"),
+                project["label"] or job_id,
+            )
+            persisted = persist_snapshot({
+                "agentId": snapshot_id,
+                "dataUrl": data_url,
+            })
+            log_event("snapshot.rendered", {
+                "jobId": job_id,
+                "label": project["label"],
+                "projectBytes": project["bytes"],
+                "durationMs": int((time.monotonic() - started_at) * 1000),
+                "imageChars": len(data_url),
+                "url": persisted["url"],
+            })
+            return {"url": persisted["url"]}
+        except Exception as error:
+            log_event("snapshot.render_error", {
+                "jobId": job_id,
+                "label": project["label"],
+                "projectBytes": project["bytes"],
+                "durationMs": int((time.monotonic() - started_at) * 1000),
+                "error": str(error),
+                "errorType": type(error).__name__,
+            })
+            raise
+        finally:
+            with SNAPSHOT_RENDER_JOBS_LOCK:
+                SNAPSHOT_RENDER_JOBS.pop(job_id, None)
+            if renderer_log is not None:
+                renderer_log.close()
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            if xvfb_process is not None and xvfb_process.poll() is None:
+                xvfb_process.terminate()
+                try:
+                    xvfb_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    xvfb_process.kill()
+                    xvfb_process.wait(timeout=5)
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            release_snapshot_display(display_number)
 
 
 def directory_size(path):
@@ -605,6 +1183,14 @@ def strip_import_lines(kcl):
         line for line in str(kcl or "").splitlines()
         if not line.strip().startswith("import ")
     )
+
+
+def has_executable_kcl_body(kcl):
+    body = strip_import_lines(kcl)
+    body = re.sub(r"/\*.*?\*/", "", body, flags=re.DOTALL)
+    body = re.sub(r"//.*", "", body)
+    body = re.sub(r"^\s*@\w+.*$", "", body, flags=re.MULTILINE)
+    return bool(body.strip())
 
 
 def strip_markdown_fences(value):
@@ -992,7 +1578,9 @@ def planner_instructions(agents_instruction, root_only=False):
         "Use scope=shared_part for reusable primitive hardware that should exist once and be imported/cloned by multiple assemblies: bolt, screw, washer, pin, bushing, bearing, spacer, nut, clip, etc.",
         "Shared part workers must be singular canonical files such as role='M4 socket head bolt' or role='flanged bearing', never role='bolt set', 'fastener set', 'hardware pack', or a KCL file containing many repeated instances.",
         "If several sub-assemblies need the same shared part, list that shared part worker key in each consuming orchestrator's imports array. The orchestrator places repeated instances with clone/translate/rotate; the shared worker only models one reusable part.",
-        "Use imports for shared component reuse and for cross-subassembly references. Imports must contain agent keys, not file paths.",
+        "Use imports only for existing scope=shared_part component reuse. Never import sibling, parent, ancestor, or unrelated orchestrator assemblies.",
+        "Describe cross-subassembly interfaces and dependencies in the instruction instead of imports; the root orchestrator owns placement of top-level assemblies.",
+        "Imports must contain shared-part agent keys, not file paths.",
         "Each instruction should include concrete dimensional/interface context: local axes, expected mate points, neighboring parts, and what the parent orchestrator expects back.",
         "Keep roles short, physical, and suitable as graph labels.",
         *([
@@ -1419,13 +2007,39 @@ def begin_session_work(session_id, work_id):
 
 
 def finish_session_work(session_id, work_id):
+    active_work_ids = []
+    cancelled = False
     with SESSION_WORK_LOCK:
         session = SESSION_WORK.get(session_id)
         if session is None:
             return
         session["workIds"].discard(work_id)
+        cancelled = session["cancelEvent"].is_set()
+        active_work_ids = sorted(session["workIds"])
         if not session["workIds"]:
             SESSION_WORK.pop(session_id, None)
+    if not cancelled:
+        publish_event(session_id, {
+            "type": "work-status",
+            "sessionId": session_id,
+            "workIds": active_work_ids,
+        })
+
+
+def session_work_status(session_id, work_id):
+    key = sanitize_text(session_id, "default")
+    target_work_id = sanitize_text(work_id, "")
+    with SESSION_WORK_LOCK:
+        session = SESSION_WORK.get(key)
+        active_work_ids = set(session["workIds"]) if session is not None else set()
+    return {
+        "ok": True,
+        "sessionId": key,
+        "workId": target_work_id,
+        "active": bool(target_work_id and target_work_id in active_work_ids),
+        "activeWork": len(active_work_ids),
+        "workIds": sorted(active_work_ids),
+    }
 
 
 def close_session(body):
@@ -1441,6 +2055,9 @@ def close_session(body):
     with EVENT_QUEUES_LOCK:
         EVENT_QUEUES.pop(session_id, None)
         EVENT_QUEUE_WARNED.discard(session_id)
+        EVENT_STREAM_GENERATIONS[session_id] = (
+            EVENT_STREAM_GENERATIONS.get(session_id, 0) + 1
+        )
     log_event("session.closed", {
         "sessionId": session_id,
         "reason": reason,
@@ -1457,8 +2074,8 @@ def zookeeper_turn(
     user_message,
     current_files,
     project_name,
-    timeout=300,
-    idle_timeout=None,
+    timeout=ZOOKEEPER_WORK_TIMEOUT,
+    idle_timeout=ZOOKEEPER_WORK_IDLE_TIMEOUT,
     stop_on_kcl=False,
     stop_when=None,
     on_kcl=None,
@@ -1628,16 +2245,66 @@ def build_zookeeper_agent_prompt(body, agent, current_kcl, imports, render_error
     interface_context = format_interface_context(body.get("interfaces"))
     agents_instruction = wall_agents_instruction()
     repair_text = (
-        f"\nRenderer error from the wall viewer that must be repaired:\n{render_error}\n"
+        "MANDATORY CURRENT ACCEPTANCE FAILURE: Repair this exact failure before doing any "
+        "additional inspection, cleanup, formatting, or visual polish. Do not return the "
+        "current geometry unchanged.\n"
+        f"{render_error}\n"
         if render_error else ""
     )
+    # Geometry review instructions include the precise defect first, followed by
+    # bounded parent KCL context. The generic 220-character sanitizer can cut the
+    # defect off behind the import-frame preamble and leave Zookeeper repairing
+    # without the measured coordinates.
+    review_instruction = sanitize_review_text(
+        body.get("reviewInstruction"),
+        "",
+        max_chars=24000,
+    )
     review_text = (
-        f"\nParent orchestrator visual review requested this rework:\n{sanitize_text(body.get('reviewInstruction'), '')}\n"
-        if body.get("reviewInstruction") else ""
+        "MANDATORY VISUAL REVIEW OVERRIDE: Apply this instruction before every generic "
+        "placement or modeling rule below. It may require deleting, hiding, or leaving an "
+        "import unused; do not preserve a reviewed defect merely to place every import.\n"
+        f"{review_instruction}\n"
+        if review_instruction else ""
+    )
+    review_precedence = (
+        "MANDATORY REVIEW PRECEDENCE: The visual-review measurements and corrections replace "
+        "any conflicting values in the original assigned instruction and current KCL. For "
+        "example, if review says to shorten or reroute a nominal-length part, do not preserve "
+        "the older nominal length as a secondary goal. Satisfy the reviewed endpoint mates, "
+        "route dimensions, and acceptance limits exactly."
+        if review_instruction else ""
+    )
+    review_confirmation = (
+        "Before finalizing, re-read the mandatory visual review override and verify that every "
+        "requested deletion, route correction, or placement correction is present in main.kcl."
+        if review_instruction else ""
+    )
+    transport_retry_attempt = int(clamp(
+        float(body.get("transportRetryAttempt") or 0),
+        0,
+        8,
+    ))
+    transport_recovery_text = (
+        "MANDATORY TRANSPORT RECOVERY: This is reconnect attempt "
+        f"{transport_retry_attempt}. The current main.kcl is the retained checkpoint from the "
+        "interrupted turn. Do not restart discovery, re-derive already documented transforms, "
+        "re-read the full project, check constraints, or request snapshots. Inspect current "
+        "main.kcl first, run at most one mock execution, repair only a concrete syntax or "
+        "execution error if one exists, then immediately use EditKclCode once to write the "
+        "retained or repaired KCL before returning, even when it is unchanged. A file that "
+        "contains only imports, settings, or comments has no renderable body and is a concrete "
+        "failure even if mock execution succeeds; compose every available direct-child alias "
+        "into one final renderable aggregate in that case."
+        if transport_retry_attempt > 0 else ""
     )
     if kind == "orchestrator":
         return "\n".join([
             f"You are {name}, running as a hosted Zoo Zookeeper in auto mode.",
+            repair_text,
+            review_text,
+            review_precedence,
+            transport_recovery_text,
             agents_instruction,
             "You are an assembly orchestrator. Your job is placement only.",
             f"Assembly prompt: {assembly_prompt}",
@@ -1647,7 +2314,7 @@ def build_zookeeper_agent_prompt(body, agent, current_kcl, imports, render_error
             f"Assigned instruction: {instruction}",
             "Edit the provided project file named main.kcl.",
             "You may import child components with aliases, clone imported components, hide raw imports, and use translate(), rotate(), scale(), and appearance() to place components.",
-            "This is an incremental assembly update. Place every currently available imported child now; do not wait for pending children and do not invent stand-ins for them.",
+            "This is an incremental assembly update. Place every currently available imported child unless the mandatory visual review identifies that child as redundant or unsupported. In that case, remove it from the final aggregate and leave its import unused; do not place it merely because it exists.",
             "You own symmetry and repeated placement. Use clone() plus explicit translate/rotate/scale transforms to create bilateral mirrored placements, radial patterns, linear arrays, and repeated hardware from one canonical imported part.",
             "Do not ask workers to generate a bolt set, left/right set, rib array, fin pair, washer pack, or other repeated placement. Workers provide one canonical part unless the geometry is truly handed; this orchestrator clones and places the instances.",
             "For mirrored placements, document the mirror plane or symmetry axis and use explicit transforms that a reviewer can audit from the KCL. For radial/linear patterns, document count, spacing/angle, source alias, and target mate points.",
@@ -1660,20 +2327,24 @@ def build_zookeeper_agent_prompt(body, agent, current_kcl, imports, render_error
             "When an imported alias is a shared reusable component such as a bolt, screw, washer, pin, bearing, or spacer, clone that one canonical component into each required placement. The count and placement of repeated hardware belongs in this orchestrator file, not in the shared part file.",
             "For every shared reusable component import you place, include a concise comment near the placement in the form // BOM: <quantity>x <alias> (<role>) so the wall graph can display the bill of materials.",
             "Read the child KCL files and interface manifests before selecting transforms. Place by aligning named mate points, local axes, bounding boxes, and dimensions; do not guess directions or distances from the render alone.",
+            "Never pass an imported alias typed as [any; N] into translate(), rotate(), scale(), clone(), or appearance(). A flattened heterogeneous aggregate already in this parent's frame must remain at identity.",
             "Maintain a // ZOOKEEPER_INTERFACE block for this assembled file with units, local_origin, local_axes, bbox_mm, mate_points, child_placements, reused_components, and placement_warnings.",
             "The wall server preserves import lines from the current file, so write the placement body that references those aliases.",
             f"Placement/review attempt: {attempt}",
-            repair_text,
-            review_text,
             "Existing import lines and aliases available to place:",
             imports or "(none)",
             "Current interface manifests from child/sub-assembly files:",
             interface_context or "(none yet; inspect child KCL files directly and write placement_warnings for missing manifests)",
             "Current placement body:",
             strip_import_lines(current_kcl)[:6000] or "(empty)",
+            review_confirmation,
         ])
     return "\n".join([
         f"You are {name}, running as a hosted Zoo Zookeeper in auto mode.",
+        repair_text,
+        review_text,
+        review_precedence,
+        transport_recovery_text,
         agents_instruction,
         f"Assembly prompt: {assembly_prompt}",
         f"Parent/root instruction: {root_instruction}",
@@ -1693,15 +2364,53 @@ def build_zookeeper_agent_prompt(body, agent, current_kcl, imports, render_error
             "Include a // ZOOKEEPER_INTERFACE block near the top of the KCL body. It must state units, local_origin, local_axes, bbox_mm, mate_points, exported_aggregate, key_dimensions, and parent_interface.",
             "Use concrete dimensions and named mate points/axes that an orchestrator can align later. Do not use vague placeholders such as TBD, approximate, or visually align.",
         f"Repair attempt: {attempt}",
-        repair_text,
-        review_text,
         "Known sibling/parent interface manifests that may constrain this repair:",
         interface_context or "(none yet)",
         "Existing import lines that the wall server will preserve outside your editable body:",
         imports or "(none)",
         "Current KCL body:",
         strip_import_lines(current_kcl)[:6000] or "(empty)",
+        review_confirmation,
     ])
+
+
+def can_accept_unchanged_orchestrator_result(agent, current_kcl, render_error, review_instruction):
+    if sanitize_text(agent.get("kind"), "worker") != "orchestrator":
+        return False
+    if render_error or not has_executable_kcl_body(current_kcl):
+        return False
+    review = str(review_instruction or "")
+    empty_explicit_review = re.search(
+        r"MANDATORY EXPLICIT PLACEMENT REVIEW START\s*"
+        r"MANDATORY EXPLICIT PLACEMENT REVIEW END",
+        review,
+        flags=re.IGNORECASE,
+    )
+    return bool(
+        empty_explicit_review
+        and re.search(r"return the current placement KCL unchanged", review, flags=re.IGNORECASE)
+    )
+
+
+def can_accept_validated_transport_checkpoint(body, agent, current_kcl, render_error, result):
+    if sanitize_text(agent.get("kind"), "worker") != "orchestrator":
+        return False
+    if int(clamp(float(body.get("transportRetryAttempt") or 0), 0, 8)) <= 0:
+        return False
+    if render_error or not has_executable_kcl_body(current_kcl):
+        return False
+    transcript = "\n".join([
+        str(result.get("summary") or ""),
+        str(result.get("rawText") or ""),
+        *[str(line) for line in (result.get("dialog") or [])],
+    ]).lower()
+    validated = "mock execution succeeded" in transcript
+    unchanged = any(phrase in transcript for phrase in (
+        "retained unchanged",
+        "retained `main.kcl`",
+        "no syntax or execution repair was necessary",
+    ))
+    return validated and unchanged
 
 
 def zookeeper_agent_work(body, agent, imports, current_kcl, render_error, attempt, emit=None):
@@ -1741,11 +2450,30 @@ def zookeeper_agent_work(body, agent, imports, current_kcl, render_error, attemp
         on_dialog=emit_dialog if emit else None,
     )
     if not result.get("kcl"):
-        raise RuntimeError("Zookeeper completed without an EditKclCode output")
-    body_kcl = clean_model_kcl(result["kcl"])
+        if not (
+            can_accept_unchanged_orchestrator_result(
+                agent,
+                current_kcl,
+                render_error,
+                body.get("reviewInstruction"),
+            )
+            or can_accept_validated_transport_checkpoint(
+                body,
+                agent,
+                current_kcl,
+                render_error,
+                result,
+            )
+        ):
+            raise RuntimeError("Zookeeper completed without an EditKclCode output")
+        body_kcl = clean_model_kcl(strip_import_lines(current_kcl))
+        summary = result["summary"] or "Validated existing orchestrator KCL unchanged."
+    else:
+        body_kcl = clean_model_kcl(result["kcl"])
+        summary = result["summary"]
     return {
         "source": "zookeeper",
-        "summary": result["summary"],
+        "summary": summary,
         "kcl": attach_imports(rewritten_imports, body_kcl),
         "dialog": result["dialog"],
         "frames": result["frames"],
@@ -1818,9 +2546,16 @@ def parse_rework_items(payload):
     for item in items[:4]:
         if not isinstance(item, dict):
             continue
-        target = sanitize_text(item.get("target") or item.get("agent") or item.get("file") or "", "")
-        instruction = sanitize_text(item.get("instruction") or item.get("change") or item.get("request") or "", "")
-        reason = sanitize_text(item.get("reason") or item.get("why") or "", "")
+        target = sanitize_review_text(
+            item.get("target") or item.get("agent") or item.get("file") or "",
+            "",
+            512,
+        )
+        instruction = sanitize_review_text(
+            item.get("instruction") or item.get("change") or item.get("request") or "",
+            "",
+        )
+        reason = sanitize_review_text(item.get("reason") or item.get("why") or "", "")
         if not instruction:
             continue
         parsed.append({
@@ -1841,8 +2576,15 @@ def list_from_value(value, limit=8):
 
 def parse_bom_review(payload):
     if not isinstance(payload, dict):
-        return {"sharedComponents": [], "importUpdates": []}
+        return {"uniqueComponents": [], "sharedComponents": [], "importUpdates": []}
     bom = payload.get("bom") if isinstance(payload.get("bom"), dict) else payload
+    unique_items = (
+        bom.get("uniqueComponents")
+        or bom.get("unique_components")
+        or bom.get("newComponents")
+        or bom.get("new_components")
+        or []
+    )
     shared_items = (
         bom.get("sharedComponents")
         or bom.get("shared_components")
@@ -1855,6 +2597,33 @@ def parse_bom_review(payload):
         or bom.get("imports")
         or []
     )
+    unique = []
+    if isinstance(unique_items, list):
+        for item in unique_items[:12]:
+            if not isinstance(item, dict):
+                continue
+            role = sanitize_text(item.get("role") or item.get("component") or item.get("name"), "")
+            instruction = sanitize_text(item.get("instruction") or item.get("request") or "", "")
+            reason = sanitize_text(item.get("reason") or item.get("why") or "", "")
+            parent = sanitize_text(
+                item.get("parent")
+                or item.get("consumer")
+                or item.get("orchestrator")
+                or item.get("assembly"),
+                "",
+            )
+            kind = sanitize_text(item.get("kind") or item.get("type"), "worker").lower()
+            if not role or not parent:
+                continue
+            if not instruction:
+                instruction = f"Generate one unique {role} for {parent}."
+            unique.append({
+                "role": role,
+                "reason": reason,
+                "instruction": instruction,
+                "parent": parent,
+                "kind": "orchestrator" if kind == "orchestrator" else "worker",
+            })
     shared = []
     if isinstance(shared_items, list):
         for item in shared_items[:6]:
@@ -1890,6 +2659,7 @@ def parse_bom_review(payload):
                 "reason": reason,
             })
     return {
+        "uniqueComponents": unique,
         "sharedComponents": shared,
         "importUpdates": imports,
     }
@@ -1901,6 +2671,7 @@ def is_retryable_zookeeper_connection_error(error):
         "websocket closed",
         "connection reset",
         "connection aborted",
+        "connection interrupted",
         "broken pipe",
         "timed out",
         "timeout",
@@ -1941,6 +2712,13 @@ def zookeeper_review_with_logging(body, on_dialog=None):
             "frames": result.get("frames"),
             "summary": sanitize_text(result.get("summary"), ""),
             "reworkCount": len(result.get("rework") or []),
+            "rework": result.get("rework") or [],
+            "bom": result.get("bom") or {
+                "uniqueComponents": [],
+                "sharedComponents": [],
+                "importUpdates": [],
+            },
+            "uniqueComponentCount": len(((result.get("bom") or {}).get("uniqueComponents") or [])),
             "sharedComponentCount": len(((result.get("bom") or {}).get("sharedComponents") or [])),
             "importUpdateCount": len(((result.get("bom") or {}).get("importUpdates") or [])),
             **metrics,
@@ -2011,6 +2789,7 @@ def zookeeper_review_impl(body, review_id, on_dialog=None):
             )
     all_agents = body.get("allAgents") or []
     all_agent_lines = []
+    shared_agent_lines = []
     if isinstance(all_agents, list):
         for item in all_agents[:80]:
             if not isinstance(item, dict):
@@ -2018,11 +2797,20 @@ def zookeeper_review_impl(body, review_id, on_dialog=None):
             all_agent_lines.append(
                 f"- {sanitize_text(item.get('name'), 'agent')} | kind={sanitize_text(item.get('kind'), '')} | scope={sanitize_text(item.get('scope'), '')} | role={sanitize_text(item.get('role'), '')} | parent={sanitize_text(item.get('parentId'), '')} | file={sanitize_text(item.get('filePath'), '')} | imports={', '.join(list_from_value(item.get('imports'), 8)) or 'none'}"
             )
+        for item in all_agents:
+            if not isinstance(item, dict) or item.get("scope") != "shared_part":
+                continue
+            shared_agent_lines.append(
+                f"- {sanitize_text(item.get('name'), 'shared component')} | role={sanitize_text(item.get('role'), '')} | file={sanitize_text(item.get('filePath'), '')}"
+            )
+    review_round = int(clamp(float(body.get("reviewRound") or 1), 1, 10000))
+    prior_review_summaries = list_from_value(body.get("priorReviewSummaries"), 6)
     prompt = "\n".join([
         f"You are {name}, running as a hosted Zoo Zookeeper in auto mode.",
         agents_instruction,
         "You are reviewing a CAD assembly after a child agent returned KCL.",
-        "This may be a partial assembly. Assess and request placement rework for the currently available direct children now; do not defer feedback merely because other children are still pending.",
+        f"This is review round {review_round}. The objective is practical mechanical acceptance and completion, not open-ended redesign or brainstorming.",
+        "This may be a partial assembly. Assess the currently available direct children now; do not defer the decision merely because other children are still pending.",
         "Use Zoo's CAD/KCL tools to inspect or execute the provided project visually.",
         "Also inspect the underlying KCL files and the interface manifests; do not rely on the render alone for axis direction, distance, or ownership.",
         "Do not edit files in this review turn.",
@@ -2034,20 +2822,33 @@ def zookeeper_review_impl(body, review_id, on_dialog=None):
         "\n".join(child_lines) or "(none)",
         "All current graph agents and BOM/import context:",
         "\n".join(all_agent_lines) or "(none)",
+        "Complete canonical shared-component registry:",
+        "\n".join(shared_agent_lines) or "(none)",
+        "Recent prior review findings for this orchestrator:",
+        "\n".join(f"- {summary}" for summary in prior_review_summaries) or "(none)",
         "Available interface manifests:",
         interface_context or "(none)",
         "Decide whether any child or orchestrator needs rework based on visual/model result, KCL evidence, and interface fit.",
+        "Request rework only for a concrete current blocker: non-executable KCL, missing/unusable aggregate return, clear collision or unsupported/floating geometry, materially wrong mate/axis/distance, missing required component, or an interface mismatch that prevents coherent assembly.",
+        "Do not request rework for optional polish, cosmetic preference, hypothetical manufacturing optimization, or a different design that would merely be nicer.",
+        "Do not repeat a prior finding unless current KCL/render evidence shows that the prior repair failed; when repeating it, cite the specific remaining mismatch.",
+        "If the assembly executes and the available components are mechanically coherent enough for their requested function, accept it by returning an empty rework array even if further polish is possible.",
         "Target an orchestrator when the problem is placement, transform, imports, mate alignment, axis convention, or assembly integration. Target a worker only when that worker's own part geometry is wrong.",
+        "Each rework item must target exactly one owning worker or orchestrator and request changes only in that target's file. Split a finding into separate rework items when it requires changes from multiple owners.",
+        "Do not target a parent orchestrator with one combined instruction that also asks a child orchestrator and a worker to change their files.",
         "If a parent assembly is reaching through to import/place grandchildren because a child sub-assembly returns no usable aggregate, target the child sub-orchestrator for repair. Do not recommend adding grandchild imports to the parent.",
         "Every orchestrator/sub-assembly file must return a renderable aggregate as its final expression so its parent can place the sub-assembly as one component.",
         "Also review the bill of materials across the whole assembly.",
         "If repeated hardware or reusable components are blended into local worker files, propose a canonical shared component and import updates for the consuming orchestrators.",
+        "Before proposing a shared component, check the complete shared-component registry above. Do not create a duplicate or near-duplicate canonical component.",
         "Shared components must be singular files, for example one bolt, one bearing, one bushing, one washer, one pin, one nut. Do not propose a bolt set or hardware pack.",
+        "Use uniqueComponents when the current assembly is missing a unique direct child part or nested sub-assembly. Name its exact parent and choose kind worker for one part or orchestrator for a nested assembly.",
+        "Do not route a missing unique component as geometry rework on an unrelated existing worker.",
         "Use importUpdates when an existing shared component should be imported by another sub-assembly. Use sharedComponents when a new canonical reusable worker should be created.",
         "Return JSON only with this exact shape:",
-        '{"summary":"one sentence visual review","rework":[{"target":"exact orchestrator or worker role/name/file when possible","reason":"why, including KCL/interface evidence","instruction":"specific rework request"}],"bom":{"sharedComponents":[{"role":"singular reusable component name","reason":"why this should be shared","instruction":"worker instruction for one canonical reusable part","consumers":["orchestrator role/name that should import it"]}],"importUpdates":[{"component":"existing shared component role/name","consumer":"orchestrator role/name that should import it","reason":"why the import is needed"}]}}',
+        '{"summary":"one sentence visual review","rework":[{"target":"exact orchestrator or worker role/name/file when possible","reason":"why, including KCL/interface evidence","instruction":"specific rework request"}],"bom":{"uniqueComponents":[{"role":"unique direct-child part or sub-assembly name","reason":"why it is missing","instruction":"specific generation request","parent":"exact parent orchestrator role/name","kind":"worker or orchestrator"}],"sharedComponents":[{"role":"singular reusable component name","reason":"why this should be shared","instruction":"worker instruction for one canonical reusable part","consumers":["orchestrator role/name that should import it"]}],"importUpdates":[{"component":"existing shared component role/name","consumer":"orchestrator role/name that should import it","reason":"why the import is needed"}]}}',
         "If no rework is needed, return an empty rework array.",
-        "If no BOM changes are needed, return empty sharedComponents and importUpdates arrays.",
+        "If no BOM changes are needed, return empty uniqueComponents, sharedComponents, and importUpdates arrays.",
     ])
     result = zookeeper_turn(
         prompt,
@@ -2200,10 +3001,6 @@ def normalize_plan(raw_plan, prompt, max_agents):
             "source": "openai",
         })
 
-    file_by_key = {
-        str(raw_agent.get("key")): agent["filePath"]
-        for raw_agent, agent in zip(raw_agents, agents)
-    }
     shared_files_by_key = {
         str(raw_agent.get("key")): agent["filePath"]
         for raw_agent, agent in zip(raw_agents, agents)
@@ -2216,10 +3013,8 @@ def normalize_plan(raw_plan, prompt, max_agents):
         if isinstance(raw_imports, list):
             for import_key in raw_imports[:16]:
                 key = str(import_key or "").strip()
-                if key in file_by_key and file_by_key[key] != agent["filePath"]:
-                    paths.append(file_by_key[key])
-                elif key.endswith(".kcl") and key != agent["filePath"]:
-                    paths.append(key)
+                if key in shared_files_by_key and shared_files_by_key[key] != agent["filePath"]:
+                    paths.append(shared_files_by_key[key])
         if agent["kind"] == "orchestrator" and agent.get("scope") != "shared_part":
             text = f"{agent.get('role', '')} {agent.get('instruction', '')}".lower()
             for key, file_path in shared_files_by_key.items():
@@ -2401,7 +3196,7 @@ def openai_orchestration_plan(prompt, max_agents, agents_instruction, source="op
     return raw_plan
 
 
-def normalize_sub_bom(raw_plan, max_children=None):
+def normalize_sub_bom(raw_plan, max_children=None, terminal_children_only=False):
     children = []
     seen_keys = set()
     raw_children = raw_plan.get("children") or []
@@ -2418,6 +3213,10 @@ def normalize_sub_bom(raw_plan, max_children=None):
             suffix += 1
         seen_keys.add(key)
         kind = "orchestrator" if raw_child.get("kind") == "orchestrator" else "worker"
+        if terminal_children_only and kind == "orchestrator":
+            raise RuntimeError(
+                "Terminal BOM level returned another sub-orchestrator instead of physical-part workers"
+            )
         scope = sanitize_scope(raw_child.get("scope"), kind)
         if scope == "shared_part":
             kind = "worker"
@@ -2443,11 +3242,17 @@ def normalize_sub_bom(raw_plan, max_children=None):
 
 
 def subassembly_child_capacity(body):
+    requested_value = body.get("remainingAgentSlots")
+    if requested_value in (None, ""):
+        return WALL_MAX_AGENTS
     try:
-        requested = int(float(body.get("remainingAgentSlots", WALL_MAX_AGENTS)))
+        requested = int(float(requested_value))
     except (TypeError, ValueError, OverflowError):
-        requested = WALL_MAX_AGENTS
-    return max(0, min(requested, WALL_MAX_AGENTS))
+        return WALL_MAX_AGENTS
+    requested = max(0, requested)
+    if WALL_MAX_AGENTS is None:
+        return requested
+    return min(requested, WALL_MAX_AGENTS)
 
 
 def subassembly_bom_prompt(body, agent):
@@ -2457,6 +3262,17 @@ def subassembly_bom_prompt(body, agent):
     root_instruction = sanitize_text(body.get("rootInstruction"), "Coordinate the complete assembly.")
     known_agents = body.get("knownAgents") or []
     child_capacity = subassembly_child_capacity(body)
+    bom_depth = max(1, int(body.get("bomDepth") or 1))
+    max_bom_depth = max(bom_depth, int(body.get("maxBomDepth") or bom_depth))
+    terminal_children_only = bool(body.get("terminalChildrenOnly"))
+    capacity_instruction = (
+        "There is no fixed wall agent limit. Choose only the direct children this sub-assembly requires."
+        if child_capacity is None
+        else (
+            f"The wall has capacity for at most {child_capacity} additional agents. "
+            f"Return no more than {child_capacity} direct children."
+        )
+    )
     known_lines = []
     if isinstance(known_agents, list):
         for item in known_agents[:120]:
@@ -2472,12 +3288,20 @@ def subassembly_bom_prompt(body, agent):
         "You are planning the direct bill of materials for your own assigned sub-assembly.",
         "Do not generate KCL in this turn. Do not edit files. Return JSON only.",
         "Choose only the immediate children that you directly own. Each direct child must either be a concrete worker part or a cohesive child sub-orchestrator.",
-        f"The wall has capacity for at most {child_capacity} additional agents. Return no more than {child_capacity} direct children. This is a hard deployment limit.",
-        "There is no fixed maximum BOM depth. Create a child sub-orchestrator when that child has a meaningful internal assembly/BOM; the wall will recursively ask it to plan its own direct children in parallel.",
+        capacity_instruction,
+        f"This sub-assembly is at hierarchy depth {bom_depth}; the wall's recursion safety depth is {max_bom_depth}.",
+        (
+            "This is the terminal planning level. Every returned child must be kind=worker and must model exactly one physical part. Do not return any orchestrator children."
+            if terminal_children_only
+            else "Create a child sub-orchestrator only when it owns a cohesive assembly with at least two distinct physical parts. Otherwise return the physical part as a worker."
+        ),
         "Do not flatten a complex subsystem merely to avoid nesting, and do not create a chain of single-child orchestrators without a real assembly responsibility.",
+        "Do not return an all-orchestrator delegation if this scope also directly owns any concrete physical parts.",
         "Workers model exactly one physical part. Shared/reusable hardware must be a singular worker with scope=shared_part, never a set or pack.",
         "Name direct children with physical roles and give every instruction concrete dimensions, axes, mate points, neighbors, and expected return interface where applicable.",
-        "Use imports only for existing shared/reusable components or intentional cross-subassembly references listed below. Do not list new direct children in imports; the wall owns those links.",
+        "Use imports only for known existing agents whose scope is shared_part. Never import sibling, parent, ancestor, or unrelated orchestrator assemblies.",
+        "Describe cross-subassembly interfaces and dependencies in the instruction instead of imports; each common parent owns sibling placement.",
+        "Do not list new direct children in imports; the wall owns those links.",
         "Do not create new part geometry, KCL, patterns, or placement transforms in this planning turn.",
         f"Assembly prompt: {sanitize_text(body.get('prompt'), 'assembly')}",
         f"Root instruction: {root_instruction}",
@@ -2493,7 +3317,7 @@ def subassembly_bom_prompt(body, agent):
 def zookeeper_subassembly_bom(body, emit_dialog=None):
     agent = body.get("agent") or {}
     child_capacity = subassembly_child_capacity(body)
-    if child_capacity <= 0:
+    if child_capacity is not None and child_capacity <= 0:
         raise RuntimeError("wall agent capacity is exhausted")
     files = body.get("files") or {}
     current_files = render_files_for_zookeeper(files) if isinstance(files, dict) else {}
@@ -2514,7 +3338,7 @@ def zookeeper_subassembly_bom(body, emit_dialog=None):
     raw_plan["_source"] = "zookeeper"
     raw_plan["_dialog"] = result.get("dialog") or []
     raw_plan["_frames"] = result.get("frames") or 0
-    return normalize_sub_bom(raw_plan, child_capacity)
+    return normalize_sub_bom(raw_plan, child_capacity, bool(body.get("terminalChildrenOnly")))
 
 
 def openai_subassembly_bom(body):
@@ -2529,7 +3353,11 @@ def openai_subassembly_bom(body):
         timeout=300,
     )
     raw_plan["_source"] = "openai_fallback"
-    return normalize_sub_bom(raw_plan, subassembly_child_capacity(body))
+    return normalize_sub_bom(
+        raw_plan,
+        subassembly_child_capacity(body),
+        bool(body.get("terminalChildrenOnly")),
+    )
 
 
 def fallback_subassembly_bom(body, error):
@@ -2557,7 +3385,11 @@ def fallback_subassembly_bom(body, error):
         ],
         "_source": "fallback",
     }
-    return normalize_sub_bom(raw_plan, subassembly_child_capacity(body))
+    return normalize_sub_bom(
+        raw_plan,
+        subassembly_child_capacity(body),
+        bool(body.get("terminalChildrenOnly")),
+    )
 
 
 def subassembly_bom_stream(body, emit):
@@ -2630,7 +3462,11 @@ def orchestrate(body, emit=None):
         except (TypeError, ValueError, OverflowError):
             requested_max_agents = 0
         if requested_max_agents > 0:
-            max_agents = min(requested_max_agents, WALL_MAX_AGENTS)
+            max_agents = (
+                requested_max_agents
+                if WALL_MAX_AGENTS is None
+                else min(requested_max_agents, WALL_MAX_AGENTS)
+            )
     agents_instruction = wall_agents_instruction()
     zookeeper_error = None
     report("started", "Connecting the hosted Zookeeper architect in auto mode.")
@@ -2728,11 +3564,76 @@ def event_queue_for(session_id):
         return EVENT_QUEUES[key]
 
 
+def poll_session_events(session_id, limit=24):
+    key = sanitize_text(session_id, "default")
+    event_limit = max(1, min(64, int(limit or 24)))
+    events = event_queue_for(key)
+    drained = []
+    try:
+        drained.append(events.get(timeout=10))
+    except queue.Empty:
+        pass
+    for _ in range(event_limit - len(drained)):
+        try:
+            drained.append(events.get_nowait())
+        except queue.Empty:
+            break
+    return {
+        "ok": True,
+        "sessionId": key,
+        "events": drained,
+        "remaining": events.qsize(),
+        "workIds": session_work_status(key, "")["workIds"],
+    }
+
+
+def decode_json_payload(payload, content_encoding=""):
+    encoding = str(content_encoding or "").strip().lower()
+    if encoding in {"", "identity"}:
+        decoded = payload
+    elif encoding == "gzip":
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(payload)) as compressed:
+                decoded = compressed.read(MAX_REQUEST_BYTES + 1)
+        except (OSError, EOFError) as error:
+            raise RuntimeError("request body is not valid gzip data") from error
+    else:
+        raise RuntimeError(f"unsupported content-encoding: {encoding}")
+    if len(decoded) > MAX_REQUEST_BYTES:
+        raise RequestBodyTooLarge(
+            f"decompressed request body exceeds {MAX_REQUEST_BYTES} bytes"
+        )
+    return json.loads(decoded.decode("utf-8"))
+
+
+def begin_event_stream_lease(session_id):
+    key = str(session_id or "default")
+    with EVENT_QUEUES_LOCK:
+        stream_lock = EVENT_STREAM_LOCKS.setdefault(key, threading.Lock())
+    with stream_lock:
+        with EVENT_QUEUES_LOCK:
+            generation = EVENT_STREAM_GENERATIONS.get(key, 0) + 1
+            EVENT_STREAM_GENERATIONS[key] = generation
+    return stream_lock, generation
+
+
+def event_stream_lease_is_current(session_id, generation):
+    key = str(session_id or "default")
+    with EVENT_QUEUES_LOCK:
+        return EVENT_STREAM_GENERATIONS.get(key, 0) == generation
+
+
 def publish_event(session_id, event):
     key = str(session_id or "default")
     events = event_queue_for(key)
     event_type = str((event or {}).get("type") or "")
-    critical = event_type in {"final", "error", "review-final", "review-error"}
+    critical = event_type in {
+        "final",
+        "error",
+        "review-final",
+        "review-error",
+        "work-status",
+    }
     if not critical and events.qsize() >= EVENT_QUEUE_MAX - EVENT_QUEUE_RESERVED_FINALS:
         with EVENT_QUEUES_LOCK:
             should_log = key not in EVENT_QUEUE_WARNED
@@ -2912,6 +3813,18 @@ def review_start(body):
 
 
 class WallHandler(SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        if self.path.startswith((
+            "/api/wall-state",
+            "/api/wall-command",
+            "/api/wall-heartbeat",
+            "/api/wall-health",
+        )):
+            return
+        super().log_message(format, *args)
+
     def translate_path(self, path):
         parsed = urllib.parse.urlparse(path)
         requested = urllib.parse.unquote(parsed.path)
@@ -2927,7 +3840,17 @@ class WallHandler(SimpleHTTPRequestHandler):
     def end_headers(self):
         if self.path.endswith(".html") or self.path.endswith(".js") or self.path.startswith("/api/"):
             self.send_header("cache-control", "no-store")
+        if CORS_ORIGIN:
+            self.send_header("access-control-allow-origin", CORS_ORIGIN)
+            self.send_header("access-control-allow-methods", "GET, POST, OPTIONS")
+            self.send_header("access-control-allow-headers", "content-type")
+            self.send_header("access-control-allow-private-network", "true")
         super().end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("content-length", "0")
+        self.end_headers()
 
     def guess_type(self, path):
         if path.endswith(".wasm"):
@@ -2953,7 +3876,10 @@ class WallHandler(SimpleHTTPRequestHandler):
             raise RuntimeError(
                 f"incomplete request body: expected {length} bytes, received {len(payload)}"
             )
-        return json.loads(payload.decode("utf-8"))
+        return decode_json_payload(
+            payload,
+            self.headers.get("content-encoding") or "",
+        )
 
     def send_json(self, status, value):
         payload = json.dumps(value).encode("utf-8")
@@ -2963,13 +3889,16 @@ class WallHandler(SimpleHTTPRequestHandler):
         self.send_header("cache-control", "no-store")
         self.end_headers()
         self.wfile.write(payload)
+        self.wfile.flush()
 
     def start_ndjson(self):
         self.send_response(200)
         self.send_header("content-type", "application/x-ndjson; charset=utf-8")
         self.send_header("cache-control", "no-store")
         self.send_header("x-accel-buffering", "no")
+        self.send_header("connection", "close")
         self.end_headers()
+        self.close_connection = True
 
     def send_ndjson(self, value):
         payload = (json.dumps(value) + "\n").encode("utf-8")
@@ -2980,20 +3909,58 @@ class WallHandler(SimpleHTTPRequestHandler):
         self.start_ndjson()
         self.connection.settimeout(15)
         events = event_queue_for(session_id)
+        stream_lock, generation = begin_event_stream_lease(session_id)
+        next_ping_at = time.monotonic() + 15
         try:
             while True:
-                try:
-                    event = events.get(timeout=15)
-                except queue.Empty:
-                    event = {"type": "ping", "sessionId": session_id, "time": time.time()}
-                try:
-                    self.send_ndjson(event)
-                except (BrokenPipeError, ConnectionError, OSError):
-                    return
+                with stream_lock:
+                    if not event_stream_lease_is_current(session_id, generation):
+                        return
+                    event = None
+                    wait_seconds = max(
+                        0.05,
+                        min(1.0, next_ping_at - time.monotonic()),
+                    )
+                    try:
+                        event = events.get(timeout=wait_seconds)
+                    except queue.Empty:
+                        pass
+                    if not event_stream_lease_is_current(session_id, generation):
+                        if event is not None:
+                            try:
+                                events.put_nowait(event)
+                            except queue.Full:
+                                pass
+                        return
+                    if event is None:
+                        if time.monotonic() < next_ping_at:
+                            continue
+                        with SESSION_WORK_LOCK:
+                            session = SESSION_WORK.get(session_id)
+                            active_work_ids = (
+                                sorted(session["workIds"])
+                                if session is not None
+                                else []
+                            )
+                        event = {
+                            "type": "ping",
+                            "sessionId": session_id,
+                            "time": time.time(),
+                            "workIds": active_work_ids,
+                        }
+                    try:
+                        self.send_ndjson(event)
+                    except (BrokenPipeError, ConnectionError, OSError):
+                        return
+                    next_ping_at = time.monotonic() + 15
         finally:
-            close_session({
+            with SESSION_WORK_LOCK:
+                session = SESSION_WORK.get(session_id)
+                active_work = len(session["workIds"]) if session is not None else 0
+            log_event("event_stream.disconnected", {
                 "sessionId": session_id,
-                "reason": "event stream disconnected",
+                "activeWork": active_work,
+                "queuedEvents": events.qsize(),
             })
 
     def send_wall_config(self):
@@ -3008,10 +3975,70 @@ class WallHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/wall-state":
+            params = urllib.parse.parse_qs(parsed.query)
+            try:
+                tile_value = (params.get("tile") or [""])[0]
+                tile = int(tile_value) if tile_value != "" else None
+                after = max(0, int((params.get("after") or ["0"])[0]))
+                controller = (params.get("controller") or ["0"])[0] == "1"
+                self.send_json(
+                    200,
+                    wall_state_for_client(
+                        tile=tile,
+                        controller=controller,
+                        after=after,
+                    ),
+                )
+            except (TypeError, ValueError) as error:
+                self.send_json(400, {"error": str(error)})
+            return
+        if parsed.path == "/api/wall-command":
+            params = urllib.parse.parse_qs(parsed.query)
+            try:
+                after = max(0, int((params.get("after") or ["0"])[0]))
+                self.send_json(200, wall_commands_after(after))
+            except (TypeError, ValueError) as error:
+                self.send_json(400, {"error": str(error)})
+            return
+        if parsed.path == "/api/wall-health":
+            self.send_json(200, wall_health())
+            return
         if parsed.path == "/api/zookeeper/events":
             params = urllib.parse.parse_qs(parsed.query)
             session_id = sanitize_text((params.get("sessionId") or ["default"])[0], "default")
             self.send_event_stream(session_id)
+            return
+        if parsed.path == "/api/zookeeper/events-poll":
+            params = urllib.parse.parse_qs(parsed.query)
+            try:
+                self.send_json(
+                    200,
+                    poll_session_events(
+                        (params.get("sessionId") or ["default"])[0],
+                        int((params.get("limit") or ["24"])[0]),
+                    ),
+                )
+            except (TypeError, ValueError) as error:
+                self.send_json(400, {"error": str(error)})
+            return
+        if parsed.path == "/api/zookeeper/work-status":
+            params = urllib.parse.parse_qs(parsed.query)
+            self.send_json(
+                200,
+                session_work_status(
+                    (params.get("sessionId") or ["default"])[0],
+                    (params.get("workId") or [""])[0],
+                ),
+            )
+            return
+        if parsed.path == "/api/render-job":
+            params = urllib.parse.parse_qs(parsed.query)
+            job_id = sanitize_text((params.get("id") or [""])[0], "")
+            try:
+                self.send_json(200, snapshot_render_job(job_id))
+            except Exception as error:
+                self.send_json(404, {"error": str(error)})
             return
         if parsed.path == "/config.js":
             self.send_wall_config()
@@ -3020,6 +4047,15 @@ class WallHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if self.path == "/api/wall-state":
+                self.send_json(200, save_wall_state(self.read_json()))
+                return
+            if self.path == "/api/wall-command":
+                self.send_json(200, enqueue_wall_command(self.read_json()))
+                return
+            if self.path == "/api/wall-heartbeat":
+                self.send_json(200, record_wall_heartbeat(self.read_json()))
+                return
             if self.path == "/api/orchestrate":
                 self.send_json(200, orchestrate(self.read_json()))
                 return
@@ -3060,6 +4096,12 @@ class WallHandler(SimpleHTTPRequestHandler):
             if self.path == "/api/snapshot":
                 self.send_json(200, persist_snapshot(self.read_json()))
                 return
+            if self.path == "/api/render-snapshot":
+                self.send_json(200, render_snapshot_isolated(self.read_json()))
+                return
+            if self.path == "/api/render-job-complete":
+                self.send_json(200, complete_snapshot_render_job(self.read_json()))
+                return
             if self.path == "/api/project":
                 self.send_json(200, persist_project(self.read_json()))
                 return
@@ -3084,6 +4126,8 @@ class WallHandler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     os.chdir(PUBLIC_DIR)
+    WALL_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WALL_PID_PATH.write_text(f"{os.getpid()}\n", encoding="utf-8")
     print(f"web-view wall server listening on http://127.0.0.1:{PORT}")
     if OPENAI_API_KEY:
         print(f"OpenAI model: {OPENAI_MODEL}")
@@ -3091,4 +4135,11 @@ if __name__ == "__main__":
         print(f"OpenAI planner reasoning effort: {OPENAI_ARCHITECT_REASONING_EFFORT}")
     else:
         print("OPENAI_API_KEY is not set; fallback plans will be used.")
-    ThreadingHTTPServer(("127.0.0.1", PORT), WallHandler).serve_forever()
+    try:
+        ThreadingHTTPServer(("127.0.0.1", PORT), WallHandler).serve_forever()
+    finally:
+        try:
+            if int(WALL_PID_PATH.read_text().strip()) == os.getpid():
+                WALL_PID_PATH.unlink(missing_ok=True)
+        except (OSError, ValueError):
+            pass

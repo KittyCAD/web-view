@@ -12,7 +12,8 @@
     "build": "make build",
     "serve": "make serve",
     "wall-server": "python3 scripts/wall_server.py",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && python3 scripts/test_wall_state.py"
   },
   "author": "",
   "license": "ISC",

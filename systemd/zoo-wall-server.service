@@ -1,0 +1,16 @@
+[Unit]
+Description=Zoo nine-display wall server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/user/web-view-wall-runtime
+EnvironmentFile=/home/user/web-view-wall-runtime/wall.env
+ExecStart=/usr/bin/python3 /home/user/web-view-wall-runtime/scripts/wall_server.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
