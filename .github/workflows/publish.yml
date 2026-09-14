@@ -9,7 +9,24 @@ permissions:
   contents: read
 
 jobs:
+  package-version:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.version.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - id: version
+        run: |
+          previous_version="$(git show HEAD^:package.json | node -e 'let input = ""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => console.log(JSON.parse(input).version));')"
+          current_version="$(node -p 'require("./package.json").version')"
+          echo "changed=$([[ "$current_version" != "$previous_version" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
   publish:
+    needs: package-version
+    if: needs.package-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.package.outputs.version }}
@@ -34,6 +51,7 @@ jobs:
 
   update-viewer:
     needs: publish
+    if: needs.publish.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
