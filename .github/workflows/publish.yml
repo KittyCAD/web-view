@@ -1,0 +1,62 @@
+name: Publish and update viewer
+
+on:
+  push:
+    branches: [main]
+    paths: [package.json]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - run: npm ci
+      - run: make build
+
+      - id: package
+        run: echo "version=$(node -p 'require("./package.json").version')" >> "$GITHUB_OUTPUT"
+
+      - run: npm publish ./pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  update-viewer:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: KittyCAD/viewer
+          ref: main
+          token: ${{ secrets.VIEWER_REPOSITORY_TOKEN }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - run: npm install @kittycad/lib@latest "@kittycad/web-view@${{ needs.publish.outputs.version }}"
+
+      - name: Commit updated dependencies
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email zoo-github-actions-auth[bot]@users.noreply.github.com
+          git add package.json package-lock.json
+          git commit -m "Update KittyCAD web dependencies"
+          git push origin main
