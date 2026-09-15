@@ -30,7 +30,15 @@ jobs:
       - id: package
         run: echo "version=$(jq -r '.version' package.json)" >> "$GITHUB_OUTPUT"
 
-      - run: npm publish ./pkg
+      - name: Publish package if needed
+        env:
+          WEB_VIEW_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          if npm view "@kittycad/web-view@$WEB_VIEW_VERSION" version > /dev/null 2>&1; then
+            echo "@kittycad/web-view@$WEB_VIEW_VERSION is already published"
+          else
+            npm publish ./pkg
+          fi
 
       - name: Wait for package availability
         env:
