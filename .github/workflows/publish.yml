@@ -1,4 +1,4 @@
-name: Publish and update viewer
+name: Publish and update dependents
 
 on:
   push:
@@ -98,3 +98,55 @@ jobs:
           git push origin main
           git tag "$version"
           git push origin "$version"
+
+  update-api:
+    needs: publish
+    if: needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          app-id: ${{ secrets.GH_ORG_APP_ID }}
+          private-key: ${{ secrets.GH_ORG_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: api
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@v6
+        with:
+          repository: KittyCAD/api
+          ref: main
+          path: api
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: api/admin-dashboard/app/package-lock.json
+
+      - name: Update web-view dependency
+        working-directory: api/admin-dashboard/app
+        run: npm install "@kittycad/web-view@${{ needs.publish.outputs.version }}"
+
+      - name: Open API dependency pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          path: api
+          branch: automation/web-view-${{ needs.publish.outputs.version }}
+          base: main
+          delete-branch: true
+          add-paths: |
+            admin-dashboard/app/package.json
+            admin-dashboard/app/package-lock.json
+          commit-message: |
+            Update kittycad/web-view dependency
+
+            Trigger by: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          title: Update kittycad/web-view dependency
+          body: ''
