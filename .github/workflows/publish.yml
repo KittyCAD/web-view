@@ -1,0 +1,81 @@
+name: Publish and update viewer
+
+on:
+  push:
+    tags: ['*']
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - run: npm ci
+      - run: make build
+
+      - id: package
+        run: echo "version=$(jq -r '.version' package.json)" >> "$GITHUB_OUTPUT"
+
+      - run: npm publish ./pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  update-viewer:
+    needs: publish
+    if: needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          app-id: ${{ secrets.GH_ORG_APP_ID }}
+          private-key: ${{ secrets.GH_ORG_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: viewer
+          permission-contents: write
+
+      - uses: actions/checkout@v6
+        with:
+          repository: KittyCAD/viewer
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      # Their respective repositories update @kittycad/lib and
+      # @kittycad/kcl-wasm-lib via CI to guarantee the correct versions.
+      - run: npm install "@kittycad/web-view@${{ needs.publish.outputs.version }}"
+
+      - name: Commit updated dependencies
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name github-actions[bot]
+          git config user.email zoo-github-actions-auth[bot]@users.noreply.github.com
+          git add package.json package-lock.json
+          git commit -m "Update kittycad/web-view dependency" -m "Trigger by: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          npm version patch --no-git-tag-version
+          version="$(jq -r '.version' package.json)"
+          git add package.json package-lock.json
+          git commit -m "Trigger release via version bump to $version" -m "Trigger by: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          git push origin main
+          git tag "$version"
+          git push origin "$version"
