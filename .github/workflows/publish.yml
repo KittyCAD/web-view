@@ -2,31 +2,13 @@ name: Publish and update viewer
 
 on:
   push:
-    branches: [main]
-    paths: [package.json]
+    tags: ['*']
 
 permissions:
   contents: read
 
 jobs:
-  package-version:
-    runs-on: ubuntu-latest
-    outputs:
-      changed: ${{ steps.version.outputs.changed }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - id: version
-        run: |
-          previous_version="$(git show '${{ github.event.before }}:package.json' | jq -r '.version')"
-          current_version="$(jq -r '.version' package.json)"
-          echo "changed=$([[ "$current_version" != "$previous_version" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-
   publish:
-    needs: package-version
-    if: needs.package-version.outputs.changed == 'true'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.package.outputs.version }}
