@@ -60,9 +60,12 @@ jobs:
           git config user.email zoo-github-actions-auth[bot]@users.noreply.github.com
           git add package.json package-lock.json
           git commit -m "Update KittyCAD web dependencies" -m "Source workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          git push origin main
 
           latest_tag="$(git describe --tags --abbrev=0)"
           next_tag="$(node -e 'const [major, minor, patch] = process.argv[1].split(".").map(Number); console.log(`${major}.${minor}.${patch + 1}`)' "$latest_tag")"
+          npm version "$next_tag" --no-git-tag-version
+          git add package.json package-lock.json
+          git commit -m "Bump viewer version to $next_tag" -m "Source workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          git push origin main
           git tag "$next_tag"
           git push origin "$next_tag"
