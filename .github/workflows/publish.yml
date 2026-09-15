@@ -66,7 +66,7 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      - run: npm install @kittycad/lib@latest "@kittycad/web-view@${{ needs.publish.outputs.version }}"
+      - run: npm install @kittycad/kcl-wasm-lib@latest @kittycad/lib@latest "@kittycad/web-view@${{ needs.publish.outputs.version }}"
 
       - name: Commit updated dependencies
         run: |
