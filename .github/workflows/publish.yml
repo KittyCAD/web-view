@@ -62,10 +62,11 @@ jobs:
           git commit -m "Update KittyCAD web dependencies" -m "Source workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           latest_tag="$(git describe --tags --abbrev=0)"
-          next_tag="$(jq -nr --arg tag "$latest_tag" '$tag | split(".") | map(tonumber) | .[2] += 1 | map(tostring) | join(".")')"
-          npm version "$next_tag" --no-git-tag-version
+          next_version="$(jq -nr --arg tag "$latest_tag" '$tag | split(".") | map(tonumber) | .[2] += 1 | map(tostring) | join(".")')"
+          npm version "$next_version" --no-git-tag-version
+          version="$(jq -r '.version' package.json)"
           git add package.json package-lock.json
-          git commit -m "Bump viewer version to $next_tag" -m "Source workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          git commit -m "Bump viewer version to $version" -m "Source workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           git push origin main
-          git tag "$next_tag"
-          git push origin "$next_tag"
+          git tag "$version"
+          git push origin "$version"
