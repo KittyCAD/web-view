@@ -62,7 +62,7 @@ jobs:
           git commit -m "Update KittyCAD web dependencies" -m "Source workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           latest_tag="$(git describe --tags --abbrev=0)"
-          next_tag="$(node -e 'const [major, minor, patch] = process.argv[1].split(".").map(Number); console.log(`${major}.${minor}.${patch + 1}`)' "$latest_tag")"
+          next_tag="$(jq -nr --arg tag "$latest_tag" '$tag | split(".") | map(tonumber) | .[2] += 1 | map(tostring) | join(".")')"
           npm version "$next_tag" --no-git-tag-version
           git add package.json package-lock.json
           git commit -m "Bump viewer version to $next_tag" -m "Source workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
