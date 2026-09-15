@@ -129,9 +129,9 @@ jobs:
           cache: npm
           cache-dependency-path: api/admin-dashboard/app/package-lock.json
 
-      - name: Update web-view dependency
+      - name: Update KittyCAD web dependencies
         working-directory: api/admin-dashboard/app
-        run: npm install "@kittycad/web-view@${{ needs.publish.outputs.version }}"
+        run: npm install @kittycad/lib@latest "@kittycad/web-view@${{ needs.publish.outputs.version }}"
 
       - name: Open API dependency pull request
         uses: peter-evans/create-pull-request@v8
@@ -145,8 +145,8 @@ jobs:
             admin-dashboard/app/package.json
             admin-dashboard/app/package-lock.json
           commit-message: |
-            Update kittycad/web-view dependency
+            Update KittyCAD web dependencies
 
             Trigger by: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          title: Update kittycad/web-view dependency
+          title: Update KittyCAD web dependencies
           body: ''
