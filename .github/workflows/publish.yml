@@ -36,12 +36,21 @@ jobs:
     if: needs.publish.result == 'success'
     runs-on: ubuntu-latest
     steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          app-id: ${{ secrets.GH_ORG_APP_ID }}
+          private-key: ${{ secrets.GH_ORG_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: viewer
+          permission-contents: write
+
       - uses: actions/checkout@v6
         with:
           repository: KittyCAD/viewer
           ref: main
-          token: ${{ secrets.VIEWER_REPOSITORY_TOKEN }}
-          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
 
       - uses: actions/setup-node@v6
         with:
