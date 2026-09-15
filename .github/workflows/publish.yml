@@ -16,12 +16,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - id: version
         run: |
-          previous_version="$(git show HEAD^:package.json | node -e 'let input = ""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => console.log(JSON.parse(input).version));')"
-          current_version="$(node -p 'require("./package.json").version')"
+          previous_version="$(git show '${{ github.event.before }}:package.json' | jq -r '.version')"
+          current_version="$(jq -r '.version' package.json)"
           echo "changed=$([[ "$current_version" != "$previous_version" ]] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
   publish:
