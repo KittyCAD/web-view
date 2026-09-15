@@ -15,6 +15,7 @@ jobs:
       id-token: write
     outputs:
       version: ${{ steps.package.outputs.version }}
+      lib_version: ${{ steps.package.outputs.lib_version }}
     steps:
       - uses: actions/checkout@v6
 
@@ -28,7 +29,9 @@ jobs:
       - run: make build
 
       - id: package
-        run: echo "version=$(jq -r '.version' package.json)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=$(jq -r '.version' package.json)" >> "$GITHUB_OUTPUT"
+          echo "lib_version=$(jq -r '.packages["node_modules/@kittycad/lib"].version' package-lock.json)" >> "$GITHUB_OUTPUT"
 
       - name: Publish package if needed
         env:
@@ -79,7 +82,7 @@ jobs:
 
       # The kcl-wasm-lib dependency is updated by its repository's CI to
       # guarantee the correct version.
-      - run: npm install @kittycad/lib@latest "@kittycad/web-view@${{ needs.publish.outputs.version }}"
+      - run: npm install "@kittycad/lib@${{ needs.publish.outputs.lib_version }}" "@kittycad/web-view@${{ needs.publish.outputs.version }}"
 
       - name: Commit updated dependencies
         run: |
@@ -131,7 +134,7 @@ jobs:
 
       - name: Update KittyCAD web dependencies
         working-directory: api/admin-dashboard/app
-        run: npm install @kittycad/lib@latest "@kittycad/web-view@${{ needs.publish.outputs.version }}"
+        run: npm install "@kittycad/lib@${{ needs.publish.outputs.lib_version }}" "@kittycad/web-view@${{ needs.publish.outputs.version }}"
 
       - name: Open API dependency pull request
         uses: peter-evans/create-pull-request@v8
