@@ -44,7 +44,7 @@ jobs:
         env:
           WEB_VIEW_VERSION: ${{ steps.package.outputs.version }}
         run: |
-          for delay in 0 2 4 8 16; do
+          for delay in 0 2 4 8 16 32 64 128 256 512; do
             sleep "$delay"
             npm view "@kittycad/web-view@$WEB_VIEW_VERSION" version && exit 0
           done
