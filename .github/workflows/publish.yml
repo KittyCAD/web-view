@@ -75,7 +75,7 @@ jobs:
           npm version patch --no-git-tag-version
           version="$(jq -r '.version' package.json)"
           git add package.json package-lock.json
-          git commit -m "Bump viewer version to $version" -m "Source workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          git commit -m "Trigger release via version bump to $version" -m "Source workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           git push origin main
           git tag "$version"
           git push origin "$version"
