@@ -61,9 +61,7 @@ jobs:
           git add package.json package-lock.json
           git commit -m "Update KittyCAD web dependencies" -m "Source workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-          latest_tag="$(git describe --tags --abbrev=0)"
-          next_version="$(jq -nr --arg tag "$latest_tag" '$tag | split(".") | map(tonumber) | .[2] += 1 | map(tostring) | join(".")')"
-          npm version "$next_version" --no-git-tag-version
+          npm version patch --no-git-tag-version
           version="$(jq -r '.version' package.json)"
           git add package.json package-lock.json
           git commit -m "Bump viewer version to $version" -m "Source workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
