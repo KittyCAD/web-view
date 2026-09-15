@@ -70,12 +70,12 @@ jobs:
           git config user.name github-actions[bot]
           git config user.email zoo-github-actions-auth[bot]@users.noreply.github.com
           git add package.json package-lock.json
-          git commit -m "Update kittycad/web-view dependency" -m "Source workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          git commit -m "Update kittycad/web-view dependency" -m "Trigger by: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           npm version patch --no-git-tag-version
           version="$(jq -r '.version' package.json)"
           git add package.json package-lock.json
-          git commit -m "Trigger release via version bump to $version" -m "Source workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          git commit -m "Trigger release via version bump to $version" -m "Trigger by: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           git push origin main
           git tag "$version"
           git push origin "$version"
