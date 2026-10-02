@@ -2,6 +2,8 @@
 
 Various helpers to get a Zoo KittyCAD WebRTC stream onto a web page!
 
+An example of this component in action can be found at https://viewer.zoo.dev
+
 ## Features
 
 * Each instance runs on a Web Worker, preventing main worker blocking.
@@ -19,6 +21,12 @@ npm install @kittycad/web-view @kittycad/lib
 
 You will need to copy `node_modules/@kittycad/kcl-wasm-lib/kcl_wasm_lib_bg.wasm`
 to the root of a directory that will be served by your web server.
+
+## IMPORTANT NOTE ON AUTHENTICATION
+
+For local development, [use an API token](https://zoo.dev/account/developer).
+OAuth authentication is locked to Zoo's domains currently. If you're an external
+user to Zoo, use an API token for production as well.
 
 ## Quick demo
 
@@ -41,6 +49,7 @@ import { ZooWebView } from '@kittycad/web-view'
 document.addEventListener('DOMContentLoaded', () => {
   const token = 'api-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
 
+  // If no token is passed, then OAuth will trigger, so watch out!
   const zooClient = new zoo.Client({
     token,
     baseUrl: 'wss://api.zoo.dev',
