@@ -1,6 +1,6 @@
 {
   "name": "@kittycad/web-view",
-  "version": "1.2.19",
+  "version": "1.2.20",
   "main": "index.js",
   "types": "index.d.ts",
   "homepage": "https://github.com/KittyCAD/web-view",
